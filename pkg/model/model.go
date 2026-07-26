@@ -129,10 +129,11 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 // DesiredState is the full specification for one configuration.
 type DesiredState struct {
-	ConfigID ConfigID `json:"config_id"`
-	Version  uint64   `json:"version"`
-	Spec     []byte   `json:"spec"`     // provider-specific desired spec (JSON)
-	Digest   string   `json:"digest"`   // sha256 of Spec
+	ConfigID     ConfigID `json:"config_id"`
+	ProviderType string   `json:"provider_type"`     // which provider handles this (e.g. "nginx.config")
+	Version      uint64   `json:"version"`
+	Spec         []byte   `json:"spec"`               // provider-specific desired spec (JSON)
+	Digest       string   `json:"digest"`             // sha256 of Spec
 }
 
 // ObservedState is what a Provider reads from the real system.
