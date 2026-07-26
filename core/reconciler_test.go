@@ -2,7 +2,9 @@ package core
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/akzj/converge/pkg/model"
 )
@@ -10,6 +12,8 @@ import (
 // mockProvider implements Provider for testing.
 type mockProvider struct {
 	typeName string
+	slow     int32 // if >0, Execute blocks for this many milliseconds
+	executed int32 // number of Execute calls
 }
 
 func (m *mockProvider) Type() string { return m.typeName }
@@ -21,14 +25,30 @@ func (m *mockProvider) Inspect(_ context.Context, _ model.ResourceID) (model.Obs
 func (m *mockProvider) Diff(_ context.Context, observed model.ObservedState, desired model.DesiredState) ([]model.Operation, error) {
 	if !observed.Present {
 		return []model.Operation{
-			{ID: "provision-1", Action: "provision", Phase: model.PhaseCommit, Destructive: false},
-			{ID: "verify-1", Action: "reconcile", Phase: model.PhaseVerify, Destructive: false, DependsOn: []string{"provision-1"}},
+			{
+				ID: "provision-" + m.typeName, Action: "provision",
+				Phase: model.PhaseCommit, Destructive: false,
+				CancelMode: model.CancelModeSafe,
+			},
+			{
+				ID: "verify-" + m.typeName, Action: "reconcile",
+				Phase: model.PhaseVerify, Destructive: false,
+				DependsOn: []string{"provision-" + m.typeName},
+			},
 		}, nil
 	}
 	return nil, nil
 }
 
-func (m *mockProvider) Execute(_ context.Context, op model.Operation) (model.StepResult, error) {
+func (m *mockProvider) Execute(ctx context.Context, op model.Operation) (model.StepResult, error) {
+	atomic.AddInt32(&m.executed, 1)
+	if s := atomic.LoadInt32(&m.slow); s > 0 {
+		select {
+		case <-time.After(time.Duration(s) * time.Millisecond):
+		case <-ctx.Done():
+			return model.StepResult{State: model.StepCancelled, Code: "cancelled", Reason: ctx.Err().Error()}, nil
+		}
+	}
 	return model.StepResult{State: model.StepCompleted}, nil
 }
 
@@ -48,12 +68,8 @@ func TestReconcilerSubmitsAndProcessesDesiredState(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start reconciler in background
-	go func() {
-		_ = r.Run(ctx)
-	}()
+	go func() { _ = r.Run(ctx) }()
 
-	// Submit a desired state
 	err := r.SubmitDesired(ctx, model.DesiredState{
 		ConfigID:     model.ConfigID{Name: "test-config"},
 		ProviderType: "test",
@@ -65,7 +81,70 @@ func TestReconcilerSubmitsAndProcessesDesiredState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Give it a moment to process
-	// In a real test we'd wait for events, but this validates basic plumbing
-	_ = r
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestReconcilerSupersessionCancelsInFlight(t *testing.T) {
+	store := NewMemoryStateStore()
+	events := NewMemoryEventBus()
+	arbiter := NewMemoryArbiter()
+	journal := NewMemoryJournal()
+
+	provider := &mockProvider{typeName: "slow", slow: 200} // 200ms operations
+	r := NewReconciler(store, events, arbiter, journal)
+	r.RegisterProvider(provider)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = r.Run(ctx) }()
+
+	// Submit v1 — provider will produce [provision-slow, verify-slow]
+	err := r.SubmitDesired(ctx, model.DesiredState{
+		ConfigID:     model.ConfigID{Name: "slow-config"},
+		ProviderType: "slow",
+		Version:      1,
+		Spec:         []byte(`{"v": 1}`),
+		Digest:       "sha256:v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for provision-slow to start running
+	time.Sleep(30 * time.Millisecond)
+
+	// Submit v2 while v1 operations are in-flight → triggers supersession
+	err = r.SubmitDesired(ctx, model.DesiredState{
+		ConfigID:     model.ConfigID{Name: "slow-config"},
+		ProviderType: "slow",
+		Version:      2,
+		Spec:         []byte(`{"v": 2}`),
+		Digest:       "sha256:v2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for supersession to process
+	time.Sleep(100 * time.Millisecond)
+
+	r.mu.Lock()
+	mc, exists := r.configs["slow-config"]
+	r.mu.Unlock()
+
+	if !exists {
+		t.Fatal("config not found after supersession")
+	}
+
+	r.mu.Lock()
+	graphSize := len(mc.Graph.Nodes)
+	r.mu.Unlock()
+
+	if graphSize == 0 {
+		t.Fatal("supersession left empty graph")
+	}
+
+	t.Logf("supersession: %d ops in new graph, provider.Execute called %d times",
+		graphSize, atomic.LoadInt32(&provider.executed))
 }
