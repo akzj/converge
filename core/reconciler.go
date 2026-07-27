@@ -224,8 +224,9 @@ func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredSta
 		zap.Uint64("version", desired.Version),
 		zap.Uint64("previous_version", existing.Recorded.DesiredVersion))
 
-	// Save the desired and release lock before supersession
+	// Save the desired, sync DependsOnConfigs, and release lock before supersession
 	existing.Desired = desired
+	existing.DependsOnConfigs = append([]string(nil), desired.DependsOn...)
 	existing.Status = model.ConfigConverging
 	r.mu.Unlock()
 
@@ -318,30 +319,41 @@ func (r *Reconciler) collectDependentsLocked(configName string) []string {
 	return unique
 }
 
-func (r *Reconciler) invalidateDependents(_ context.Context, configName string) {
+// invalidateDependents marks all transitive downstream configs as stale,
+// cancels their in-flight operations, and triggers re-reconciliation.
+// Must NOT be called with r.mu held.
+func (r *Reconciler) invalidateDependents(ctx context.Context, configName string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, mc := range r.configs {
-		if mc.ID.Name == configName {
-			continue
+	deps := r.collectDependentsLocked(configName)
+	var targets []*model.ManagedConfig
+	for _, name := range deps {
+		if mc, ok := r.configs[name]; ok {
+			targets = append(targets, mc)
 		}
-		for _, dep := range mc.DependsOnConfigs {
-			if dep == configName {
-				zap.L().Info("converge: invalidating downstream config due to dependency change",
-					zap.String("downstream", mc.ID.Name),
-					zap.String("upstream", configName))
-				mc.Status = model.ConfigConverging
-				// Clear old graph nodes — they'll be rebuilt on next reconcile
-				if mc.Graph != nil {
-					for id, node := range mc.Graph.Nodes {
-						delete(r.globalGraph.Nodes, id)
-						_ = node
-					}
-					mc.Graph.Nodes = make(map[string]*model.Node)
-				}
-				break
+	}
+	r.mu.Unlock()
+
+	for _, mc := range targets {
+		zap.L().Info("converge: cascading to downstream config",
+			zap.String("downstream", mc.ID.Name),
+			zap.String("upstream", configName))
+
+		// Cancel in-flight operations
+		r.supersede(ctx, mc.ID.Name)
+
+		// Clear stale graph
+		r.mu.Lock()
+		mc.Status = model.ConfigConverging
+		if mc.Graph != nil {
+			for id := range mc.Graph.Nodes {
+				delete(r.globalGraph.Nodes, id)
 			}
+			mc.Graph.Nodes = make(map[string]*model.Node)
 		}
+		r.mu.Unlock()
+
+		// Re-reconcile
+		r.reconcile(ctx, mc)
 	}
 }
 
@@ -514,6 +526,31 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 	}
 
 	// Build DAG
+	if len(ops) == 0 {
+		// Already converged — no operations needed
+		r.mu.Lock()
+		mc.Status = model.ConfigConverged
+		mc.Graph = &model.Graph{Nodes: make(map[string]*model.Node)}
+		recorded := model.RecordedState{
+			ConfigID:        mc.Desired.ConfigID,
+			DesiredVersion:  mc.Desired.Version,
+			DesiredDigest:   mc.Desired.Digest,
+			HandlerDigest:   provider.Digest(),
+			Status:          string(model.ConfigConverged),
+			UpdatedAt:       time.Now(),
+		}
+		if err := r.store.Record(ctx, recorded); err != nil {
+			zap.L().Error("converge: state store record failed", zap.Error(err))
+		}
+		r.mu.Unlock()
+		zap.L().Info("converge: config already converged",
+			zap.String("config", mc.ID.Name),
+			zap.Uint64("version", mc.Desired.Version))
+		// Wake up downstream configs that depend on this one
+		r.wakeUpDependents(ctx, mc.ID.Name)
+		return
+	}
+
 	graph := &model.Graph{Nodes: make(map[string]*model.Node)}
 	for _, op := range ops {
 		op.ConfigID = mc.ID.Name
@@ -595,15 +632,15 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 
 	// Check if this config's graph is fully converged
 	if mc, ok := r.configs[event.ConfigID]; ok && mc.Graph != nil {
-		if allNodesCompleted(mc.Graph) {
+		if allNodesSucceeded(mc.Graph) {
 			mc.Status = model.ConfigConverged
-			// Record to StateStore
 			recorded := model.RecordedState{
-				ConfigID:       mc.Desired.ConfigID,
-				DesiredVersion: mc.Desired.Version,
-				DesiredDigest:  mc.Desired.Digest,
-				Status:         string(model.ConfigConverged),
-				UpdatedAt:      time.Now(),
+				ConfigID:        mc.Desired.ConfigID,
+				DesiredVersion:  mc.Desired.Version,
+				DesiredDigest:   mc.Desired.Digest,
+				HandlerDigest:   mc.Recorded.HandlerDigest,
+				Status:          string(model.ConfigConverged),
+				UpdatedAt:       time.Now(),
 			}
 			if err := r.store.Record(ctx, recorded); err != nil {
 				zap.L().Error("converge: state store record failed", zap.Error(err))
@@ -611,19 +648,68 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 			zap.L().Info("converge: config converged",
 				zap.String("config", event.ConfigID),
 				zap.Uint64("version", mc.Desired.Version))
+			// Wake up downstream configs that depend on this one
+			r.mu.Unlock()
+			r.wakeUpDependents(ctx, event.ConfigID)
+			return
+		}
+
+		// Check if any node failed — mark config error
+		if hasFailedNode(mc.Graph) {
+			mc.Status = model.ConfigError
+			recorded := model.RecordedState{
+				ConfigID:       mc.Desired.ConfigID,
+				DesiredVersion: mc.Desired.Version,
+				DesiredDigest:  mc.Desired.Digest,
+				Status:         string(model.ConfigError),
+				UpdatedAt:      time.Now(),
+			}
+			_ = r.store.Record(ctx, recorded)
+			zap.L().Error("converge: config failed",
+				zap.String("config", event.ConfigID))
 		}
 	}
 
 	r.mu.Unlock()
 }
 
-// allNodesCompleted returns true iff every node in the graph is in a terminal state.
-func allNodesCompleted(g *model.Graph) bool {
+// hasFailedNode returns true if any node in the graph has failed.
+func hasFailedNode(g *model.Graph) bool {
 	for _, n := range g.Nodes {
-		switch n.Status {
-		case model.NodeCompleted, model.NodeFailed, model.NodeCancelled:
-			continue
-		default:
+		if n.Status == model.NodeFailed {
+			return true
+		}
+	}
+	return false
+}
+
+// wakeUpDependents triggers reconcile for all configs that depend on configName.
+func (r *Reconciler) wakeUpDependents(ctx context.Context, configName string) {
+	r.mu.Lock()
+	var downstream []*model.ManagedConfig
+	for _, mc := range r.configs {
+		for _, dep := range mc.DependsOnConfigs {
+			if dep == configName && mc.Status != model.ConfigConverged {
+				downstream = append(downstream, mc)
+				break
+			}
+		}
+	}
+	r.mu.Unlock()
+	for _, mc := range downstream {
+		zap.L().Info("converge: waking up downstream config",
+			zap.String("config", mc.ID.Name),
+			zap.String("depends_on", configName))
+		r.reconcile(ctx, mc)
+	}
+}
+
+// allNodesSucceeded returns true iff every node in the graph is either
+// completed (success) or was never needed (empty graph).
+// Failed/Cancelled nodes mean convergence failed.
+func allNodesSucceeded(g *model.Graph) bool {
+	for _, n := range g.Nodes {
+		if n.Status != model.NodeCompleted {
 			return false
 		}
 	}
@@ -717,7 +803,8 @@ func (r *Reconciler) tick(ctx context.Context) {
 	r.mu.Lock()
 	configs := make([]*model.ManagedConfig, 0, len(r.configs))
 	for _, mc := range r.configs {
-		if mc.Status == model.ConfigConverged {
+		// Scan both converged (drift detection) and converging (stale/blocked re-entry)
+		if mc.Status == model.ConfigConverged || mc.Status == model.ConfigConverging {
 			configs = append(configs, mc)
 		}
 	}
