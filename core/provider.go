@@ -59,9 +59,9 @@ type Journal interface {
 	Events(ctx context.Context, configID string) ([]model.Event, error)
 }
 
-// log returns the package-level sugared logger.
-func log() *zap.SugaredLogger {
-	return zap.S()
+// log returns the package-level structured logger.
+func log() *zap.Logger {
+	return zap.L()
 }
 
 func init() {
