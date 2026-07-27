@@ -48,12 +48,57 @@ func NewReconciler(store StateStore, events EventBus, arbiter Arbiter, journal J
 	}
 }
 
-// RegisterProvider adds a provider to the engine.
+// RegisterProvider adds a provider to the engine. If a provider with the same
+// Type() was already registered with a different Digest(), all configs using
+// that provider are forced to re-reconcile (provider upgrade detection).
 func (r *Reconciler) RegisterProvider(p Provider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	old, exists := r.providers[p.Type()]
+	oldDigest := ""
+	if exists {
+		oldDigest = old.Digest()
+	}
 	r.providers[p.Type()] = p
-	zap.L().Info("converge: registered provider", zap.String("provider", p.Type()))
+
+	if !exists {
+		zap.L().Info("converge: registered provider",
+			zap.String("provider", p.Type()),
+			zap.String("digest", p.Digest()))
+		return
+	}
+
+	if oldDigest == p.Digest() {
+		zap.L().Info("converge: re-registered provider (same digest)",
+			zap.String("provider", p.Type()),
+			zap.String("digest", p.Digest()))
+		return
+	}
+
+	// Digest changed — existing configs using this provider must re-converge.
+	zap.L().Info("converge: provider upgraded, forcing re-reconciliation",
+		zap.String("provider", p.Type()),
+		zap.String("old_digest", oldDigest),
+		zap.String("new_digest", p.Digest()))
+	for _, mc := range r.configs {
+		if mc.Desired.ProviderType != p.Type() {
+			continue
+		}
+		if mc.Recorded.HandlerDigest == p.Digest() {
+			continue // already using this version
+		}
+		zap.L().Info("converge: re-reconciling config due to provider upgrade",
+			zap.String("config", mc.ID.Name),
+			zap.String("provider", p.Type()))
+		mc.Status = model.ConfigConverging
+		if mc.Graph != nil {
+			for id := range mc.Graph.Nodes {
+				delete(r.globalGraph.Nodes, id)
+			}
+			mc.Graph.Nodes = make(map[string]*model.Node)
+		}
+	}
 }
 
 // SubmitDesired queues a desired state for reconciliation.
@@ -418,6 +463,16 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 		r.mu.Unlock()
 		return
 	}
+	// Provider digest detection — if the handler implementation changed,
+	// force re-reconciliation even if the desired spec hasn't changed.
+	providerDigest := provider.Digest()
+	if mc.Recorded.HandlerDigest != "" && mc.Recorded.HandlerDigest != providerDigest {
+		zap.L().Info("converge: handler digest changed, forcing re-reconciliation",
+			zap.String("config", mc.ID.Name),
+			zap.String("old", mc.Recorded.HandlerDigest),
+			zap.String("new", providerDigest))
+	}
+
 
 	// If this config depends on others, check they are all converged first.
 	if !r.dependenciesMet(mc) {

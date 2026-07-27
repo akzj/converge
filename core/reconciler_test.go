@@ -17,6 +17,8 @@ type mockProvider struct {
 }
 
 func (m *mockProvider) Type() string { return m.typeName }
+func (m *mockProvider) Digest() string { return "sha256:mock-" + m.typeName }
+
 
 func (m *mockProvider) Inspect(_ context.Context, _ model.ResourceID) (model.ObservedState, error) {
 	return model.ObservedState{Present: false}, nil

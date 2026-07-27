@@ -21,6 +21,10 @@ type Provider interface {
 	// Type returns the resource type this provider handles (e.g. "nginx.config").
 	Type() string
 
+	// Digest returns a stable identifier for this provider implementation version.
+	// When Digest changes, the Core re-reconciles all configs using this provider.
+	Digest() string
+
 	// Inspect reads the current real-world state of a resource.
 	Inspect(ctx context.Context, resource model.ResourceID) (model.ObservedState, error)
 
