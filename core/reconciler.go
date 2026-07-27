@@ -29,6 +29,7 @@ type Reconciler struct {
 	inFlight map[string]context.CancelFunc // operation ID → cancel
 
 	pendingDesired chan model.DesiredState // inbound desired state updates
+	pendingDelete  chan string             // inbound config deletion requests
 }
 
 // NewReconciler creates a new Converge engine instance.
@@ -43,6 +44,7 @@ func NewReconciler(store StateStore, events EventBus, arbiter Arbiter, journal J
 		globalGraph:    &model.Graph{Nodes: make(map[string]*model.Node)},
 		inFlight:       make(map[string]context.CancelFunc),
 		pendingDesired: make(chan model.DesiredState, 128),
+		pendingDelete:  make(chan string, 128),
 	}
 }
 
@@ -58,6 +60,16 @@ func (r *Reconciler) RegisterProvider(p Provider) {
 func (r *Reconciler) SubmitDesired(ctx context.Context, desired model.DesiredState) error {
 	select {
 	case r.pendingDesired <- desired:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// SubmitDelete queues a config for deletion. Dependents are deleted first.
+func (r *Reconciler) SubmitDelete(ctx context.Context, configName string) error {
+	select {
+	case r.pendingDelete <- configName:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -88,6 +100,9 @@ func (r *Reconciler) Run(ctx context.Context) error {
 
 		case desired := <-r.pendingDesired:
 			r.handleDesired(ctx, desired)
+
+		case name := <-r.pendingDelete:
+			r.deleteConfig(ctx, name)
 
 		case event := <-eventCh:
 			r.handleEvent(ctx, event)
@@ -172,9 +187,119 @@ func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredSta
 	// Phase 1: Supersession — cancel or wait for in-flight operations
 	r.supersede(ctx, name)
 
-	// Phase 2: reconcile with fresh Inspect
+	// Phase 2: Invalidate downstream configs whose dependency has changed
+	r.invalidateDependents(ctx, name)
+
+	// Phase 3: reconcile with fresh Inspect
 	r.reconcile(ctx, existing)
 }
+// invalidateDependents marks all configs that depend on configName as stale,
+// forcing them to re-reconcile on the next loop.
+// deleteConfig removes a config and all its dependents in reverse dependency order.
+func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
+	r.mu.Lock()
+	mc, exists := r.configs[name]
+	if !exists {
+		r.mu.Unlock()
+		return
+	}
+
+	// Collect all configs that must be deleted before this one (dependents)
+	dependents := r.collectDependentsLocked(name)
+	r.mu.Unlock()
+
+	// Delete dependents first (depth-first, reverse dependency order)
+	for _, depName := range dependents {
+		r.deleteConfig(ctx, depName)
+	}
+
+	// Now delete the target config itself
+	r.mu.Lock()
+	zap.L().Info("converge: deleting config",
+		zap.String("config", name),
+		zap.Uint64("version", mc.Desired.Version))
+
+	// Cancel any in-flight operations
+	r.mu.Unlock()
+	r.supersede(ctx, name)
+	r.mu.Lock()
+
+	// Remove from StateStore
+	if err := r.store.Delete(ctx, mc.ID); err != nil {
+		zap.L().Error("converge: state store delete failed", zap.Error(err))
+	}
+
+	// Remove from global graph
+	for id, node := range r.globalGraph.Nodes {
+		if node.Operation.ConfigID == name {
+			delete(r.globalGraph.Nodes, id)
+		}
+	}
+
+	// Remove from configs map
+	delete(r.configs, name)
+	r.mu.Unlock()
+
+	zap.L().Info("converge: config deleted", zap.String("config", name))
+}
+
+// collectDependentsLocked returns names of configs that directly or indirectly
+// depend on configName. Must be called with r.mu held.
+func (r *Reconciler) collectDependentsLocked(configName string) []string {
+	var deps []string
+	for _, mc := range r.configs {
+		if mc.ID.Name == configName {
+			continue
+		}
+		for _, dep := range mc.DependsOnConfigs {
+			if dep == configName {
+				deps = append(deps, mc.ID.Name)
+				// Recursively collect transitive dependents
+				transitive := r.collectDependentsLocked(mc.ID.Name)
+				deps = append(deps, transitive...)
+				break
+			}
+		}
+	}
+	// Return unique names preserving order
+	seen := make(map[string]struct{}, len(deps))
+	unique := make([]string, 0, len(deps))
+	for _, d := range deps {
+		if _, ok := seen[d]; !ok {
+			seen[d] = struct{}{}
+			unique = append(unique, d)
+		}
+	}
+	return unique
+}
+
+func (r *Reconciler) invalidateDependents(_ context.Context, configName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, mc := range r.configs {
+		if mc.ID.Name == configName {
+			continue
+		}
+		for _, dep := range mc.DependsOnConfigs {
+			if dep == configName {
+				zap.L().Info("converge: invalidating downstream config due to dependency change",
+					zap.String("downstream", mc.ID.Name),
+					zap.String("upstream", configName))
+				mc.Status = model.ConfigConverging
+				// Clear old graph nodes — they'll be rebuilt on next reconcile
+				if mc.Graph != nil {
+					for id, node := range mc.Graph.Nodes {
+						delete(r.globalGraph.Nodes, id)
+						_ = node
+					}
+					mc.Graph.Nodes = make(map[string]*model.Node)
+				}
+				break
+			}
+		}
+	}
+}
+
 
 // supersede handles in-flight operations when a new desired state arrives.
 // Must NOT be called with r.mu held.
