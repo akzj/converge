@@ -145,6 +145,7 @@ func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredSta
 			Desired: desired,
 			Status: model.ConfigConverging,
 			Graph:  &model.Graph{Nodes: make(map[string]*model.Node)},
+			DependsOnConfigs: append([]string(nil), desired.DependsOn...),
 		}
 		r.mu.Unlock()
 		r.reconcile(ctx, r.configs[name])
@@ -293,6 +294,17 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 		return
 	}
 
+	// If this config depends on others, check they are all converged first.
+	if !r.dependenciesMet(mc) {
+		zap.L().Info("converge: waiting for dependencies",
+			zap.String("config", mc.ID.Name),
+			zap.Strings("depends_on", mc.DependsOnConfigs))
+		r.mu.Lock()
+		mc.Status = model.ConfigConverging
+		r.mu.Unlock()
+		return
+	}
+
 	// Inspect current state
 	observed, err := provider.Inspect(ctx, model.ResourceID{Name: mc.ID.Name})
 	if err != nil {
@@ -354,6 +366,22 @@ func (r *Reconciler) mergeGlobalGraphLocked(mc *model.ManagedConfig) {
 		r.globalGraph.Nodes[id] = node
 	}
 }
+// dependenciesMet checks whether all configs this one depends on have converged.
+func (r *Reconciler) dependenciesMet(mc *model.ManagedConfig) bool {
+	if len(mc.DependsOnConfigs) == 0 {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, depName := range mc.DependsOnConfigs {
+		dep, ok := r.configs[depName]
+		if !ok || dep.Status != model.ConfigConverged {
+			return false
+		}
+	}
+	return true
+}
+
 
 // ---------------------------------------------------------------------------
 // Event handling
@@ -362,7 +390,6 @@ func (r *Reconciler) mergeGlobalGraphLocked(mc *model.ManagedConfig) {
 // handleEvent processes an Event from a completed Operation.
 func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if node, ok := r.globalGraph.Nodes[event.NodeID]; ok {
 		switch event.State {
@@ -373,6 +400,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 		case model.StepCancelled:
 			node.Status = model.NodeCancelled
 		default:
+			r.mu.Unlock()
 			return
 		}
 	}
@@ -384,6 +412,42 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	if err := r.journal.Append(ctx, event); err != nil {
 		zap.L().Error("converge: journal append failed", zap.Error(err))
 	}
+
+	// Check if this config's graph is fully converged
+	if mc, ok := r.configs[event.ConfigID]; ok && mc.Graph != nil {
+		if allNodesCompleted(mc.Graph) {
+			mc.Status = model.ConfigConverged
+			// Record to StateStore
+			recorded := model.RecordedState{
+				ConfigID:       mc.Desired.ConfigID,
+				DesiredVersion: mc.Desired.Version,
+				DesiredDigest:  mc.Desired.Digest,
+				Status:         string(model.ConfigConverged),
+				UpdatedAt:      time.Now(),
+			}
+			if err := r.store.Record(ctx, recorded); err != nil {
+				zap.L().Error("converge: state store record failed", zap.Error(err))
+			}
+			zap.L().Info("converge: config converged",
+				zap.String("config", event.ConfigID),
+				zap.Uint64("version", mc.Desired.Version))
+		}
+	}
+
+	r.mu.Unlock()
+}
+
+// allNodesCompleted returns true iff every node in the graph is in a terminal state.
+func allNodesCompleted(g *model.Graph) bool {
+	for _, n := range g.Nodes {
+		switch n.Status {
+		case model.NodeCompleted, model.NodeFailed, model.NodeCancelled:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------

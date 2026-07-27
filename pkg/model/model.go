@@ -134,6 +134,7 @@ type DesiredState struct {
 	Version      uint64   `json:"version"`
 	Spec         []byte   `json:"spec"`               // provider-specific desired spec (JSON)
 	Digest       string   `json:"digest"`             // sha256 of Spec
+	DependsOn    []string `json:"depends_on,omitempty"` // config names that must converge first
 }
 
 // ObservedState is what a Provider reads from the real system.
@@ -245,4 +246,7 @@ type ManagedConfig struct {
 	Recorded RecordedState
 	Graph    *Graph
 	Status   ConfigStatus
+	// DependsOnConfigs lists config names that must reach ConfigConverged before
+	// this config's reconciliation loop begins.
+	DependsOnConfigs []string
 }
