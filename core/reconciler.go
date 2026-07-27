@@ -51,9 +51,13 @@ func NewReconciler(store StateStore, events EventBus, arbiter Arbiter, journal J
 // RegisterProvider adds a provider to the engine. If a provider with the same
 // Type() was already registered with a different Digest(), all configs using
 // that provider are forced to re-reconcile (provider upgrade detection).
+// RegisterProvider adds a provider to the engine. If a provider with the same
+// Type() was already registered with a different Digest(), all configs using
+// that provider are forced to re-reconcile (provider upgrade detection).
+// NOTE: For cold-start (first registration), digest comparison with recorded
+// state happens in recover() or on next reconcile() cycle.
 func (r *Reconciler) RegisterProvider(p Provider) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	old, exists := r.providers[p.Type()]
 	oldDigest := ""
@@ -61,6 +65,7 @@ func (r *Reconciler) RegisterProvider(p Provider) {
 		oldDigest = old.Digest()
 	}
 	r.providers[p.Type()] = p
+	r.mu.Unlock()
 
 	if !exists {
 		zap.L().Info("converge: registered provider",
@@ -76,28 +81,37 @@ func (r *Reconciler) RegisterProvider(p Provider) {
 		return
 	}
 
-	// Digest changed — existing configs using this provider must re-converge.
-	zap.L().Info("converge: provider upgraded, forcing re-reconciliation",
+	// Digest changed — collect configs using this provider and re-converge.
+	// We process outside the lock because supersede/reconcile release it.
+	r.mu.Lock()
+	var targets []string
+	for _, mc := range r.configs {
+		if mc.Desired.ProviderType == p.Type() && mc.Recorded.HandlerDigest != p.Digest() {
+			targets = append(targets, mc.ID.Name)
+		}
+	}
+	r.mu.Unlock()
+
+	zap.L().Info("converge: provider upgraded, re-reconciling affected configs",
 		zap.String("provider", p.Type()),
 		zap.String("old_digest", oldDigest),
-		zap.String("new_digest", p.Digest()))
-	for _, mc := range r.configs {
-		if mc.Desired.ProviderType != p.Type() {
-			continue
-		}
-		if mc.Recorded.HandlerDigest == p.Digest() {
-			continue // already using this version
-		}
-		zap.L().Info("converge: re-reconciling config due to provider upgrade",
-			zap.String("config", mc.ID.Name),
-			zap.String("provider", p.Type()))
-		mc.Status = model.ConfigConverging
-		if mc.Graph != nil {
-			for id := range mc.Graph.Nodes {
-				delete(r.globalGraph.Nodes, id)
+		zap.String("new_digest", p.Digest()),
+		zap.Int("targets", len(targets)))
+
+	for _, name := range targets {
+		r.supersede(context.Background(), name)
+		r.mu.Lock()
+		if mc, ok := r.configs[name]; ok {
+			mc.Status = model.ConfigConverging
+			if mc.Graph != nil {
+				for id := range mc.Graph.Nodes {
+					delete(r.globalGraph.Nodes, id)
+				}
+				mc.Graph.Nodes = make(map[string]*model.Node)
 			}
-			mc.Graph.Nodes = make(map[string]*model.Node)
 		}
+		r.mu.Unlock()
+		r.reconcile(context.Background(), r.configs[name])
 	}
 }
 
@@ -171,15 +185,29 @@ func (r *Reconciler) recover(ctx context.Context) error {
 		if err != nil || recorded == nil {
 			continue
 		}
+
+		status := model.ConfigConverged
+		// Check if the recorded handler digest differs from the current provider
+		if p, ok := r.providers[recorded.HandlerDigest]; !ok {
+			// No provider registered yet — assume converged, will re-check on registration
+		} else if p.Digest() != recorded.HandlerDigest {
+			// Provider digest changed — force re-reconciliation
+			status = model.ConfigConverging
+			zap.L().Info("converge: recovered config with stale handler digest, will re-reconcile",
+				zap.String("config", id.Name),
+				zap.String("recorded", recorded.HandlerDigest),
+				zap.String("current", p.Digest()))
+		}
+
 		r.configs[id.Name] = &model.ManagedConfig{
 			ID:       id,
 			Recorded: *recorded,
-			Status:   model.ConfigConverged,
+			Status:   status,
 		}
 		zap.L().Info("converge: recovered config",
 			zap.String("config", id.Name),
 			zap.Uint64("version", recorded.DesiredVersion),
-			zap.String("status", recorded.Status))
+			zap.String("status", string(status)))
 	}
 	return nil
 }
@@ -466,6 +494,11 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 	provider, ok := r.providers[mc.Desired.ProviderType]
 	r.mu.Unlock()
 
+	// Record the current provider digest for this convergence cycle.
+	// This ensures the recorded HandlerDigest is always up to date.
+	mc.Recorded.HandlerDigest = provider.Digest()
+
+
 	if !ok {
 		zap.L().Error("converge: no provider for config",
 			zap.String("provider", mc.Desired.ProviderType),
@@ -540,6 +573,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 			UpdatedAt:       time.Now(),
 		}
 		if err := r.store.Record(ctx, recorded); err != nil {
+		mc.Recorded = recorded // update in-memory state
 			zap.L().Error("converge: state store record failed", zap.Error(err))
 		}
 		r.mu.Unlock()
@@ -633,15 +667,23 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	// Check if this config's graph is fully converged
 	if mc, ok := r.configs[event.ConfigID]; ok && mc.Graph != nil {
 		if allNodesSucceeded(mc.Graph) {
-			mc.Status = model.ConfigConverged
+			digest := mc.Recorded.HandlerDigest
+			if digest == "" {
+				// Fallback: try to get from provider (shouldn't happen after reconcile sets it)
+				if p, ok := r.providers[mc.Desired.ProviderType]; ok {
+					digest = p.Digest()
+				}
+			}
 			recorded := model.RecordedState{
 				ConfigID:        mc.Desired.ConfigID,
 				DesiredVersion:  mc.Desired.Version,
 				DesiredDigest:   mc.Desired.Digest,
-				HandlerDigest:   mc.Recorded.HandlerDigest,
+				HandlerDigest:   digest,
+				HandlerRef:      mc.Recorded.HandlerRef,
 				Status:          string(model.ConfigConverged),
 				UpdatedAt:       time.Now(),
 			}
+			mc.Recorded = recorded // update in-memory state
 			if err := r.store.Record(ctx, recorded); err != nil {
 				zap.L().Error("converge: state store record failed", zap.Error(err))
 			}
@@ -665,6 +707,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 				UpdatedAt:      time.Now(),
 			}
 			_ = r.store.Record(ctx, recorded)
+			mc.Recorded = recorded
 			zap.L().Error("converge: config failed",
 				zap.String("config", event.ConfigID))
 		}
