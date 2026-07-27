@@ -153,6 +153,7 @@ type ObservedState struct {
 // RecordedState is persisted after each successful convergence.
 type RecordedState struct {
 	ConfigID       ConfigID  `json:"config_id"`
+	ProviderType   string    `json:"provider_type"` // which provider owns this config
 	DesiredVersion uint64    `json:"desired_version"`
 	DesiredDigest  string    `json:"desired_digest"`
 	HandlerDigest  string    `json:"handler_digest"`
