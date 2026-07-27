@@ -2,9 +2,10 @@ package core
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
+
+	"github.com/cockroachdb/errors"
 
 	"github.com/akzj/converge/pkg/model"
 )
@@ -110,7 +111,7 @@ func (a *MemoryArbiter) Acquire(_ context.Context, operationID string) (func(), 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.activeOpID != "" {
-		return nil, fmt.Errorf("destructive commit busy: %s", a.activeOpID)
+		return nil, errors.Errorf("destructive commit busy: %s", a.activeOpID)
 	}
 	a.activeOpID = operationID
 	var once sync.Once

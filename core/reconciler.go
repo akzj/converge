@@ -2,10 +2,11 @@ package core
 
 import (
 	"context"
-	"fmt"
-	"log"
 	"sync"
 	"time"
+
+	"github.com/cockroachdb/errors"
+	"go.uber.org/zap"
 
 	"github.com/akzj/converge/pkg/model"
 )
@@ -50,7 +51,7 @@ func (r *Reconciler) RegisterProvider(p Provider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.providers[p.Type()] = p
-	log.Printf("converge: registered provider %q", p.Type())
+	zap.S().Infof("converge: registered provider %q", p.Type())
 }
 
 // SubmitDesired queues a desired state for reconciliation.
@@ -65,15 +66,15 @@ func (r *Reconciler) SubmitDesired(ctx context.Context, desired model.DesiredSta
 
 // Run starts the reconciliation loop. Blocks until ctx is cancelled.
 func (r *Reconciler) Run(ctx context.Context) error {
-	log.Println("converge: starting reconciliation loop")
+	zap.S().Infof("converge: starting reconciliation loop")
 
 	if err := r.recover(ctx); err != nil {
-		return fmt.Errorf("converge: recovery failed: %w", err)
+		return errors.Errorf("converge: recovery failed: %w", err)
 	}
 
 	eventCh, err := r.events.Subscribe(ctx, "")
 	if err != nil {
-		return fmt.Errorf("converge: subscribe failed: %w", err)
+		return errors.Errorf("converge: subscribe failed: %w", err)
 	}
 
 	ticker := time.NewTicker(30 * time.Second)
@@ -82,7 +83,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("converge: reconciliation loop stopped")
+			zap.S().Infof("converge: reconciliation loop stopped")
 			return ctx.Err()
 
 		case desired := <-r.pendingDesired:
@@ -115,7 +116,7 @@ func (r *Reconciler) recover(ctx context.Context) error {
 			Recorded: *recorded,
 			Status:   model.ConfigConverged,
 		}
-		log.Printf("converge: recovered config %q (version %d, status %s)",
+		zap.S().Infof("converge: recovered config %q (version %d, status %s)",
 			id.Name, recorded.DesiredVersion, recorded.Status)
 	}
 	return nil
@@ -134,7 +135,7 @@ func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredSta
 	existing, exists := r.configs[name]
 
 	if !exists {
-		log.Printf("converge: new config %q version %d", name, desired.Version)
+		zap.S().Infof("converge: new config %q version %d", name, desired.Version)
 		r.configs[name] = &model.ManagedConfig{
 			ID:     desired.ConfigID,
 			Desired: desired,
@@ -153,7 +154,7 @@ func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredSta
 		return
 	}
 
-	log.Printf("converge: config %q supersession version %d (was %d)",
+	zap.S().Infof("converge: config %q supersession version %d (was %d)",
 		name, desired.Version, existing.Recorded.DesiredVersion)
 
 	// Save the desired and release lock before supersession
@@ -194,7 +195,7 @@ func (r *Reconciler) supersede(ctx context.Context, configName string) {
 	}
 	r.mu.Unlock()
 
-	log.Printf("converge: superseding %d in-flight ops for config %q", len(runningIDs), configName)
+	zap.S().Infof("converge: superseding %d in-flight ops for config %q", len(runningIDs), configName)
 
 	// Cancel all cancellable operations; wait for non-cancellable ones
 	var waitFor []string
@@ -211,14 +212,14 @@ func (r *Reconciler) supersede(ctx context.Context, configName string) {
 		switch node.Operation.CancelMode {
 		case model.CancelModeNone:
 			waitFor = append(waitFor, id)
-			log.Printf("converge:   op %q: non-cancellable, waiting", id)
+			zap.S().Infof("converge:   op %q: non-cancellable, waiting", id)
 		default:
 			cancelFn()
 			r.mu.Lock()
 			node.Status = model.NodeCancelled
 			delete(r.inFlight, id)
 			r.mu.Unlock()
-			log.Printf("converge:   op %q: cancelled", id)
+			zap.S().Infof("converge:   op %q: cancelled", id)
 		}
 	}
 
@@ -241,7 +242,7 @@ func (r *Reconciler) waitForOps(ctx context.Context, opIDs []string, timeout tim
 	for len(remaining) > 0 {
 		select {
 		case <-waitCtx.Done():
-			log.Printf("converge: timeout waiting for %d ops to complete", len(remaining))
+			zap.S().Warnf("converge: timeout waiting for %d ops to complete", len(remaining))
 			return
 		default:
 		}
@@ -274,7 +275,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 	r.mu.Unlock()
 
 	if !ok {
-		log.Printf("converge: no provider %q for config %q", mc.Desired.ProviderType, mc.ID.Name)
+		zap.S().Errorf("converge: no provider %q for config %q", mc.Desired.ProviderType, mc.ID.Name)
 		r.mu.Lock()
 		mc.Status = model.ConfigError
 		r.mu.Unlock()
@@ -284,7 +285,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 	// Inspect current state
 	observed, err := provider.Inspect(ctx, model.ResourceID{Name: mc.ID.Name})
 	if err != nil {
-		log.Printf("converge: inspect failed for %q: %v", mc.ID.Name, err)
+		zap.S().Errorf("converge: inspect failed for %q: %v", mc.ID.Name, err)
 		r.mu.Lock()
 		mc.Status = model.ConfigError
 		r.mu.Unlock()
@@ -298,7 +299,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 	// Compute diff
 	ops, err := provider.Diff(ctx, observed, mc.Desired)
 	if err != nil {
-		log.Printf("converge: diff failed for %q: %v", mc.ID.Name, err)
+		zap.S().Errorf("converge: diff failed for %q: %v", mc.ID.Name, err)
 		r.mu.Lock()
 		mc.Status = model.ConfigError
 		r.mu.Unlock()
@@ -319,7 +320,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 	r.mergeGlobalGraphLocked(mc)
 	r.mu.Unlock()
 
-	log.Printf("converge: config %q: diff produced %d operations", mc.ID.Name, len(ops))
+	zap.S().Infof("converge: config %q: diff produced %d operations", mc.ID.Name, len(ops))
 }
 
 // mergeGlobalGraphLocked merges this config's DAG into the global graph.
@@ -364,7 +365,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 
 	// Record in journal
 	if err := r.journal.Append(ctx, event); err != nil {
-		log.Printf("converge: journal append failed: %v", err)
+		zap.S().Errorf("converge: journal append failed: %v", err)
 	}
 }
 
@@ -442,7 +443,7 @@ func (r *Reconciler) executeNode(ctx context.Context, node *model.Node) {
 
 func (r *Reconciler) emitEvent(ctx context.Context, event model.Event) {
 	if err := r.events.Publish(ctx, event); err != nil {
-		log.Printf("converge: event publish failed: %v", err)
+		zap.S().Errorf("converge: event publish failed: %v", err)
 	}
 }
 
