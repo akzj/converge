@@ -16,6 +16,7 @@ type configExecution struct {
 	active   *model.Plan
 	attempts map[model.AttemptID]*model.Attempt
 	retired  map[model.AttemptID]*model.Attempt
+	outbox   map[string]model.Event
 }
 
 // PlanRegistry is the concurrency boundary for plans and attempts.
@@ -62,6 +63,9 @@ func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) Execution
 	for _, attempt := range state.retired {
 		snapshot.Attempts = append(snapshot.Attempts, *attempt)
 	}
+	for _, event := range state.outbox {
+		snapshot.Outbox = append(snapshot.Outbox, event)
+	}
 	return snapshot
 }
 
@@ -92,7 +96,7 @@ func (r *PlanRegistry) Restore(ctx context.Context) error {
 		if snapshot == nil || snapshot.Plan == nil {
 			continue
 		}
-		state := &configExecution{active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt)}
+		state := &configExecution{active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
 		for i := range snapshot.Attempts {
 			attempt := snapshot.Attempts[i]
 			copy := attempt
@@ -106,6 +110,9 @@ func (r *PlanRegistry) Restore(ctx context.Context) error {
 				state.attempts[copy.ID] = &copy
 			}
 		}
+		for _, event := range snapshot.Outbox {
+			state.outbox[event.EventID] = event
+		}
 		r.configs[id.Name] = state
 	}
 	return nil
@@ -115,7 +122,7 @@ func cloneConfigExecution(state *configExecution) *configExecution {
 	if state == nil {
 		return nil
 	}
-	copy := &configExecution{active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt)}
+	copy := &configExecution{active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
 	for id, attempt := range state.attempts {
 		value := *attempt
 		copy.attempts[id] = &value
@@ -123,6 +130,9 @@ func cloneConfigExecution(state *configExecution) *configExecution {
 	for id, attempt := range state.retired {
 		value := *attempt
 		copy.retired[id] = &value
+		for id, event := range state.outbox {
+			copy.outbox[id] = event
+		}
 	}
 	return copy
 }
@@ -137,7 +147,7 @@ func (r *PlanRegistry) Install(expected model.Generation, candidate *model.Plan)
 	original := r.configs[candidate.ConfigID.Name]
 	state := cloneConfigExecution(original)
 	if state == nil {
-		state = &configExecution{attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt)}
+		state = &configExecution{attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
 	}
 	current := model.Generation(0)
 	if state.active != nil {
@@ -334,4 +344,57 @@ func (r *PlanRegistry) ReadyOperations(configID model.ConfigID) (*model.Plan, []
 		}
 	}
 	return state.active.Clone(), ready
+}
+
+// EnqueueOutbox persists an event before any best-effort publication.
+func (r *PlanRegistry) EnqueueOutbox(ctx context.Context, event model.Event) error {
+	if event.EventID == "" {
+		return errors.New("outbox event ID is empty")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[event.ConfigID]
+	if current == nil || current.active == nil {
+		return errors.New("outbox config has no active plan")
+	}
+	state := cloneConfigExecution(current)
+	state.outbox[event.EventID] = event
+	if err := r.persistLocked(ctx, state.active.ConfigID, state.active.Generation, state); err != nil {
+		return err
+	}
+	r.configs[event.ConfigID] = state
+	return nil
+}
+
+// PendingOutbox returns copies of all durable pending events.
+func (r *PlanRegistry) PendingOutbox() []model.Event {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var events []model.Event
+	for _, state := range r.configs {
+		for _, event := range state.outbox {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
+// AckOutbox removes an event after successful processing.
+func (r *PlanRegistry) AckOutbox(ctx context.Context, configID model.ConfigID, eventID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[configID.Name]
+	if current == nil || current.active == nil {
+		return nil
+	}
+	if _, exists := current.outbox[eventID]; !exists {
+		return nil
+	}
+	state := cloneConfigExecution(current)
+	delete(state.outbox, eventID)
+	if err := r.persistLocked(ctx, configID, state.active.Generation, state); err != nil {
+		return err
+	}
+	r.configs[configID.Name] = state
+	return nil
 }
