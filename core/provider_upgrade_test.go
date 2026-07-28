@@ -1,0 +1,50 @@
+package core
+
+import (
+	"context"
+	"testing"
+
+	"github.com/akzj/converge/pkg/model"
+)
+
+type versionProvider struct {
+	lifecycleProvider
+	digest   string
+	executed chan string
+}
+
+func (p *versionProvider) Digest() string { return p.digest }
+func (p *versionProvider) Execute(context.Context, model.Operation) (model.StepResult, error) {
+	p.executed <- p.digest
+	return model.StepResult{State: model.StepCompleted}, nil
+}
+
+func TestExecutorUsesProviderVersionBoundToPlanDigest(t *testing.T) {
+	ctx := context.Background()
+	r := NewReconciler(NewMemoryStateStore(), NewMemoryExecutionStore(), NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
+	executed := make(chan string, 2)
+	oldProvider := &versionProvider{lifecycleProvider: lifecycleProvider{name: "versioned"}, digest: "old", executed: executed}
+	newProvider := &versionProvider{lifecycleProvider: lifecycleProvider{name: "versioned"}, digest: "new", executed: executed}
+	r.RegisterProvider(ctx, oldProvider)
+	desired := model.DesiredState{ConfigID: model.ConfigID{Name: "config"}, ProviderType: "versioned", Version: 1, Digest: "desired"}
+	candidate, err := BuildCandidate(desired.ConfigID, desired, oldProvider.Type(), oldProvider.Digest(), []model.Operation{{Key: "apply", Provider: oldProvider.Type()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _, err := r.registry.Install(ctx, 0, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Replace current provider after plan installation, before execution.
+	r.RegisterProvider(ctx, newProvider)
+	operation := plan.Nodes["apply"].Operation
+	attempt, err := r.registry.StartAttempt(ctx, plan.ConfigID, plan.Generation, operation.Key, "attempt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.executeAttempt(ctx, plan, operation, attempt)
+	if got := <-executed; got != "old" {
+		t.Fatalf("plan executed with provider digest %q, want old", got)
+	}
+}

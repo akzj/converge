@@ -19,12 +19,13 @@ const maxConcurrentExecutions = 10
 type Reconciler struct {
 	mu sync.RWMutex
 
-	providers map[string]Provider
-	store     StateStore
-	events    EventBus
-	arbiter   Arbiter
-	journal   Journal
-	registry  *PlanRegistry
+	providers        map[string]Provider
+	providerVersions map[string]map[string]Provider
+	store            StateStore
+	events           EventBus
+	arbiter          Arbiter
+	journal          Journal
+	registry         *PlanRegistry
 
 	configs map[string]*model.ManagedConfig
 	cancels map[model.AttemptID]context.CancelFunc
@@ -36,7 +37,7 @@ type Reconciler struct {
 
 func NewReconciler(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
 	return &Reconciler{
-		providers: make(map[string]Provider), store: store, events: events, arbiter: arbiter, journal: journal,
+		providers: make(map[string]Provider), providerVersions: make(map[string]map[string]Provider), store: store, events: events, arbiter: arbiter, journal: journal,
 		registry: NewPlanRegistry(executionStore), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc),
 		pendingDesired: make(chan model.DesiredState, 128), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions),
 	}
@@ -45,6 +46,10 @@ func NewReconciler(store StateStore, executionStore ExecutionStore, events Event
 func (r *Reconciler) RegisterProvider(ctx context.Context, provider Provider) {
 	r.mu.Lock()
 	old := r.providers[provider.Type()]
+	if r.providerVersions[provider.Type()] == nil {
+		r.providerVersions[provider.Type()] = make(map[string]Provider)
+	}
+	r.providerVersions[provider.Type()][provider.Digest()] = provider
 	r.providers[provider.Type()] = provider
 	var affected []string
 	if old == nil || old.Digest() != provider.Digest() {
@@ -297,8 +302,12 @@ func (r *Reconciler) executeAttempt(ctx context.Context, plan *model.Plan, opera
 	}
 	r.mu.Lock()
 	r.cancels[attempt.ID] = cancel
-	provider := r.providers[operation.Provider]
+	provider := r.providerVersions[operation.Provider][plan.ProviderDigest]
 	r.mu.Unlock()
+	if provider == nil {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "provider_version_unavailable", Reason: "provider implementation matching plan digest is unavailable", Retryable: true})
+		return
+	}
 	defer func() { cancel(); r.mu.Lock(); delete(r.cancels, attempt.ID); r.mu.Unlock() }()
 
 	for _, condition := range operation.Conditions {
