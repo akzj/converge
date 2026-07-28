@@ -57,6 +57,64 @@ func (s *MemoryStateStore) Delete(_ context.Context, id model.ConfigID) error {
 	return nil
 }
 
+// MemoryExecutionStore is a durable-contract in-memory implementation for tests.
+type MemoryExecutionStore struct {
+	mu         sync.RWMutex
+	executions map[model.ConfigID]ExecutionSnapshot
+}
+
+func NewMemoryExecutionStore() *MemoryExecutionStore {
+	return &MemoryExecutionStore{executions: make(map[model.ConfigID]ExecutionSnapshot)}
+}
+
+func (s *MemoryExecutionStore) LoadExecution(_ context.Context, id model.ConfigID) (*ExecutionSnapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snapshot, ok := s.executions[id]
+	if !ok {
+		return nil, nil
+	}
+	copy := cloneExecutionSnapshot(snapshot)
+	return &copy, nil
+}
+
+func (s *MemoryExecutionStore) ListExecutions(_ context.Context) ([]model.ConfigID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]model.ConfigID, 0, len(s.executions))
+	for id := range s.executions {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func (s *MemoryExecutionStore) CommitExecutionCAS(_ context.Context, id model.ConfigID, expected model.Generation, snapshot ExecutionSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := model.Generation(0)
+	if stored, ok := s.executions[id]; ok && stored.Plan != nil {
+		current = stored.Plan.Generation
+	}
+	if current != expected {
+		return ErrGenerationChanged
+	}
+	s.executions[id] = cloneExecutionSnapshot(snapshot)
+	return nil
+}
+
+func (s *MemoryExecutionStore) DeleteExecution(_ context.Context, id model.ConfigID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.executions, id)
+	return nil
+}
+
+func cloneExecutionSnapshot(snapshot ExecutionSnapshot) ExecutionSnapshot {
+	copy := ExecutionSnapshot{Plan: snapshot.Plan.Clone(), Attempts: make([]model.Attempt, len(snapshot.Attempts))}
+	copy.Attempts = append(copy.Attempts[:0], snapshot.Attempts...)
+	return copy
+}
+
 // MemoryEventBus is an in-memory EventBus for testing and development.
 type MemoryEventBus struct {
 	mu       sync.RWMutex
