@@ -47,7 +47,7 @@ func (r *Reconciler) RegisterProvider(ctx context.Context, provider Provider) {
 	old := r.providers[provider.Type()]
 	r.providers[provider.Type()] = provider
 	var affected []string
-	if old != nil && old.Digest() != provider.Digest() {
+	if old == nil || old.Digest() != provider.Digest() {
 		for name, config := range r.configs {
 			if config.Desired.ProviderType == provider.Type() {
 				affected = append(affected, name)
@@ -115,7 +115,6 @@ func (r *Reconciler) recover(ctx context.Context) error {
 		return err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	for _, id := range ids {
 		recorded, err := r.store.Get(ctx, id)
 		if err != nil {
@@ -124,7 +123,34 @@ func (r *Reconciler) recover(ctx context.Context) error {
 		if recorded == nil {
 			continue
 		}
-		r.configs[id.Name] = &model.ManagedConfig{ID: id, Recorded: *recorded, Status: model.ConfigConverged, Desired: model.DesiredState{ConfigID: id, ProviderType: recorded.ProviderType, Version: recorded.DesiredVersion, Digest: recorded.DesiredDigest}}
+		r.configs[id.Name] = &model.ManagedConfig{ID: id, Recorded: *recorded, Status: recorded.Status, Desired: model.DesiredState{ConfigID: id, ProviderType: recorded.ProviderType, Version: recorded.DesiredVersion, Digest: recorded.DesiredDigest}}
+	}
+	// Execution plans are the authority for in-progress/newer desired revisions.
+	for _, plan := range r.registry.ExecutionPlans() {
+		desired := model.CloneDesiredState(plan.Desired)
+		if desired.ConfigID.Name == "" {
+			desired.ConfigID = plan.ConfigID
+		}
+		managed := r.configs[plan.ConfigID.Name]
+		if managed == nil {
+			managed = &model.ManagedConfig{ID: plan.ConfigID}
+			r.configs[plan.ConfigID.Name] = managed
+		}
+		if desired.Version >= managed.Desired.Version {
+			managed.Desired = desired
+			managed.DependsOnConfigs = append([]string(nil), desired.DependsOn...)
+			managed.Status = model.ConfigConverging
+		}
+	}
+	r.mu.Unlock()
+	// Unknown/draining effects need active inspection/replanning after recovery.
+	for _, plan := range r.registry.ExecutionPlans() {
+		r.mu.RLock()
+		providerAvailable := r.providers[plan.ProviderType] != nil
+		r.mu.RUnlock()
+		if providerAvailable {
+			r.planLatest(ctx, plan.ConfigID.Name)
+		}
 	}
 	return nil
 }

@@ -25,6 +25,7 @@ type PlanChange struct {
 func BuildCandidate(config model.ConfigID, desired model.DesiredState, providerType, providerDigest string, operations []model.Operation) (*model.Plan, error) {
 	plan := &model.Plan{
 		ConfigID:       config,
+		Desired:        model.CloneDesiredState(desired),
 		DesiredVersion: desired.Version,
 		DesiredDigest:  desired.Digest,
 		ProviderType:   providerType,

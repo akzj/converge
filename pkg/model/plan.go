@@ -6,6 +6,7 @@ import "time"
 type Plan struct {
 	ID             PlanID                 `json:"id"`
 	ConfigID       ConfigID               `json:"config_id"`
+	Desired        DesiredState           `json:"desired"`
 	DesiredVersion uint64                 `json:"desired_version"`
 	DesiredDigest  string                 `json:"desired_digest"`
 	ProviderType   string                 `json:"provider_type"`
@@ -57,6 +58,7 @@ func (p *Plan) Clone() *Plan {
 		return nil
 	}
 	clone := *p
+	clone.Desired = CloneDesiredState(p.Desired)
 	clone.Nodes = make(map[OperationKey]*Node, len(p.Nodes))
 	for key, node := range p.Nodes {
 		if node == nil {
@@ -73,4 +75,12 @@ func (p *Plan) Clone() *Plan {
 		clone.Nodes[key] = &nodeClone
 	}
 	return &clone
+}
+
+// CloneDesiredState returns a deep copy safe for durable plan snapshots.
+func CloneDesiredState(desired DesiredState) DesiredState {
+	copy := desired
+	copy.Spec = append([]byte(nil), desired.Spec...)
+	copy.DependsOn = append([]string(nil), desired.DependsOn...)
+	return copy
 }

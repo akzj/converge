@@ -53,6 +53,20 @@ func (r *PlanRegistry) Snapshot(configID model.ConfigID) model.PlanSnapshot {
 	}
 	return result
 }
+
+// ExecutionPlans returns deep copies of all durable active plans.
+func (r *PlanRegistry) ExecutionPlans() []*model.Plan {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	plans := make([]*model.Plan, 0, len(r.configs))
+	for _, state := range r.configs {
+		if state.active != nil {
+			plans = append(plans, state.active.Clone())
+		}
+	}
+	return plans
+}
+
 func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) ExecutionSnapshot {
 	if state == nil {
 		return ExecutionSnapshot{}
