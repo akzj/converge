@@ -282,16 +282,37 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 			continue
 		}
 		for _, operation := range operations {
+			// Capacity is acquired before publishing Running, so the number of
+			// durable running attempts and goroutines is bounded together.
+			select {
+			case r.execSem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			attemptID, err := newAttemptID()
 			if err != nil {
+				<-r.execSem
 				zap.L().Error("converge: generate attempt ID", zap.Error(err))
 				continue
 			}
+			opCtx, cancel := context.WithCancel(ctx)
+			if operation.Timeout > 0 {
+				opCtx, cancel = context.WithTimeout(ctx, time.Duration(operation.Timeout))
+			}
+			// Register cancellation before exposing Running to close the launch race.
+			r.mu.Lock()
+			r.cancels[attemptID] = cancel
+			r.mu.Unlock()
 			attempt, err := r.registry.StartAttempt(ctx, id, plan.Generation, operation.Key, attemptID)
 			if err != nil {
+				cancel()
+				r.mu.Lock()
+				delete(r.cancels, attemptID)
+				r.mu.Unlock()
+				<-r.execSem
 				continue
 			}
-			go r.executeAttempt(ctx, plan, operation, attempt)
+			go r.executeAttempt(ctx, opCtx, cancel, plan, operation, attempt)
 		}
 	}
 }
@@ -304,17 +325,11 @@ func newAttemptID() (model.AttemptID, error) {
 	return model.AttemptID(hex.EncodeToString(value[:])), nil
 }
 
-func (r *Reconciler) executeAttempt(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt) {
-	r.execSem <- struct{}{}
+func (r *Reconciler) executeAttempt(ctx, opCtx context.Context, cancel context.CancelFunc, plan *model.Plan, operation model.Operation, attempt *model.Attempt) {
 	defer func() { <-r.execSem }()
-	opCtx, cancel := context.WithCancel(ctx)
-	if operation.Timeout > 0 {
-		opCtx, cancel = context.WithTimeout(ctx, time.Duration(operation.Timeout))
-	}
-	r.mu.Lock()
-	r.cancels[attempt.ID] = cancel
+	r.mu.RLock()
 	provider := r.providerVersions[operation.Provider][plan.ProviderDigest]
-	r.mu.Unlock()
+	r.mu.RUnlock()
 	if provider == nil {
 		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "provider_version_unavailable", Reason: "provider implementation matching plan digest is unavailable", Retryable: true})
 		return

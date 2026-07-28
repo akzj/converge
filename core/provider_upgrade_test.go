@@ -43,7 +43,12 @@ func TestExecutorUsesProviderVersionBoundToPlanDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.executeAttempt(ctx, plan, operation, attempt)
+	r.execSem <- struct{}{}
+	opCtx, cancel := context.WithCancel(ctx)
+	r.mu.Lock()
+	r.cancels[attempt.ID] = cancel
+	r.mu.Unlock()
+	r.executeAttempt(ctx, opCtx, cancel, plan, operation, attempt)
 	if got := <-executed; got != "old" {
 		t.Fatalf("plan executed with provider digest %q, want old", got)
 	}
