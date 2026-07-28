@@ -197,16 +197,23 @@ func (a *MemoryArbiter) Acquire(_ context.Context, operationID string) (func(), 
 type MemoryJournal struct {
 	mu     sync.RWMutex
 	events []model.Event
+	seen   map[string]struct{}
 }
 
 func NewMemoryJournal() *MemoryJournal {
-	return &MemoryJournal{}
+	return &MemoryJournal{seen: make(map[string]struct{})}
 }
 
 func (j *MemoryJournal) Append(_ context.Context, event model.Event) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.events = append(j.events, event)
+	if event.EventID != "" {
+		if _, exists := j.seen[event.EventID]; exists {
+			return nil
+		}
+		j.seen[event.EventID] = struct{}{}
+	}
+	j.events = append(j.events, cloneEvent(event))
 	return nil
 }
 

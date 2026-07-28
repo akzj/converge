@@ -19,7 +19,6 @@ func TestMemoryExecutionStoreCASAndDeepCopy(t *testing.T) {
 	if err := store.CommitExecutionCAS(ctx, id, 0, snapshot); !errors.Is(err, ErrGenerationChanged) {
 		t.Fatalf("stale CAS error=%v", err)
 	}
-
 	loaded, err := store.LoadExecution(ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -57,5 +56,25 @@ func TestMemoryExecutionStoreRejectsStaleSameGenerationTransition(t *testing.T) 
 	}
 	if loaded.Revision != 2 || loaded.Plan.Generation != 7 {
 		t.Fatalf("snapshot=%#v", loaded)
+	}
+}
+
+func TestMemoryJournalAppendIsIdempotentByEventID(t *testing.T) {
+	ctx := context.Background()
+	journal := NewMemoryJournal()
+	event := model.Event{EventID: "event-1", ConfigID: "config", Observed: model.ObservedState{Properties: []byte("original")}}
+	if err := journal.Append(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Append(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	event.Observed.Properties[0] = 'X'
+	events, err := journal.Events(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || string(events[0].Observed.Properties) != "original" {
+		t.Fatalf("events=%#v", events)
 	}
 }
