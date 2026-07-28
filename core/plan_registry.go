@@ -138,7 +138,7 @@ func cloneConfigExecution(state *configExecution) *configExecution {
 }
 
 // Install performs generation CAS and atomically transfers compatible state.
-func (r *PlanRegistry) Install(expected model.Generation, candidate *model.Plan) (*model.Plan, PlanChange, error) {
+func (r *PlanRegistry) Install(ctx context.Context, expected model.Generation, candidate *model.Plan) (*model.Plan, PlanChange, error) {
 	if candidate == nil {
 		return nil, PlanChange{}, errors.New("candidate plan is nil")
 	}
@@ -186,7 +186,7 @@ func (r *PlanRegistry) Install(expected model.Generation, candidate *model.Plan)
 		r.retire(state, change.Drain, model.AttemptDraining)
 	}
 	state.active = installed
-	if err := r.persistLocked(context.Background(), candidate.ConfigID, current, state); err != nil {
+	if err := r.persistLocked(ctx, candidate.ConfigID, current, state); err != nil {
 		return nil, PlanChange{}, err
 	}
 	r.configs[candidate.ConfigID.Name] = state
@@ -210,7 +210,7 @@ func (r *PlanRegistry) retire(state *configExecution, keys []model.OperationKey,
 }
 
 // StartAttempt atomically transitions one pending/ready node to Running.
-func (r *PlanRegistry) StartAttempt(configID model.ConfigID, generation model.Generation, key model.OperationKey, attemptID model.AttemptID) (*model.Attempt, error) {
+func (r *PlanRegistry) StartAttempt(ctx context.Context, configID model.ConfigID, generation model.Generation, key model.OperationKey, attemptID model.AttemptID) (*model.Attempt, error) {
 	if attemptID == "" {
 		return nil, errors.New("attempt ID is empty")
 	}
@@ -234,7 +234,7 @@ func (r *PlanRegistry) StartAttempt(configID model.ConfigID, generation model.Ge
 	attempt := &model.Attempt{ID: attemptID, PlanID: state.active.ID, Generation: generation, ConfigID: configID, NodeKey: key, Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey, Status: model.AttemptRunning}
 	node.Status, node.AttemptID = model.NodeRunning, attemptID
 	state.attempts[attemptID] = attempt
-	if err := r.persistLocked(context.Background(), configID, generation, state); err != nil {
+	if err := r.persistLocked(ctx, configID, generation, state); err != nil {
 		return nil, err
 	}
 	r.configs[configID.Name] = state
@@ -243,7 +243,7 @@ func (r *PlanRegistry) StartAttempt(configID model.ConfigID, generation model.Ge
 }
 
 // ApplyEvent routes a terminal event strictly by attempt identity.
-func (r *PlanRegistry) ApplyEvent(event model.Event) (activeChanged, retiredFinished bool, err error) {
+func (r *PlanRegistry) ApplyEvent(ctx context.Context, event model.Event) (activeChanged, retiredFinished bool, err error) {
 	if event.AttemptID == "" {
 		return false, false, errors.New("event attempt ID is empty")
 	}
@@ -281,14 +281,14 @@ func (r *PlanRegistry) ApplyEvent(event model.Event) (activeChanged, retiredFini
 			return false, false, errors.New("active attempt generation mismatch")
 		}
 		node.Status = terminal
-		if err := r.persistLocked(context.Background(), attempt.ConfigID, state.active.Generation, state); err != nil {
+		if err := r.persistLocked(ctx, attempt.ConfigID, state.active.Generation, state); err != nil {
 			return false, false, err
 		}
 		r.configs[event.ConfigID] = state
 		return true, false, nil
 	}
 	delete(state.retired, event.AttemptID)
-	if err := r.persistLocked(context.Background(), attempt.ConfigID, state.active.Generation, state); err != nil {
+	if err := r.persistLocked(ctx, attempt.ConfigID, state.active.Generation, state); err != nil {
 		return false, false, err
 	}
 	r.configs[event.ConfigID] = state

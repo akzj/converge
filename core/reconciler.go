@@ -193,7 +193,7 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 			r.setConfigStatus(name, model.ConfigError)
 			return
 		}
-		installed, change, err := r.registry.Install(expected, candidate)
+		installed, change, err := r.registry.Install(ctx, expected, candidate)
 		if errors.Is(err, ErrGenerationChanged) {
 			continue
 		}
@@ -242,7 +242,7 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 		}
 		for _, operation := range operations {
 			attemptID := model.AttemptID(fmt.Sprintf("%s/%d", plan.ID, r.attemptSeq.Add(1)))
-			attempt, err := r.registry.StartAttempt(id, plan.Generation, operation.Key, attemptID)
+			attempt, err := r.registry.StartAttempt(ctx, id, plan.Generation, operation.Key, attemptID)
 			if err != nil {
 				continue
 			}
@@ -340,7 +340,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 			return
 		}
 	}
-	changed, retiredFinished, err := r.registry.ApplyEvent(event)
+	changed, retiredFinished, err := r.registry.ApplyEvent(ctx, event)
 	if err != nil {
 		zap.L().Warn("converge: ignored invalid event", zap.Error(err))
 		return

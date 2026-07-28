@@ -11,14 +11,14 @@ import (
 func TestRetryableFailureUsesFreshAttemptAndStopsAtLimit(t *testing.T) {
 	ctx := context.Background()
 	registry := NewPlanRegistry(NewMemoryExecutionStore())
-	installed, _, err := registry.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := registry.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for number := 1; number <= maxAttemptsPerNode; number++ {
 		attemptID := model.AttemptID(fmt.Sprintf("attempt-%d", number))
-		if _, err := registry.StartAttempt(installed.ConfigID, installed.Generation, "apply", attemptID); err != nil {
+		if _, err := registry.StartAttempt(context.Background(), installed.ConfigID, installed.Generation, "apply", attemptID); err != nil {
 			t.Fatal(err)
 		}
 		event := model.Event{ConfigID: "config", NodeKey: "apply", AttemptID: attemptID, State: model.StepFailed, Result: model.StepResult{State: model.StepFailed, Retryable: true}}
@@ -42,11 +42,11 @@ func TestRetryableFailureUsesFreshAttemptAndStopsAtLimit(t *testing.T) {
 func TestRetryableDuplicateFailureIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	registry := NewPlanRegistry()
-	installed, _, err := registry.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := registry.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.StartAttempt(installed.ConfigID, installed.Generation, "apply", "attempt-1"); err != nil {
+	if _, err := registry.StartAttempt(context.Background(), installed.ConfigID, installed.Generation, "apply", "attempt-1"); err != nil {
 		t.Fatal(err)
 	}
 	event := model.Event{ConfigID: "config", NodeKey: "apply", AttemptID: "attempt-1", State: model.StepFailed, Result: model.StepResult{State: model.StepFailed, Retryable: true}}

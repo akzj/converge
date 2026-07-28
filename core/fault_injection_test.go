@@ -33,7 +33,7 @@ func TestPersistenceFailureDoesNotPublishPlanInMemory(t *testing.T) {
 	store := &failingExecutionStore{inner: NewMemoryExecutionStore(), fail: true}
 	registry := NewPlanRegistry(store)
 	candidate := testPlan(t, "digest", model.Operation{Key: "apply"})
-	if _, _, err := registry.Install(0, candidate); err == nil {
+	if _, _, err := registry.Install(context.Background(), 0, candidate); err == nil {
 		t.Fatal("expected injected persistence failure")
 	}
 	if snapshot := registry.Snapshot(candidate.ConfigID); snapshot.Plan != nil {
@@ -44,12 +44,12 @@ func TestPersistenceFailureDoesNotPublishPlanInMemory(t *testing.T) {
 func TestPersistenceFailureDoesNotStartAttemptInMemory(t *testing.T) {
 	store := &failingExecutionStore{inner: NewMemoryExecutionStore()}
 	registry := NewPlanRegistry(store)
-	installed, _, err := registry.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := registry.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	store.fail = true
-	if _, err := registry.StartAttempt(installed.ConfigID, installed.Generation, "apply", "attempt-1"); err == nil {
+	if _, err := registry.StartAttempt(context.Background(), installed.ConfigID, installed.Generation, "apply", "attempt-1"); err == nil {
 		t.Fatal("expected injected persistence failure")
 	}
 	snapshot := registry.Snapshot(installed.ConfigID)
@@ -61,7 +61,7 @@ func TestPersistenceFailureDoesNotStartAttemptInMemory(t *testing.T) {
 func TestPersistenceFailureDoesNotEnqueueOutboxInMemory(t *testing.T) {
 	store := &failingExecutionStore{inner: NewMemoryExecutionStore()}
 	registry := NewPlanRegistry(store)
-	installed, _, err := registry.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := registry.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
 	if err != nil {
 		t.Fatal(err)
 	}

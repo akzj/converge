@@ -11,7 +11,7 @@ func TestOutboxIsDurableUntilAcknowledged(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryExecutionStore()
 	registry := NewPlanRegistry(store)
-	installed, _, err := registry.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := registry.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestOutboxIsDurableUntilAcknowledged(t *testing.T) {
 func TestOutboxEnqueueIsIdempotentByEventID(t *testing.T) {
 	ctx := context.Background()
 	registry := NewPlanRegistry(NewMemoryExecutionStore())
-	installed, _, err := registry.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := registry.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
 	if err != nil {
 		t.Fatal(err)
 	}

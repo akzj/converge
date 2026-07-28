@@ -12,11 +12,11 @@ func TestWaitingTransitionIsDurableAndUsesFreshAttempt(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryExecutionStore()
 	registry := NewPlanRegistry(store)
-	installed, _, err := registry.Install(0, testPlan(t, "digest", model.Operation{Key: "wait"}))
+	installed, _, err := registry.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "wait"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.StartAttempt(installed.ConfigID, installed.Generation, "wait", "attempt-1"); err != nil {
+	if _, err := registry.StartAttempt(context.Background(), installed.ConfigID, installed.Generation, "wait", "attempt-1"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -42,7 +42,7 @@ func TestWaitingTransitionIsDurableAndUsesFreshAttempt(t *testing.T) {
 	if got := registry.Snapshot(installed.ConfigID).Plan.Nodes["wait"].Status; got != model.NodePending {
 		t.Fatalf("did not wake: %s", got)
 	}
-	if _, err := registry.StartAttempt(installed.ConfigID, installed.Generation, "wait", "attempt-2"); err != nil {
+	if _, err := registry.StartAttempt(context.Background(), installed.ConfigID, installed.Generation, "wait", "attempt-2"); err != nil {
 		t.Fatal(err)
 	}
 
