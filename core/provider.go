@@ -1,5 +1,4 @@
-// Package core defines the Converge engine: reconciliation loop, DAG scheduler,
-// executor, safety layer, and Provider contract.
+// Package core defines the Converge execution engine and provider contract.
 package core
 
 import (
@@ -11,31 +10,28 @@ import (
 	"github.com/akzj/converge/pkg/model"
 )
 
-// Provider is the interface every Converge resource provider must implement.
-//
-// Converge Core does not interpret Action strings — they are opaque tokens
-// passed from Diff to Execute. The Provider owns all resource-specific
-// semantics: what "provision", "deprovision", or "reconcile" means for an
-// nginx config vs a GPU driver vs a Vault cluster.
+// Provider owns all resource-specific planning and execution semantics.
 type Provider interface {
-	// Type returns the resource type this provider handles (e.g. "nginx.config").
 	Type() string
-
-	// Digest returns a stable identifier for this provider implementation version.
-	// When Digest changes, the Core re-reconciles all configs using this provider.
 	Digest() string
-
-	// Inspect reads the current real-world state of a resource.
 	Inspect(ctx context.Context, resource model.ResourceID) (model.ObservedState, error)
-
-	// Diff computes the set of Operations needed to transform observed into desired.
-	Diff(ctx context.Context, observed model.ObservedState, desired model.DesiredState) ([]model.Operation, error)
-
-	// Execute performs one Operation and returns its result.
+	Replan(ctx context.Context, request ReplanRequest) (ReplanResult, error)
 	Execute(ctx context.Context, op model.Operation) (model.StepResult, error)
-
-	// Verify confirms convergence by reading back and comparing against desired.
 	Verify(ctx context.Context, resource model.ResourceID, desired model.DesiredState) (model.ObservedState, error)
+}
+
+// ReplanRequest is the provider's read-only input for building a candidate plan.
+type ReplanRequest struct {
+	Observed       model.ObservedState
+	Desired        model.DesiredState
+	Active         model.PlanSnapshot
+	ProviderDigest string
+}
+
+// ReplanResult is provisional. Core assigns identity/generation, validates
+// fingerprints and DAG structure, then installs it atomically.
+type ReplanResult struct {
+	Operations []model.Operation
 }
 
 // StateStore persists the last-known applied state for each configuration.
@@ -63,10 +59,7 @@ type Journal interface {
 	Events(ctx context.Context, configID string) ([]model.Event, error)
 }
 
-// log returns the package-level structured logger.
-func log() *zap.Logger {
-	return zap.L()
-}
+func log() *zap.Logger { return zap.L() }
 
 func init() {
 	logger, err := zap.NewProduction()

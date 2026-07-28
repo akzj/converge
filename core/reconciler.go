@@ -47,7 +47,7 @@ func NewReconciler(store StateStore, events EventBus, arbiter Arbiter, journal J
 		globalGraph:    &model.Graph{Nodes: make(map[string]*model.Node)},
 		inFlight:       make(map[string]context.CancelFunc),
 		pendingDesired: make(chan model.DesiredState, 128),
-		execSem:        make(chan struct{}, maxConcurrentExecutions),		pendingDelete:  make(chan string, 128),
+		execSem:        make(chan struct{}, maxConcurrentExecutions), pendingDelete: make(chan string, 128),
 	}
 }
 
@@ -254,10 +254,10 @@ func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredSta
 			zap.String("config", name),
 			zap.Uint64("version", desired.Version))
 		r.configs[name] = &model.ManagedConfig{
-			ID:     desired.ConfigID,
-			Desired: desired,
-			Status: model.ConfigConverging,
-			Graph:  &model.Graph{Nodes: make(map[string]*model.Node)},
+			ID:               desired.ConfigID,
+			Desired:          desired,
+			Status:           model.ConfigConverging,
+			Graph:            &model.Graph{Nodes: make(map[string]*model.Node)},
 			DependsOnConfigs: append([]string(nil), desired.DependsOn...),
 		}
 		r.mu.Unlock()
@@ -292,6 +292,7 @@ func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredSta
 	// Phase 3: reconcile with fresh Inspect
 	r.reconcile(ctx, existing)
 }
+
 // deleteConfig removes a config and all its dependents in reverse dependency order.
 func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
 	r.mu.Lock()
@@ -407,7 +408,6 @@ func (r *Reconciler) invalidateDependents(ctx context.Context, configName string
 		r.reconcile(ctx, mc)
 	}
 }
-
 
 // supersede handles in-flight operations when a new desired state arrives.
 // Must NOT be called with r.mu held.
@@ -563,7 +563,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 	r.mu.Unlock()
 
 	// Compute diff
-	ops, err := provider.Diff(ctx, observed, mc.Desired)
+	replan, err := provider.Replan(ctx, ReplanRequest{Observed: observed, Desired: mc.Desired, ProviderDigest: providerDigest})
 	if err != nil {
 		zap.L().Error("converge: diff failed",
 			zap.String("config", mc.ID.Name),
@@ -575,6 +575,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 	}
 
 	// Build DAG
+	ops := replan.Operations
 	if len(ops) == 0 {
 		// Already converged — no operations needed
 		r.mu.Lock()
@@ -645,6 +646,7 @@ func (r *Reconciler) mergeGlobalGraphLocked(mc *model.ManagedConfig) {
 		r.globalGraph.Nodes[id] = node
 	}
 }
+
 // dependenciesMet checks whether all configs this one depends on have converged.
 func (r *Reconciler) dependenciesMet(mc *model.ManagedConfig) bool {
 	if len(mc.DependsOnConfigs) == 0 {
@@ -660,7 +662,6 @@ func (r *Reconciler) dependenciesMet(mc *model.ManagedConfig) bool {
 	}
 	return true
 }
-
 
 // ---------------------------------------------------------------------------
 // Event handling

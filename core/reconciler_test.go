@@ -16,17 +16,17 @@ type mockProvider struct {
 	executed int32 // number of Execute calls
 }
 
-func (m *mockProvider) Type() string { return m.typeName }
+func (m *mockProvider) Type() string   { return m.typeName }
 func (m *mockProvider) Digest() string { return "sha256:mock-" + m.typeName }
-
 
 func (m *mockProvider) Inspect(_ context.Context, _ model.ResourceID) (model.ObservedState, error) {
 	return model.ObservedState{Present: false}, nil
 }
 
-func (m *mockProvider) Diff(_ context.Context, observed model.ObservedState, desired model.DesiredState) ([]model.Operation, error) {
+func (m *mockProvider) Replan(_ context.Context, request ReplanRequest) (ReplanResult, error) {
+	observed := request.Observed
 	if !observed.Present {
-		return []model.Operation{
+		return ReplanResult{Operations: []model.Operation{
 			{
 				ID: "provision-" + m.typeName, Action: "provision",
 				Phase: model.PhaseCommit, Destructive: false,
@@ -37,9 +37,9 @@ func (m *mockProvider) Diff(_ context.Context, observed model.ObservedState, des
 				Phase: model.PhaseVerify, Destructive: false,
 				DependsOn: []string{"provision-" + m.typeName},
 			},
-		}, nil
+		}}, nil
 	}
-	return nil, nil
+	return ReplanResult{}, nil
 }
 
 func (m *mockProvider) Execute(ctx context.Context, op model.Operation) (model.StepResult, error) {
