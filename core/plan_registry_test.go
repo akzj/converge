@@ -162,3 +162,35 @@ func TestPlanRegistryUnknownOldEventCannotMutateActive(t *testing.T) {
 		t.Fatalf("unknown event mutated node: %s", got)
 	}
 }
+
+func TestPlanRegistryRetiredConflictBarrier(t *testing.T) {
+	r := NewPlanRegistry()
+	old := testPlan(t, "digest", model.Operation{Key: "old", Action: "old", CancelMode: model.CancelModeNone, ConflictKey: "resource/x"})
+	installed, _, err := r.Install(0, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.StartAttempt(installed.ConfigID, installed.Generation, "old", "attempt-old"); err != nil {
+		t.Fatal(err)
+	}
+	candidate := testPlan(t, "digest", model.Operation{Key: "blocked", Action: "new", ConflictKey: "resource/x"}, model.Operation{Key: "free", Action: "new", ConflictKey: "resource/y"})
+	installed, change, err := r.Install(1, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(change.Drain) != 1 {
+		t.Fatalf("expected drain: %#v", change)
+	}
+	_, ready := r.ReadyOperations(installed.ConfigID)
+	if len(ready) != 1 || ready[0].Key != "free" {
+		t.Fatalf("barrier ready set=%#v, want only free", ready)
+	}
+	_, retiredFinished, err := r.ApplyEvent(model.Event{ConfigID: "config", NodeKey: "old", AttemptID: "attempt-old", State: model.StepCompleted})
+	if err != nil || !retiredFinished {
+		t.Fatalf("retired completion failed: %v %v", retiredFinished, err)
+	}
+	_, ready = r.ReadyOperations(installed.ConfigID)
+	if len(ready) != 2 {
+		t.Fatalf("barrier not released: %#v", ready)
+	}
+}

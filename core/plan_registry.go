@@ -202,3 +202,37 @@ func terminalAttemptStatus(state model.StepState) (model.AttemptStatus, model.No
 func isTerminalAttempt(status model.AttemptStatus) bool {
 	return status == model.AttemptCompleted || status == model.AttemptFailed || status == model.AttemptCancelled
 }
+
+// ReadyOperations returns dependency-ready nodes not blocked by retired effects.
+func (r *PlanRegistry) ReadyOperations(configID model.ConfigID) (*model.Plan, []model.Operation) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state := r.configs[configID.Name]
+	if state == nil || state.active == nil {
+		return nil, nil
+	}
+	blocked := make(map[string]bool)
+	for _, attempt := range state.retired {
+		if attempt.Status == model.AttemptCancelling || attempt.Status == model.AttemptDraining || attempt.Status == model.AttemptUnknown {
+			blocked[attempt.ConflictKey] = true
+		}
+	}
+	var ready []model.Operation
+	for _, node := range state.active.Nodes {
+		if node.Status != model.NodePending || blocked[node.Operation.ConflictKey] {
+			continue
+		}
+		dependenciesDone := true
+		for _, dependency := range node.Operation.DependsOn {
+			dep := state.active.Nodes[model.OperationKey(dependency)]
+			if dep == nil || dep.Status != model.NodeCompleted {
+				dependenciesDone = false
+				break
+			}
+		}
+		if dependenciesDone {
+			ready = append(ready, node.Operation)
+		}
+	}
+	return state.active.Clone(), ready
+}
