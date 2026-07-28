@@ -315,15 +315,17 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 		zap.L().Error("converge: append journal", zap.Error(err))
 		return
 	}
-	defer func() {
+	ack := func() {
 		if err := r.registry.AckOutbox(ctx, model.ConfigID{Name: event.ConfigID}, event.EventID); err != nil {
 			zap.L().Error("converge: acknowledge outbox", zap.Error(err))
 		}
-	}()
+	}
 	if event.State == model.StepWaiting {
 		if err := r.registry.ApplyWaiting(ctx, event); err != nil {
-			zap.L().Warn("converge: invalid waiting event", zap.Error(err))
+			zap.L().Warn("converge: waiting transition failed; retaining outbox event", zap.Error(err))
+			return
 		}
+		ack()
 		return
 	}
 	if event.State == model.StepFailed && event.Result.Retryable {
@@ -333,18 +335,22 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 			return
 		}
 		if retried {
+			ack()
 			r.executeReady(ctx)
 			return
 		}
 		if !exhausted {
+			// The attempt was already transitioned by an earlier delivery.
+			ack()
 			return
 		}
 	}
 	changed, retiredFinished, err := r.registry.ApplyEvent(ctx, event)
 	if err != nil {
-		zap.L().Warn("converge: ignored invalid event", zap.Error(err))
+		zap.L().Warn("converge: event transition failed; retaining outbox event", zap.Error(err))
 		return
 	}
+	ack()
 	if retiredFinished {
 		r.planLatest(ctx, event.ConfigID)
 		return

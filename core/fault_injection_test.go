@@ -74,3 +74,40 @@ func TestPersistenceFailureDoesNotEnqueueOutboxInMemory(t *testing.T) {
 		t.Fatalf("failed enqueue leaked into memory: %#v", events)
 	}
 }
+
+func TestEventTransitionFailureRetainsOutboxForRetry(t *testing.T) {
+	ctx := context.Background()
+	store := &failingExecutionStore{inner: NewMemoryExecutionStore()}
+	registry := NewPlanRegistry(store)
+	installed, _, err := registry.Install(ctx, 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.StartAttempt(ctx, installed.ConfigID, installed.Generation, "apply", "attempt-1"); err != nil {
+		t.Fatal(err)
+	}
+	event := model.Event{EventID: "event-1", ConfigID: installed.ConfigID.Name, PlanID: installed.ID, Generation: installed.Generation, NodeKey: "apply", AttemptID: "attempt-1", State: model.StepCompleted, Result: model.StepResult{State: model.StepCompleted}}
+	if err := registry.EnqueueOutbox(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewReconciler(NewMemoryStateStore(), store, NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
+	r.registry = registry
+	store.fail = true
+	r.handleEvent(ctx, event)
+	if pending := registry.PendingOutbox(); len(pending) != 1 {
+		t.Fatalf("failed transition acknowledged event: %#v", pending)
+	}
+	if status := registry.Snapshot(installed.ConfigID).Plan.Nodes["apply"].Status; status != model.NodeRunning {
+		t.Fatalf("failed transition changed status: %s", status)
+	}
+
+	store.fail = false
+	r.handleEvent(ctx, event)
+	if pending := registry.PendingOutbox(); len(pending) != 0 {
+		t.Fatalf("successful retry did not acknowledge event: %#v", pending)
+	}
+	if status := registry.Snapshot(installed.ConfigID).Plan.Nodes["apply"].Status; status != model.NodeCompleted {
+		t.Fatalf("retry status=%s, want completed", status)
+	}
+}
