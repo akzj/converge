@@ -794,14 +794,8 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 func (r *Reconciler) executeNode(ctx context.Context, node *model.Node) {
 	op := node.Operation
 
-	// Create cancellable context for this operation, with optional timeout
-	var opCtx context.Context
-	var opCancel context.CancelFunc
-	if op.Timeout > 0 {
-		opCtx, opCancel = context.WithTimeout(ctx, time.Duration(op.Timeout))
-	} else {
-		opCtx, opCancel = context.WithCancel(ctx)
-	}
+	// Create cancellable context for this operation
+	opCtx, opCancel := context.WithCancel(ctx)
 	defer opCancel()
 
 	r.mu.Lock()
