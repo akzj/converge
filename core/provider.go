@@ -16,6 +16,7 @@ type Provider interface {
 	Digest() string
 	Inspect(ctx context.Context, resource model.ResourceID) (model.ObservedState, error)
 	Replan(ctx context.Context, request ReplanRequest) (ReplanResult, error)
+	EvaluateCondition(ctx context.Context, condition model.Condition) (bool, error)
 	Execute(ctx context.Context, op model.Operation) (model.StepResult, error)
 	Verify(ctx context.Context, resource model.ResourceID, desired model.DesiredState) (model.ObservedState, error)
 }

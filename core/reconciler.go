@@ -263,6 +263,17 @@ func (r *Reconciler) executeAttempt(ctx context.Context, plan *model.Plan, opera
 	r.mu.Unlock()
 	defer func() { cancel(); r.mu.Lock(); delete(r.cancels, attempt.ID); r.mu.Unlock() }()
 
+	for _, condition := range operation.Conditions {
+		met, err := provider.EvaluateCondition(opCtx, condition)
+		if err != nil {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "condition_error", Reason: err.Error(), Retryable: true})
+			return
+		}
+		if !met {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepWaiting, Code: "condition_unmet", NextCheckAt: time.Now().Add(5 * time.Second)})
+			return
+		}
+	}
 	var release func()
 	if operation.Destructive && operation.Phase == model.PhaseCommit {
 		var err error

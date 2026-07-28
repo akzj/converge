@@ -58,6 +58,10 @@ func (m *mockProvider) Verify(_ context.Context, _ model.ResourceID, _ model.Des
 	return model.ObservedState{Present: true}, nil
 }
 
+func (m *mockProvider) EvaluateCondition(_ context.Context, _ model.Condition) (bool, error) {
+	return true, nil
+}
+
 func TestReconcilerSubmitsAndProcessesDesiredState(t *testing.T) {
 	store := NewMemoryStateStore()
 	events := NewMemoryEventBus()
