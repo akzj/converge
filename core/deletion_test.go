@@ -43,3 +43,42 @@ func TestMarkDeletingStopsSchedulingAndPersistsTombstone(t *testing.T) {
 		t.Fatalf("recovered deleting config schedulable: %#v %#v", plan, ready)
 	}
 }
+
+func TestReconcilerDeletionCascadesAndFinalizes(t *testing.T) {
+	ctx := context.Background()
+	stateStore := NewMemoryStateStore()
+	executionStore := NewMemoryExecutionStore()
+	r := NewReconciler(stateStore, executionStore, NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
+	configs := []struct {
+		name    string
+		depends []string
+	}{{"upstream", nil}, {"downstream", []string{"upstream"}}}
+	for _, config := range configs {
+		desired := model.DesiredState{ConfigID: model.ConfigID{Name: config.name}, ProviderType: "test", Version: 1, Digest: config.name, DependsOn: config.depends}
+		candidate, err := BuildCandidate(desired.ConfigID, desired, "test", "digest", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := r.registry.Install(ctx, 0, candidate); err != nil {
+			t.Fatal(err)
+		}
+		recorded := model.RecordedState{ConfigID: desired.ConfigID, ProviderType: "test", DesiredVersion: 1, DesiredDigest: config.name, Status: model.ConfigConverged}
+		if err := stateStore.Record(ctx, recorded); err != nil {
+			t.Fatal(err)
+		}
+		r.configs[config.name] = &model.ManagedConfig{ID: desired.ConfigID, Desired: desired, Recorded: recorded, DependsOnConfigs: config.depends, Status: model.ConfigConverged}
+	}
+	r.deleteConfig(ctx, "upstream")
+	if len(r.configs) != 0 {
+		t.Fatalf("configs remain after cascade: %#v", r.configs)
+	}
+	for _, name := range []string{"upstream", "downstream"} {
+		id := model.ConfigID{Name: name}
+		if snapshot := r.registry.Snapshot(id); snapshot.Plan != nil {
+			t.Fatalf("execution remains for %s", name)
+		}
+		if recorded, err := stateStore.Get(ctx, id); err != nil || recorded != nil {
+			t.Fatalf("record remains for %s: %#v err=%v", name, recorded, err)
+		}
+	}
+}

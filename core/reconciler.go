@@ -150,6 +150,10 @@ func (r *Reconciler) recover(ctx context.Context) error {
 	r.mu.Unlock()
 	// Unknown/draining effects need active inspection/replanning after recovery.
 	for _, plan := range r.registry.ExecutionPlans() {
+		if r.registry.IsDeleting(plan.ConfigID) && r.registry.DeletionReady(plan.ConfigID) {
+			r.finalizeDeletion(ctx, plan.ConfigID)
+			continue
+		}
 		r.mu.RLock()
 		providerAvailable := r.providers[plan.ProviderType] != nil
 		r.mu.RUnlock()
@@ -224,6 +228,12 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		}
 		if err := r.registry.ResolveEffects(ctx, desired.ConfigID, result.Resolutions); err != nil {
 			r.setConfigStatus(name, model.ConfigError)
+			return
+		}
+		if r.registry.IsDeleting(desired.ConfigID) {
+			if r.registry.DeletionReady(desired.ConfigID) {
+				r.finalizeDeletion(ctx, desired.ConfigID)
+			}
 			return
 		}
 		// Resolutions change execution revision/state; re-snapshot before plan CAS.
@@ -436,7 +446,12 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	}
 	ack()
 	if retiredFinished {
-		r.planLatest(ctx, event.ConfigID)
+		configID := model.ConfigID{Name: event.ConfigID}
+		if r.registry.IsDeleting(configID) && r.registry.DeletionReady(configID) {
+			r.finalizeDeletion(ctx, configID)
+		} else {
+			r.planLatest(ctx, event.ConfigID)
+		}
 		return
 	}
 	if !changed {
@@ -510,24 +525,53 @@ func (r *Reconciler) wakeDependents(ctx context.Context, name string) {
 }
 
 func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
+	// Dependents are deleted first so no converged config can reference a
+	// deleted upstream.
+	for _, dependent := range r.transitiveDependents(name) {
+		r.deleteConfig(ctx, dependent)
+	}
 	r.mu.RLock()
 	managed := r.configs[name]
 	r.mu.RUnlock()
 	if managed == nil {
 		return
 	}
-	// Delete durable execution and final state before publishing the deletion in
-	// memory. Any failure leaves the config visible for a safe retry.
-	if err := r.registry.Delete(ctx, managed.ID); err != nil {
-		zap.L().Error("converge: delete execution state", zap.String("config", name), zap.Error(err))
+	attempts, err := r.registry.MarkDeleting(ctx, managed.ID)
+	if err != nil {
+		zap.L().Error("converge: mark config deleting", zap.String("config", name), zap.Error(err))
 		return
 	}
-	if err := r.store.Delete(ctx, managed.ID); err != nil {
-		zap.L().Error("converge: delete recorded state", zap.String("config", name), zap.Error(err))
+	r.setConfigStatus(name, model.ConfigConverging)
+	for _, attempt := range attempts {
+		if attempt.Status != model.AttemptCancelling {
+			continue
+		}
+		r.mu.RLock()
+		cancel := r.cancels[attempt.ID]
+		r.mu.RUnlock()
+		if cancel != nil {
+			cancel()
+		}
+	}
+	if r.registry.DeletionReady(managed.ID) {
+		r.finalizeDeletion(ctx, managed.ID)
+	}
+}
+
+func (r *Reconciler) finalizeDeletion(ctx context.Context, configID model.ConfigID) {
+	// The tombstone remains durable until both user-visible state and execution
+	// state are removed. Recorded state is deleted first; a crash after it is
+	// harmless because the tombstone resumes deletion on recovery.
+	if err := r.store.Delete(ctx, configID); err != nil {
+		zap.L().Error("converge: delete recorded state", zap.String("config", configID.Name), zap.Error(err))
+		return
+	}
+	if err := r.registry.Delete(ctx, configID); err != nil {
+		zap.L().Error("converge: delete execution state", zap.String("config", configID.Name), zap.Error(err))
 		return
 	}
 	r.mu.Lock()
-	delete(r.configs, name)
+	delete(r.configs, configID.Name)
 	r.mu.Unlock()
 }
 
