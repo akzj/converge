@@ -53,6 +53,20 @@ type Arbiter interface {
 	Acquire(ctx context.Context, operationID string) (release func(), err error)
 }
 
+// ExecutionSnapshot is the durable execution state for one configuration.
+type ExecutionSnapshot struct {
+	Plan     *model.Plan
+	Attempts []model.Attempt
+}
+
+// ExecutionStore persists plan/attempt transitions used for crash recovery.
+type ExecutionStore interface {
+	LoadExecution(ctx context.Context, configID model.ConfigID) (*ExecutionSnapshot, error)
+	ListExecutions(ctx context.Context) ([]model.ConfigID, error)
+	CommitExecutionCAS(ctx context.Context, configID model.ConfigID, expected model.Generation, snapshot ExecutionSnapshot) error
+	DeleteExecution(ctx context.Context, configID model.ConfigID) error
+}
+
 // Journal records every Operation transition for audit and recovery.
 type Journal interface {
 	Append(ctx context.Context, event model.Event) error
