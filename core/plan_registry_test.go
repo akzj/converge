@@ -54,7 +54,7 @@ func TestPlanRegistryCarriesMatchingRunningAttempt(t *testing.T) {
 	}
 	snapshot := r.Snapshot(first.ConfigID)
 	for _, attempt := range snapshot.Attempts {
-		if attempt.ID == "attempt-1" && (attempt.Generation != 2 || attempt.CarriedTo != 2) {
+		if attempt.ID == "attempt-1" && (attempt.Generation != 1 || attempt.CarriedTo != 2) {
 			t.Fatalf("attempt not migrated: %#v", attempt)
 		}
 	}

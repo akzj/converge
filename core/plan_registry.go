@@ -213,7 +213,10 @@ func (r *PlanRegistry) Install(ctx context.Context, expected model.Generation, c
 				if attempt == nil || attempt.Status != model.AttemptRunning || attempt.NodeKey != key || attempt.Fingerprint != oldNode.Operation.Fingerprint {
 					return nil, PlanChange{}, errors.Errorf("running operation %q has no matching active attempt", key)
 				}
-				attempt.PlanID, attempt.Generation, attempt.CarriedTo = installed.ID, installed.Generation, installed.Generation
+				// Preserve source PlanID/Generation so the already-running worker's
+				// event identity remains valid; CarriedTo authorizes it to advance
+				// the newly installed generation.
+				attempt.CarriedTo = installed.Generation
 			}
 			newNode.Status, newNode.AttemptID, newNode.RetryCount = oldNode.Status, oldNode.AttemptID, oldNode.RetryCount
 		}
@@ -320,7 +323,7 @@ func (r *PlanRegistry) ApplyEvent(ctx context.Context, event model.Event) (activ
 		if node == nil || node.AttemptID != event.AttemptID {
 			return false, false, errors.New("active node does not match attempt")
 		}
-		if attempt.PlanID != state.active.ID || attempt.Generation != state.active.Generation {
+		if (attempt.PlanID != state.active.ID || attempt.Generation != state.active.Generation) && attempt.CarriedTo != state.active.Generation {
 			return false, false, errors.New("active attempt generation mismatch")
 		}
 		node.Status = terminal
