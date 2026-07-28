@@ -162,6 +162,10 @@ func (r *Reconciler) recover(ctx context.Context) error {
 
 func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredState) {
 	name := desired.ConfigID.Name
+	if err := r.validateConfigDependencies(desired); err != nil {
+		zap.L().Error("converge: rejected configuration dependency graph", zap.String("config", name), zap.Error(err))
+		return
+	}
 	r.mu.Lock()
 	current := r.configs[name]
 	if current != nil {
@@ -496,18 +500,7 @@ func (r *Reconciler) dependenciesMet(managed *model.ManagedConfig) bool {
 }
 
 func (r *Reconciler) invalidateDependents(ctx context.Context, upstream string) {
-	r.mu.RLock()
-	var names []string
-	for name, c := range r.configs {
-		for _, dep := range c.DependsOnConfigs {
-			if dep == upstream {
-				names = append(names, name)
-				break
-			}
-		}
-	}
-	r.mu.RUnlock()
-	for _, name := range names {
+	for _, name := range r.transitiveDependents(upstream) {
 		r.setConfigStatus(name, model.ConfigConverging)
 		r.planLatest(ctx, name)
 	}
