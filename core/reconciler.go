@@ -35,10 +35,10 @@ type Reconciler struct {
 	attemptSeq     atomic.Uint64
 }
 
-func NewReconciler(store StateStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
+func NewReconciler(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
 	return &Reconciler{
 		providers: make(map[string]Provider), store: store, events: events, arbiter: arbiter, journal: journal,
-		registry: NewPlanRegistry(), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc),
+		registry: NewPlanRegistry(executionStore), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc),
 		pendingDesired: make(chan model.DesiredState, 128), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions),
 	}
 }
@@ -107,6 +107,9 @@ func (r *Reconciler) Run(ctx context.Context) error {
 }
 
 func (r *Reconciler) recover(ctx context.Context) error {
+	if err := r.registry.Restore(ctx); err != nil {
+		return err
+	}
 	ids, err := r.store.List(ctx)
 	if err != nil {
 		return err

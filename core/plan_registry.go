@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -21,12 +22,17 @@ type configExecution struct {
 type PlanRegistry struct {
 	mu      sync.RWMutex
 	configs map[string]*configExecution
+	store   ExecutionStore
 }
 
 var ErrDesiredConflict = errors.New("desired revision conflict")
 
-func NewPlanRegistry() *PlanRegistry {
-	return &PlanRegistry{configs: make(map[string]*configExecution)}
+func NewPlanRegistry(stores ...ExecutionStore) *PlanRegistry {
+	var store ExecutionStore
+	if len(stores) > 0 {
+		store = stores[0]
+	}
+	return &PlanRegistry{configs: make(map[string]*configExecution), store: store}
 }
 
 func (r *PlanRegistry) Snapshot(configID model.ConfigID) model.PlanSnapshot {
@@ -45,6 +51,81 @@ func (r *PlanRegistry) Snapshot(configID model.ConfigID) model.PlanSnapshot {
 	}
 	return result
 }
+func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) ExecutionSnapshot {
+	if state == nil {
+		return ExecutionSnapshot{}
+	}
+	snapshot := ExecutionSnapshot{Plan: state.active.Clone()}
+	for _, attempt := range state.attempts {
+		snapshot.Attempts = append(snapshot.Attempts, *attempt)
+	}
+	for _, attempt := range state.retired {
+		snapshot.Attempts = append(snapshot.Attempts, *attempt)
+	}
+	return snapshot
+}
+
+func (r *PlanRegistry) persistLocked(ctx context.Context, id model.ConfigID, expected model.Generation, state *configExecution) error {
+	if r.store == nil {
+		return nil
+	}
+	return r.store.CommitExecutionCAS(ctx, id, expected, r.executionSnapshotLocked(state))
+}
+
+// Restore loads durable state. Previously-running attempts become Unknown and
+// retired, because process loss cannot prove whether external effects stopped.
+func (r *PlanRegistry) Restore(ctx context.Context) error {
+	if r.store == nil {
+		return nil
+	}
+	ids, err := r.store.ListExecutions(ctx)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range ids {
+		snapshot, err := r.store.LoadExecution(ctx, id)
+		if err != nil {
+			return err
+		}
+		if snapshot == nil || snapshot.Plan == nil {
+			continue
+		}
+		state := &configExecution{active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt)}
+		for i := range snapshot.Attempts {
+			attempt := snapshot.Attempts[i]
+			copy := attempt
+			if attempt.Status == model.AttemptRunning || attempt.Status == model.AttemptCancelling || attempt.Status == model.AttemptDraining {
+				copy.Status = model.AttemptUnknown
+				state.retired[copy.ID] = &copy
+				if node := state.active.Nodes[copy.NodeKey]; node != nil && node.AttemptID == copy.ID {
+					node.Status = model.NodeDraining
+				}
+			} else {
+				state.attempts[copy.ID] = &copy
+			}
+		}
+		r.configs[id.Name] = state
+	}
+	return nil
+}
+
+func cloneConfigExecution(state *configExecution) *configExecution {
+	if state == nil {
+		return nil
+	}
+	copy := &configExecution{active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt)}
+	for id, attempt := range state.attempts {
+		value := *attempt
+		copy.attempts[id] = &value
+	}
+	for id, attempt := range state.retired {
+		value := *attempt
+		copy.retired[id] = &value
+	}
+	return copy
+}
 
 // Install performs generation CAS and atomically transfers compatible state.
 func (r *PlanRegistry) Install(expected model.Generation, candidate *model.Plan) (*model.Plan, PlanChange, error) {
@@ -53,10 +134,10 @@ func (r *PlanRegistry) Install(expected model.Generation, candidate *model.Plan)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.configs[candidate.ConfigID.Name]
+	original := r.configs[candidate.ConfigID.Name]
+	state := cloneConfigExecution(original)
 	if state == nil {
 		state = &configExecution{attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt)}
-		r.configs[candidate.ConfigID.Name] = state
 	}
 	current := model.Generation(0)
 	if state.active != nil {
@@ -95,6 +176,10 @@ func (r *PlanRegistry) Install(expected model.Generation, candidate *model.Plan)
 		r.retire(state, change.Drain, model.AttemptDraining)
 	}
 	state.active = installed
+	if err := r.persistLocked(context.Background(), candidate.ConfigID, current, state); err != nil {
+		return nil, PlanChange{}, err
+	}
+	r.configs[candidate.ConfigID.Name] = state
 	return installed.Clone(), change, nil
 }
 
@@ -121,10 +206,11 @@ func (r *PlanRegistry) StartAttempt(configID model.ConfigID, generation model.Ge
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.configs[configID.Name]
-	if state == nil || state.active == nil || state.active.Generation != generation {
+	currentState := r.configs[configID.Name]
+	if currentState == nil || currentState.active == nil || currentState.active.Generation != generation {
 		return nil, ErrGenerationChanged
 	}
+	state := cloneConfigExecution(currentState)
 	node := state.active.Nodes[key]
 	if node == nil {
 		return nil, errors.Errorf("operation %q not found", key)
@@ -138,6 +224,10 @@ func (r *PlanRegistry) StartAttempt(configID model.ConfigID, generation model.Ge
 	attempt := &model.Attempt{ID: attemptID, PlanID: state.active.ID, Generation: generation, ConfigID: configID, NodeKey: key, Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey, Status: model.AttemptRunning}
 	node.Status, node.AttemptID = model.NodeRunning, attemptID
 	state.attempts[attemptID] = attempt
+	if err := r.persistLocked(context.Background(), configID, generation, state); err != nil {
+		return nil, err
+	}
+	r.configs[configID.Name] = state
 	copy := *attempt
 	return &copy, nil
 }
@@ -149,10 +239,11 @@ func (r *PlanRegistry) ApplyEvent(event model.Event) (activeChanged, retiredFini
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.configs[event.ConfigID]
-	if state == nil {
+	currentState := r.configs[event.ConfigID]
+	if currentState == nil {
 		return false, false, nil
 	}
+	state := cloneConfigExecution(currentState)
 	attempt, active := state.attempts[event.AttemptID]
 	if !active {
 		attempt = state.retired[event.AttemptID]
@@ -180,9 +271,17 @@ func (r *PlanRegistry) ApplyEvent(event model.Event) (activeChanged, retiredFini
 			return false, false, errors.New("active attempt generation mismatch")
 		}
 		node.Status = terminal
+		if err := r.persistLocked(context.Background(), attempt.ConfigID, state.active.Generation, state); err != nil {
+			return false, false, err
+		}
+		r.configs[event.ConfigID] = state
 		return true, false, nil
 	}
 	delete(state.retired, event.AttemptID)
+	if err := r.persistLocked(context.Background(), attempt.ConfigID, state.active.Generation, state); err != nil {
+		return false, false, err
+	}
+	r.configs[event.ConfigID] = state
 	return false, true, nil
 }
 

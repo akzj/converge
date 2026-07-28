@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -192,5 +193,34 @@ func TestPlanRegistryRetiredConflictBarrier(t *testing.T) {
 	_, ready = r.ReadyOperations(installed.ConfigID)
 	if len(ready) != 2 {
 		t.Fatalf("barrier not released: %#v", ready)
+	}
+}
+
+func TestPlanRegistryPersistsAndRestoresRunningAsUnknown(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	first := NewPlanRegistry(store)
+	installed, _, err := first.Install(0, testPlan(t, "digest", model.Operation{Key: "apply", ConflictKey: "resource/x"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.StartAttempt(installed.ConfigID, installed.Generation, "apply", "attempt-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := NewPlanRegistry(store)
+	if err := recovered.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := recovered.Snapshot(installed.ConfigID)
+	if snapshot.Plan == nil || snapshot.Plan.Nodes["apply"].Status != model.NodeDraining {
+		t.Fatalf("running node not recovered conservatively: %#v", snapshot.Plan)
+	}
+	if len(snapshot.Attempts) != 1 || snapshot.Attempts[0].Status != model.AttemptUnknown {
+		t.Fatalf("attempt not recovered as unknown: %#v", snapshot.Attempts)
+	}
+	_, ready := recovered.ReadyOperations(installed.ConfigID)
+	if len(ready) != 0 {
+		t.Fatalf("unknown effect did not block conflicting work: %#v", ready)
 	}
 }

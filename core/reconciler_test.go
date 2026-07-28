@@ -64,7 +64,7 @@ func TestReconcilerSubmitsAndProcessesDesiredState(t *testing.T) {
 	arbiter := NewMemoryArbiter()
 	journal := NewMemoryJournal()
 
-	r := NewReconciler(store, events, arbiter, journal)
+	r := NewReconciler(store, NewMemoryExecutionStore(), events, arbiter, journal)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -94,7 +94,7 @@ func TestReconcilerSupersessionCancelsInFlight(t *testing.T) {
 	journal := NewMemoryJournal()
 
 	provider := &mockProvider{typeName: "slow", slow: 200} // 200ms operations
-	r := NewReconciler(store, events, arbiter, journal)
+	r := NewReconciler(store, NewMemoryExecutionStore(), events, arbiter, journal)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
