@@ -2,7 +2,9 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -11,129 +13,54 @@ import (
 	"github.com/akzj/converge/pkg/model"
 )
 
-// Reconciler is the core of Converge: it maintains managed configurations,
-// computes diffs, builds DAGs, and drives execution through the safety layer.
-type Reconciler struct {
-	mu sync.Mutex
+const maxConcurrentExecutions = 10
 
-	providers map[string]Provider // provider name → implementation
+// Reconciler owns desired state and drives generation-aware plan execution.
+type Reconciler struct {
+	mu sync.RWMutex
+
+	providers map[string]Provider
 	store     StateStore
 	events    EventBus
 	arbiter   Arbiter
 	journal   Journal
+	registry  *PlanRegistry
 
-	configs     map[string]*model.ManagedConfig // config name → managed state
-	globalGraph *model.Graph                    // cross-config DAG
+	configs map[string]*model.ManagedConfig
+	cancels map[model.AttemptID]context.CancelFunc
 
-	// inFlight tracks running operations and their cancel functions.
-	inFlight map[string]context.CancelFunc // operation ID → cancel
-
-	pendingDesired chan model.DesiredState // inbound desired state updates
-	pendingDelete  chan string             // inbound config deletion requests
-
-	// execSem limits concurrent node executions to prevent unbounded goroutines.
-	execSem chan struct{}
+	pendingDesired chan model.DesiredState
+	pendingDelete  chan string
+	execSem        chan struct{}
+	attemptSeq     atomic.Uint64
 }
 
-// NewReconciler creates a new Converge engine instance.
 func NewReconciler(store StateStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
 	return &Reconciler{
-		providers:      make(map[string]Provider),
-		store:          store,
-		events:         events,
-		arbiter:        arbiter,
-		journal:        journal,
-		configs:        make(map[string]*model.ManagedConfig),
-		globalGraph:    &model.Graph{Nodes: make(map[string]*model.Node)},
-		inFlight:       make(map[string]context.CancelFunc),
-		pendingDesired: make(chan model.DesiredState, 128),
-		execSem:        make(chan struct{}, maxConcurrentExecutions), pendingDelete: make(chan string, 128),
+		providers: make(map[string]Provider), store: store, events: events, arbiter: arbiter, journal: journal,
+		registry: NewPlanRegistry(), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc),
+		pendingDesired: make(chan model.DesiredState, 128), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions),
 	}
 }
 
-// RegisterProvider adds a provider to the engine. If a provider with the same
-// Type() was already registered with a different Digest(), all configs using
-// that provider are forced to re-reconcile (provider upgrade detection).
-// Cold-start digest comparison against StateStore also runs in recover().
-func (r *Reconciler) RegisterProvider(ctx context.Context, p Provider) {
+func (r *Reconciler) RegisterProvider(ctx context.Context, provider Provider) {
 	r.mu.Lock()
-	old, exists := r.providers[p.Type()]
-	oldDigest := ""
-	if exists {
-		oldDigest = old.Digest()
-	}
-	r.providers[p.Type()] = p
-
-	if !exists {
-		r.mu.Unlock()
-		zap.L().Info("converge: registered provider",
-			zap.String("provider", p.Type()),
-			zap.String("digest", p.Digest()))
-		// First registration after recover(): pick up configs with stale digests.
-		r.reReconcileForProvider(ctx, p)
-		return
-	}
-
-	if oldDigest == p.Digest() {
-		r.mu.Unlock()
-		zap.L().Info("converge: re-registered provider (same digest)",
-			zap.String("provider", p.Type()),
-			zap.String("digest", p.Digest()))
-		return
-	}
-	r.mu.Unlock()
-
-	zap.L().Info("converge: provider upgraded, re-reconciling affected configs",
-		zap.String("provider", p.Type()),
-		zap.String("old_digest", oldDigest),
-		zap.String("new_digest", p.Digest()))
-	r.reReconcileForProvider(ctx, p)
-}
-
-// reReconcileForProvider supersedes and reconciles configs whose recorded
-// handler digest does not match p.Digest(). Must NOT be called with r.mu held.
-func (r *Reconciler) reReconcileForProvider(ctx context.Context, p Provider) {
-	r.mu.Lock()
-	var targets []*model.ManagedConfig
-	for _, mc := range r.configs {
-		providerType := mc.Desired.ProviderType
-		if providerType == "" {
-			providerType = mc.Recorded.ProviderType
-		}
-		if providerType == p.Type() && mc.Recorded.HandlerDigest != p.Digest() {
-			targets = append(targets, mc)
-		}
-	}
-	r.mu.Unlock()
-
-	if len(targets) == 0 {
-		return
-	}
-	zap.L().Info("converge: re-reconciling configs for provider digest",
-		zap.String("provider", p.Type()),
-		zap.String("digest", p.Digest()),
-		zap.Int("targets", len(targets)))
-
-	for _, mc := range targets {
-		r.supersede(ctx, mc.ID.Name)
-		r.mu.Lock()
-		if _, ok := r.configs[mc.ID.Name]; !ok {
-			r.mu.Unlock()
-			continue
-		}
-		mc.Status = model.ConfigConverging
-		if mc.Graph != nil {
-			for id := range mc.Graph.Nodes {
-				delete(r.globalGraph.Nodes, id)
+	old := r.providers[provider.Type()]
+	r.providers[provider.Type()] = provider
+	var affected []string
+	if old != nil && old.Digest() != provider.Digest() {
+		for name, config := range r.configs {
+			if config.Desired.ProviderType == provider.Type() {
+				affected = append(affected, name)
 			}
-			mc.Graph.Nodes = make(map[string]*model.Node)
 		}
-		r.mu.Unlock()
-		r.reconcile(ctx, mc)
+	}
+	r.mu.Unlock()
+	for _, name := range affected {
+		r.planLatest(ctx, name)
 	}
 }
 
-// SubmitDesired queues a desired state for reconciliation.
 func (r *Reconciler) SubmitDesired(ctx context.Context, desired model.DesiredState) error {
 	select {
 	case r.pendingDesired <- desired:
@@ -143,778 +70,353 @@ func (r *Reconciler) SubmitDesired(ctx context.Context, desired model.DesiredSta
 	}
 }
 
-// SubmitDelete queues a config for deletion. Dependents are deleted first.
-func (r *Reconciler) SubmitDelete(ctx context.Context, configName string) error {
+func (r *Reconciler) SubmitDelete(ctx context.Context, name string) error {
 	select {
-	case r.pendingDelete <- configName:
+	case r.pendingDelete <- name:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-// Run starts the reconciliation loop. Blocks until ctx is cancelled.
 func (r *Reconciler) Run(ctx context.Context) error {
-	zap.L().Info("converge: starting reconciliation loop")
-
 	if err := r.recover(ctx); err != nil {
-		return errors.Errorf("converge: recovery failed: %w", err)
+		return errors.Wrap(err, "recover")
 	}
-
 	eventCh, err := r.events.Subscribe(ctx, "")
 	if err != nil {
-		return errors.Errorf("converge: subscribe failed: %w", err)
+		return errors.Wrap(err, "subscribe")
 	}
-
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			zap.L().Info("converge: reconciliation loop stopped")
 			return ctx.Err()
-
 		case desired := <-r.pendingDesired:
 			r.handleDesired(ctx, desired)
-
 		case name := <-r.pendingDelete:
 			r.deleteConfig(ctx, name)
-
 		case event := <-eventCh:
 			r.handleEvent(ctx, event)
-
 		case <-ticker.C:
-			r.tick(ctx)
+			r.detectDrift(ctx)
 		}
-
 		r.executeReady(ctx)
 	}
 }
 
-// recover loads previously recorded state into the engine on startup.
 func (r *Reconciler) recover(ctx context.Context) error {
 	ids, err := r.store.List(ctx)
 	if err != nil {
 		return err
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, id := range ids {
 		recorded, err := r.store.Get(ctx, id)
-		if err != nil || recorded == nil {
+		if err != nil {
+			return err
+		}
+		if recorded == nil {
 			continue
 		}
-
-		status := model.ConfigConverged
-		// Compare against the provider identified by ProviderType (not HandlerDigest).
-		if p, ok := r.providers[recorded.ProviderType]; ok {
-			if recorded.HandlerDigest != "" && p.Digest() != recorded.HandlerDigest {
-				status = model.ConfigConverging
-				zap.L().Info("converge: recovered config with stale handler digest, will re-reconcile",
-					zap.String("config", id.Name),
-					zap.String("provider", recorded.ProviderType),
-					zap.String("recorded", recorded.HandlerDigest),
-					zap.String("current", p.Digest()))
-			}
-		}
-
-		r.configs[id.Name] = &model.ManagedConfig{
-			ID:       id,
-			Recorded: *recorded,
-			Status:   status,
-			// Restore enough Desired for reconcile / provider lookup after restart.
-			Desired: model.DesiredState{
-				ConfigID:     id,
-				ProviderType: recorded.ProviderType,
-				Version:      recorded.DesiredVersion,
-				Digest:       recorded.DesiredDigest,
-			},
-		}
-		zap.L().Info("converge: recovered config",
-			zap.String("config", id.Name),
-			zap.Uint64("version", recorded.DesiredVersion),
-			zap.String("status", string(status)))
+		r.configs[id.Name] = &model.ManagedConfig{ID: id, Recorded: *recorded, Status: model.ConfigConverged, Desired: model.DesiredState{ConfigID: id, ProviderType: recorded.ProviderType, Version: recorded.DesiredVersion, Digest: recorded.DesiredDigest}}
 	}
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// handleDesired — process a new desired state with supersession
-// ---------------------------------------------------------------------------
-
-// handleDesired processes a new desired state, handling plan supersession
-// if the configuration is currently converging with in-flight operations.
 func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredState) {
-	r.mu.Lock()
-
 	name := desired.ConfigID.Name
-	existing, exists := r.configs[name]
-
-	if !exists {
-		zap.L().Info("converge: new config",
-			zap.String("config", name),
-			zap.Uint64("version", desired.Version))
-		r.configs[name] = &model.ManagedConfig{
-			ID:               desired.ConfigID,
-			Desired:          desired,
-			Status:           model.ConfigConverging,
-			Graph:            &model.Graph{Nodes: make(map[string]*model.Node)},
-			DependsOnConfigs: append([]string(nil), desired.DependsOn...),
-		}
-		r.mu.Unlock()
-		r.reconcile(ctx, r.configs[name])
-		return
-	}
-
-	// Skip if same version already applied
-	if existing.Recorded.DesiredVersion == desired.Version &&
-		existing.Recorded.DesiredDigest == desired.Digest {
-		r.mu.Unlock()
-		return
-	}
-
-	zap.L().Info("converge: config supersession",
-		zap.String("config", name),
-		zap.Uint64("version", desired.Version),
-		zap.Uint64("previous_version", existing.Recorded.DesiredVersion))
-
-	// Save the desired, sync DependsOnConfigs, and release lock before supersession
-	existing.Desired = desired
-	existing.DependsOnConfigs = append([]string(nil), desired.DependsOn...)
-	existing.Status = model.ConfigConverging
-	r.mu.Unlock()
-
-	// Phase 1: Supersession — cancel or wait for in-flight operations
-	r.supersede(ctx, name)
-
-	// Phase 2: Invalidate downstream configs whose dependency has changed
-	r.invalidateDependents(ctx, name)
-
-	// Phase 3: reconcile with fresh Inspect
-	r.reconcile(ctx, existing)
-}
-
-// deleteConfig removes a config and all its dependents in reverse dependency order.
-func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
 	r.mu.Lock()
-	mc, exists := r.configs[name]
-	if !exists {
-		r.mu.Unlock()
-		return
-	}
-
-	// Collect all configs that must be deleted before this one (dependents)
-	dependents := r.collectDependentsLocked(name)
-	r.mu.Unlock()
-
-	// Delete dependents first (depth-first, reverse dependency order)
-	for _, depName := range dependents {
-		r.deleteConfig(ctx, depName)
-	}
-
-	// Now delete the target config itself
-	r.mu.Lock()
-	zap.L().Info("converge: deleting config",
-		zap.String("config", name),
-		zap.Uint64("version", mc.Desired.Version))
-
-	// Cancel any in-flight operations
-	r.mu.Unlock()
-	r.supersede(ctx, name)
-	r.mu.Lock()
-
-	// Remove from StateStore
-	if err := r.store.Delete(ctx, mc.ID); err != nil {
-		zap.L().Error("converge: state store delete failed", zap.Error(err))
-	}
-
-	// Remove from global graph
-	for id, node := range r.globalGraph.Nodes {
-		if node.Operation.ConfigID == name {
-			delete(r.globalGraph.Nodes, id)
-		}
-	}
-
-	// Remove from configs map
-	delete(r.configs, name)
-	r.mu.Unlock()
-
-	zap.L().Info("converge: config deleted", zap.String("config", name))
-}
-
-// collectDependentsLocked returns names of configs that directly or indirectly
-// depend on configName. Must be called with r.mu held.
-func (r *Reconciler) collectDependentsLocked(configName string) []string {
-	var deps []string
-	for _, mc := range r.configs {
-		if mc.ID.Name == configName {
-			continue
-		}
-		for _, dep := range mc.DependsOnConfigs {
-			if dep == configName {
-				deps = append(deps, mc.ID.Name)
-				// Recursively collect transitive dependents
-				transitive := r.collectDependentsLocked(mc.ID.Name)
-				deps = append(deps, transitive...)
-				break
-			}
-		}
-	}
-	// Return unique names preserving order
-	seen := make(map[string]struct{}, len(deps))
-	unique := make([]string, 0, len(deps))
-	for _, d := range deps {
-		if _, ok := seen[d]; !ok {
-			seen[d] = struct{}{}
-			unique = append(unique, d)
-		}
-	}
-	return unique
-}
-
-// invalidateDependents marks all transitive downstream configs as stale,
-// cancels their in-flight operations, and triggers re-reconciliation.
-// Must NOT be called with r.mu held.
-func (r *Reconciler) invalidateDependents(ctx context.Context, configName string) {
-	r.mu.Lock()
-	deps := r.collectDependentsLocked(configName)
-	var targets []*model.ManagedConfig
-	for _, name := range deps {
-		if mc, ok := r.configs[name]; ok {
-			targets = append(targets, mc)
-		}
-	}
-	r.mu.Unlock()
-
-	for _, mc := range targets {
-		zap.L().Info("converge: cascading to downstream config",
-			zap.String("downstream", mc.ID.Name),
-			zap.String("upstream", configName))
-
-		// Cancel in-flight operations
-		r.supersede(ctx, mc.ID.Name)
-
-		// Clear stale graph
-		r.mu.Lock()
-		mc.Status = model.ConfigConverging
-		if mc.Graph != nil {
-			for id := range mc.Graph.Nodes {
-				delete(r.globalGraph.Nodes, id)
-			}
-			mc.Graph.Nodes = make(map[string]*model.Node)
-		}
-		r.mu.Unlock()
-
-		// Re-reconcile
-		r.reconcile(ctx, mc)
-	}
-}
-
-// supersede handles in-flight operations when a new desired state arrives.
-// Must NOT be called with r.mu held.
-//
-// Classification:
-//   - CancelMode Safe: cancel immediately via context
-//   - CancelMode Async: cancel (provider handles between sub-steps)
-//   - CancelMode None: let complete (non-cancellable; re-Inspect will account for result)
-func (r *Reconciler) supersede(ctx context.Context, configName string) {
-	r.mu.Lock()
-	var runningIDs []string
-	for id, cancel := range r.inFlight {
-		node, ok := r.globalGraph.Nodes[id]
-		if !ok || node.Operation.ConfigID != configName {
-			continue
-		}
-		if node.Status == model.NodeRunning {
-			runningIDs = append(runningIDs, id)
-			_ = cancel
-		}
-	}
-	if len(runningIDs) == 0 {
-		r.mu.Unlock()
-		return
-	}
-	r.mu.Unlock()
-
-	zap.L().Info("converge: superseding in-flight ops",
-		zap.String("config", configName),
-		zap.Int("count", len(runningIDs)))
-
-	// Cancel all cancellable operations; wait for non-cancellable ones
-	var waitFor []string
-	for _, id := range runningIDs {
-		r.mu.Lock()
-		node, ok := r.globalGraph.Nodes[id]
-		cancelFn, inFlight := r.inFlight[id]
-		r.mu.Unlock()
-
-		if !ok || !inFlight {
-			continue
-		}
-
-		switch node.Operation.CancelMode {
-		case model.CancelModeNone:
-			waitFor = append(waitFor, id)
-			zap.L().Info("converge: waiting for non-cancellable op", zap.String("op", id))
-		default:
-			cancelFn()
-			r.mu.Lock()
-			node.Status = model.NodeCancelled
-			delete(r.inFlight, id)
+	current := r.configs[name]
+	if current != nil {
+		if desired.Version < current.Desired.Version || (desired.Version == current.Desired.Version && desired.Digest != current.Desired.Digest) {
 			r.mu.Unlock()
-			zap.L().Info("converge: cancelled op", zap.String("op", id))
-		}
-	}
-
-	// Wait for non-cancellable operations with timeout
-	if len(waitFor) > 0 {
-		r.waitForOps(ctx, waitFor, 30*time.Second)
-	}
-}
-
-// waitForOps waits for a set of operations to complete, with timeout.
-func (r *Reconciler) waitForOps(ctx context.Context, opIDs []string, timeout time.Duration) {
-	remaining := make(map[string]struct{}, len(opIDs))
-	for _, id := range opIDs {
-		remaining[id] = struct{}{}
-	}
-
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	for len(remaining) > 0 {
-		select {
-		case <-waitCtx.Done():
-			zap.L().Warn("converge: timeout waiting for ops to complete",
-				zap.Int("remaining", len(remaining)))
+			zap.L().Error("converge: rejected desired revision conflict", zap.String("config", name))
 			return
-		default:
+		}
+		if desired.Version == current.Desired.Version && desired.Digest == current.Desired.Digest {
+			r.mu.Unlock()
+			return
+		}
+		current.Desired, current.DependsOnConfigs, current.Status = desired, append([]string(nil), desired.DependsOn...), model.ConfigConverging
+	} else {
+		r.configs[name] = &model.ManagedConfig{ID: desired.ConfigID, Desired: desired, DependsOnConfigs: append([]string(nil), desired.DependsOn...), Status: model.ConfigConverging}
+	}
+	r.mu.Unlock()
+	r.planLatest(ctx, name)
+	r.invalidateDependents(ctx, name)
+}
+
+// planLatest implements snapshot -> provider replan -> validate -> generation CAS.
+func (r *Reconciler) planLatest(ctx context.Context, name string) {
+	for retries := 0; retries < 4; retries++ {
+		r.mu.RLock()
+		managed := r.configs[name]
+		if managed == nil {
+			r.mu.RUnlock()
+			return
+		}
+		desired := managed.Desired
+		provider := r.providers[desired.ProviderType]
+		r.mu.RUnlock()
+		if provider == nil {
+			r.setConfigStatus(name, model.ConfigError)
+			return
+		}
+		if !r.dependenciesMet(managed) {
+			return
 		}
 
-		r.mu.Lock()
-		for id := range remaining {
-			if node, ok := r.globalGraph.Nodes[id]; ok {
-				if node.Status == model.NodeCompleted || node.Status == model.NodeFailed {
-					delete(remaining, id)
-					delete(r.inFlight, id)
-				}
+		snapshot := r.registry.Snapshot(desired.ConfigID)
+		expected := model.Generation(0)
+		if snapshot.Plan != nil {
+			expected = snapshot.Plan.Generation
+		}
+		observed, err := provider.Inspect(ctx, model.ResourceID{Name: name})
+		if err != nil {
+			r.setConfigStatus(name, model.ConfigError)
+			return
+		}
+		result, err := provider.Replan(ctx, ReplanRequest{Observed: observed, Desired: desired, Active: snapshot, ProviderDigest: provider.Digest()})
+		if err != nil {
+			r.setConfigStatus(name, model.ConfigError)
+			return
+		}
+		candidate, err := BuildCandidate(desired.ConfigID, desired, provider.Type(), provider.Digest(), result.Operations)
+		if err != nil {
+			r.setConfigStatus(name, model.ConfigError)
+			return
+		}
+		installed, change, err := r.registry.Install(expected, candidate)
+		if errors.Is(err, ErrGenerationChanged) {
+			continue
+		}
+		if err != nil {
+			r.setConfigStatus(name, model.ConfigError)
+			return
+		}
+		r.cancelRetired(snapshot, change)
+		if len(installed.Nodes) == 0 || planCompleted(installed) {
+			r.verifyAndRecord(ctx, managed, provider)
+			return
+		}
+		r.setConfigStatus(name, model.ConfigConverging)
+		return
+	}
+	zap.L().Warn("converge: replan CAS contention", zap.String("config", name))
+}
+
+func (r *Reconciler) cancelRetired(snapshot model.PlanSnapshot, change PlanChange) {
+	byKey := make(map[model.OperationKey]model.AttemptID)
+	for _, attempt := range snapshot.Attempts {
+		byKey[attempt.NodeKey] = attempt.ID
+	}
+	for _, key := range change.Cancel {
+		attemptID := byKey[key]
+		r.mu.RLock()
+		cancel := r.cancels[attemptID]
+		r.mu.RUnlock()
+		if cancel != nil {
+			cancel()
+		}
+	}
+}
+
+func (r *Reconciler) executeReady(ctx context.Context) {
+	r.mu.RLock()
+	ids := make([]model.ConfigID, 0, len(r.configs))
+	for _, c := range r.configs {
+		ids = append(ids, c.ID)
+	}
+	r.mu.RUnlock()
+	for _, id := range ids {
+		plan, operations := r.registry.ReadyOperations(id)
+		if plan == nil {
+			continue
+		}
+		for _, operation := range operations {
+			attemptID := model.AttemptID(fmt.Sprintf("%s/%d", plan.ID, r.attemptSeq.Add(1)))
+			attempt, err := r.registry.StartAttempt(id, plan.Generation, operation.Key, attemptID)
+			if err != nil {
+				continue
 			}
-		}
-		r.mu.Unlock()
-
-		if len(remaining) > 0 {
-			time.Sleep(100 * time.Millisecond)
+			go r.executeAttempt(ctx, plan, operation, attempt)
 		}
 	}
 }
 
-// ---------------------------------------------------------------------------
-// reconcile — Inspect → Diff → DAG
-// ---------------------------------------------------------------------------
-
-// reconcile computes the diff and builds a DAG for one configuration.
-func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
+func (r *Reconciler) executeAttempt(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt) {
+	r.execSem <- struct{}{}
+	defer func() { <-r.execSem }()
+	opCtx, cancel := context.WithCancel(ctx)
+	if operation.Timeout > 0 {
+		opCtx, cancel = context.WithTimeout(ctx, time.Duration(operation.Timeout))
+	}
 	r.mu.Lock()
-	provider, ok := r.providers[mc.Desired.ProviderType]
+	r.cancels[attempt.ID] = cancel
+	provider := r.providers[operation.Provider]
 	r.mu.Unlock()
+	defer func() { cancel(); r.mu.Lock(); delete(r.cancels, attempt.ID); r.mu.Unlock() }()
 
-	if !ok {
-		zap.L().Error("converge: no provider for config",
-			zap.String("provider", mc.Desired.ProviderType),
-			zap.String("config", mc.ID.Name))
-		r.mu.Lock()
-		mc.Status = model.ConfigError
-		r.mu.Unlock()
-		return
+	var release func()
+	if operation.Destructive && operation.Phase == model.PhaseCommit {
+		var err error
+		release, err = r.arbiter.Acquire(opCtx, string(attempt.ID))
+		if err != nil {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "arbiter_busy", Reason: err.Error()})
+			return
+		}
+		defer release()
 	}
-
-	providerDigest := provider.Digest()
-	if mc.Recorded.HandlerDigest != "" && mc.Recorded.HandlerDigest != providerDigest {
-		zap.L().Info("converge: handler digest changed, re-reconciling",
-			zap.String("config", mc.ID.Name),
-			zap.String("old", mc.Recorded.HandlerDigest),
-			zap.String("new", providerDigest))
-	}
-
-	// If this config depends on others, check they are all converged first.
-	if !r.dependenciesMet(mc) {
-		zap.L().Info("converge: waiting for dependencies",
-			zap.String("config", mc.ID.Name),
-			zap.Strings("depends_on", mc.DependsOnConfigs))
-		r.mu.Lock()
-		mc.Status = model.ConfigConverging
-		r.mu.Unlock()
-		return
-	}
-
-	// Inspect current state
-	observed, err := provider.Inspect(ctx, model.ResourceID{Name: mc.ID.Name})
+	result, err := provider.Execute(opCtx, operation)
 	if err != nil {
-		zap.L().Error("converge: inspect failed",
-			zap.String("config", mc.ID.Name),
-			zap.Error(err))
-		r.mu.Lock()
-		mc.Status = model.ConfigError
-		r.mu.Unlock()
-		return
+		result = model.StepResult{State: model.StepFailed, Code: "execute_error", Reason: err.Error()}
 	}
+	if result.State == model.StepWaiting {
+		result = model.StepResult{State: model.StepFailed, Code: "waiting_unsupported", Reason: "provider returned waiting without a resumable attempt"}
+	}
+	r.publishResult(ctx, plan, operation, attempt, result)
+}
 
-	r.mu.Lock()
-	mc.Observed = observed
-	r.mu.Unlock()
+func (r *Reconciler) publishResult(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, result model.StepResult) {
+	event := model.Event{EventID: string(attempt.ID) + "/terminal", PlanID: plan.ID, Generation: plan.Generation, NodeKey: operation.Key, AttemptID: attempt.ID, ConfigID: plan.ConfigID.Name, State: result.State, Result: result}
+	if err := r.events.Publish(ctx, event); err != nil {
+		zap.L().Error("converge: publish event", zap.Error(err))
+	}
+}
 
-	// Compute diff
-	replan, err := provider.Replan(ctx, ReplanRequest{Observed: observed, Desired: mc.Desired, ProviderDigest: providerDigest})
+func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
+	if err := r.journal.Append(ctx, event); err != nil {
+		zap.L().Error("converge: append journal", zap.Error(err))
+	}
+	changed, retiredFinished, err := r.registry.ApplyEvent(event)
 	if err != nil {
-		zap.L().Error("converge: diff failed",
-			zap.String("config", mc.ID.Name),
-			zap.Error(err))
-		r.mu.Lock()
-		mc.Status = model.ConfigError
-		r.mu.Unlock()
+		zap.L().Warn("converge: ignored invalid event", zap.Error(err))
 		return
 	}
-
-	// Build DAG
-	ops := replan.Operations
-	if len(ops) == 0 {
-		// Already converged — no operations needed
-		r.mu.Lock()
-		mc.Status = model.ConfigConverged
-		mc.Graph = &model.Graph{Nodes: make(map[string]*model.Node)}
-		recorded := model.RecordedState{
-			ConfigID:       mc.Desired.ConfigID,
-			ProviderType:   mc.Desired.ProviderType,
-			DesiredVersion: mc.Desired.Version,
-			DesiredDigest:  mc.Desired.Digest,
-			HandlerDigest:  providerDigest,
-			HandlerRef:     mc.Recorded.HandlerRef,
-			Status:         string(model.ConfigConverged),
-			UpdatedAt:      time.Now(),
+	if retiredFinished {
+		r.planLatest(ctx, event.ConfigID)
+		return
+	}
+	if !changed {
+		return
+	}
+	snapshot := r.registry.Snapshot(model.ConfigID{Name: event.ConfigID})
+	if snapshot.Plan == nil {
+		return
+	}
+	if planFailed(snapshot.Plan) {
+		r.setConfigStatus(event.ConfigID, model.ConfigError)
+		return
+	}
+	if planCompleted(snapshot.Plan) {
+		r.mu.RLock()
+		managed, provider := r.configs[event.ConfigID], r.providers[snapshot.Plan.ProviderType]
+		r.mu.RUnlock()
+		if managed != nil && provider != nil {
+			r.verifyAndRecord(ctx, managed, provider)
 		}
-		mc.Recorded = recorded
-		if err := r.store.Record(ctx, recorded); err != nil {
-			zap.L().Error("converge: state store record failed", zap.Error(err))
-		}
-		r.mu.Unlock()
-		zap.L().Info("converge: config already converged",
-			zap.String("config", mc.ID.Name),
-			zap.Uint64("version", mc.Desired.Version))
-		r.wakeUpDependents(ctx, mc.ID.Name)
+	}
+}
+
+func (r *Reconciler) verifyAndRecord(ctx context.Context, managed *model.ManagedConfig, provider Provider) {
+	observed, err := provider.Verify(ctx, model.ResourceID{Name: managed.ID.Name}, managed.Desired)
+	if err != nil {
+		r.setConfigStatus(managed.ID.Name, model.ConfigError)
 		return
 	}
-
-	graph := &model.Graph{Nodes: make(map[string]*model.Node)}
-	for _, op := range ops {
-		op.ConfigID = mc.ID.Name
-		op.Provider = provider.Type()
-		n := &model.Node{Operation: op, Status: model.NodePending}
-		graph.Nodes[op.ID] = n
-	}
-
-	// Validate the DAG for cycles before accepting it into the engine.
-	if err := graph.Validate(); err != nil {
-		zap.L().Error("converge: DAG validation failed, rejecting graph",
-			zap.String("config", mc.ID.Name),
-			zap.Error(err))
-		r.mu.Lock()
-		mc.Status = model.ConfigError
-		r.mu.Unlock()
+	recorded := model.RecordedState{ConfigID: managed.ID, ProviderType: provider.Type(), DesiredVersion: managed.Desired.Version, DesiredDigest: managed.Desired.Digest, HandlerDigest: provider.Digest(), Status: string(model.ConfigConverged), UpdatedAt: time.Now()}
+	if err := r.store.Record(ctx, recorded); err != nil {
+		r.setConfigStatus(managed.ID.Name, model.ConfigError)
 		return
 	}
-
 	r.mu.Lock()
-	mc.Graph = graph
-	r.mergeGlobalGraphLocked(mc)
+	managed.Observed, managed.Recorded, managed.Status = observed, recorded, model.ConfigConverged
 	r.mu.Unlock()
-
-	zap.L().Info("converge: diff produced operations",
-		zap.String("config", mc.ID.Name),
-		zap.Int("operations", len(ops)))
+	r.wakeDependents(ctx, managed.ID.Name)
 }
 
-// mergeGlobalGraphLocked merges this config's DAG into the global graph.
-// Caller must hold r.mu.
-func (r *Reconciler) mergeGlobalGraphLocked(mc *model.ManagedConfig) {
-	// Remove old nodes for this config
-	for id, node := range r.globalGraph.Nodes {
-		if node.Operation.ConfigID == mc.ID.Name {
-			delete(r.globalGraph.Nodes, id)
-		}
-	}
-	// Add new nodes
-	for id, node := range mc.Graph.Nodes {
-		r.globalGraph.Nodes[id] = node
-	}
-}
-
-// dependenciesMet checks whether all configs this one depends on have converged.
-func (r *Reconciler) dependenciesMet(mc *model.ManagedConfig) bool {
-	if len(mc.DependsOnConfigs) == 0 {
-		return true
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, depName := range mc.DependsOnConfigs {
-		dep, ok := r.configs[depName]
-		if !ok || dep.Status != model.ConfigConverged {
+func (r *Reconciler) dependenciesMet(managed *model.ManagedConfig) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, name := range managed.DependsOnConfigs {
+		dependency := r.configs[name]
+		if dependency == nil || dependency.Status != model.ConfigConverged {
 			return false
 		}
 	}
 	return true
 }
 
-// ---------------------------------------------------------------------------
-// Event handling
-// ---------------------------------------------------------------------------
-
-// maxRetriesPerNode is the maximum number of times a failed operation
-// with Retryable=true will be retried before marking the config as error.
-const maxRetriesPerNode = 3
-
-// maxConcurrentExecutions limits the number of simultaneous node executions
-// to prevent unbounded goroutine growth under high submission load.
-const maxConcurrentExecutions = 10
-
-// handleEvent processes an Event from a completed Operation.
-func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
-	r.mu.Lock()
-
-	if node, ok := r.globalGraph.Nodes[event.NodeID]; ok {
-		switch event.State {
-		case model.StepCompleted:
-			node.Status = model.NodeCompleted
-		case model.StepFailed:
-			// Retry logic: if the result is retryable and we haven't exceeded
-			// the max retry count, reset the node to pending for re-execution.
-			if event.Result.Retryable && node.RetryCount < maxRetriesPerNode {
-				node.RetryCount++
-				node.Status = model.NodePending
-				zap.L().Info("converge: retrying failed op",
-					zap.String("op", event.NodeID),
-					zap.Int("retry", node.RetryCount),
-					zap.String("reason", event.Result.Reason))
-			} else {
-				node.Status = model.NodeFailed
-			}
-		case model.StepCancelled:
-			node.Status = model.NodeCancelled
-		default:
-			r.mu.Unlock()
-			return
-		}
-	}
-
-	// Clean up in-flight tracking
-	delete(r.inFlight, event.NodeID)
-
-	// Record in journal
-	if err := r.journal.Append(ctx, event); err != nil {
-		zap.L().Error("converge: journal append failed", zap.Error(err))
-	}
-
-	// Check if this config's graph is fully converged
-	if mc, ok := r.configs[event.ConfigID]; ok && mc.Graph != nil {
-		if allNodesSucceeded(mc.Graph) {
-			digest := mc.Recorded.HandlerDigest
-			if p, pok := r.providers[mc.Desired.ProviderType]; pok {
-				digest = p.Digest()
-			}
-			recorded := model.RecordedState{
-				ConfigID:       mc.Desired.ConfigID,
-				ProviderType:   mc.Desired.ProviderType,
-				DesiredVersion: mc.Desired.Version,
-				DesiredDigest:  mc.Desired.Digest,
-				HandlerDigest:  digest,
-				HandlerRef:     mc.Recorded.HandlerRef,
-				Status:         string(model.ConfigConverged),
-				UpdatedAt:      time.Now(),
-			}
-			mc.Status = model.ConfigConverged
-			mc.Recorded = recorded
-			if err := r.store.Record(ctx, recorded); err != nil {
-				zap.L().Error("converge: state store record failed", zap.Error(err))
-			}
-			zap.L().Info("converge: config converged",
-				zap.String("config", event.ConfigID),
-				zap.Uint64("version", mc.Desired.Version))
-			r.mu.Unlock()
-			r.wakeUpDependents(ctx, event.ConfigID)
-			return
-		}
-
-		// Check if any node failed — mark config error
-		if hasFailedNode(mc.Graph) {
-			mc.Status = model.ConfigError
-			recorded := model.RecordedState{
-				ConfigID:       mc.Desired.ConfigID,
-				ProviderType:   mc.Desired.ProviderType,
-				DesiredVersion: mc.Desired.Version,
-				DesiredDigest:  mc.Desired.Digest,
-				HandlerDigest:  mc.Recorded.HandlerDigest,
-				HandlerRef:     mc.Recorded.HandlerRef,
-				Status:         string(model.ConfigError),
-				UpdatedAt:      time.Now(),
-			}
-			_ = r.store.Record(ctx, recorded)
-			mc.Recorded = recorded
-			zap.L().Error("converge: config failed",
-				zap.String("config", event.ConfigID))
-		}
-	}
-
-	r.mu.Unlock()
-}
-
-// hasFailedNode returns true if any node in the graph has failed.
-func hasFailedNode(g *model.Graph) bool {
-	for _, n := range g.Nodes {
-		if n.Status == model.NodeFailed {
-			return true
-		}
-	}
-	return false
-}
-
-// wakeUpDependents triggers reconcile for all configs that depend on configName.
-func (r *Reconciler) wakeUpDependents(ctx context.Context, configName string) {
-	r.mu.Lock()
-	var downstream []*model.ManagedConfig
-	for _, mc := range r.configs {
-		for _, dep := range mc.DependsOnConfigs {
-			if dep == configName && mc.Status != model.ConfigConverged {
-				downstream = append(downstream, mc)
+func (r *Reconciler) invalidateDependents(ctx context.Context, upstream string) {
+	r.mu.RLock()
+	var names []string
+	for name, c := range r.configs {
+		for _, dep := range c.DependsOnConfigs {
+			if dep == upstream {
+				names = append(names, name)
 				break
 			}
 		}
 	}
+	r.mu.RUnlock()
+	for _, name := range names {
+		r.setConfigStatus(name, model.ConfigConverging)
+		r.planLatest(ctx, name)
+	}
+}
+func (r *Reconciler) wakeDependents(ctx context.Context, name string) {
+	r.invalidateDependents(ctx, name)
+}
+
+func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
+	r.mu.Lock()
+	managed := r.configs[name]
+	if managed == nil {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.configs, name)
 	r.mu.Unlock()
-	for _, mc := range downstream {
-		zap.L().Info("converge: waking up downstream config",
-			zap.String("config", mc.ID.Name),
-			zap.String("depends_on", configName))
-		r.reconcile(ctx, mc)
+	_ = r.store.Delete(ctx, managed.ID)
+}
+
+func (r *Reconciler) detectDrift(ctx context.Context) {
+	r.mu.RLock()
+	var names []string
+	for name, c := range r.configs {
+		if c.Status == model.ConfigConverged {
+			names = append(names, name)
+		}
+	}
+	r.mu.RUnlock()
+	for _, name := range names {
+		r.planLatest(ctx, name)
 	}
 }
 
-// allNodesSucceeded returns true iff every node in the graph is either
-// completed (success) or was never needed (empty graph).
-// Failed/Cancelled nodes mean convergence failed.
-func allNodesSucceeded(g *model.Graph) bool {
-	for _, n := range g.Nodes {
+func (r *Reconciler) setConfigStatus(name string, status model.ConfigStatus) {
+	r.mu.Lock()
+	if c := r.configs[name]; c != nil {
+		c.Status = status
+	}
+	r.mu.Unlock()
+}
+func planCompleted(plan *model.Plan) bool {
+	for _, n := range plan.Nodes {
 		if n.Status != model.NodeCompleted {
 			return false
 		}
 	}
 	return true
 }
-
-// ---------------------------------------------------------------------------
-// Execution
-// ---------------------------------------------------------------------------
-
-// executeReady finds and executes all ready nodes from the global graph.
-func (r *Reconciler) executeReady(ctx context.Context) {
-	r.mu.Lock()
-	nodes := r.globalGraph.ReadyNodes()
-	r.mu.Unlock()
-
-	for _, node := range nodes {
-		n := node
-		go r.executeNode(ctx, n)
-	}
-}
-
-// executeNode runs one Operation through the safety layer.
-func (r *Reconciler) executeNode(ctx context.Context, node *model.Node) {
-	op := node.Operation
-
-	// Create cancellable context for this operation, with optional timeout
-	var opCtx context.Context
-	var opCancel context.CancelFunc
-	if op.Timeout > 0 {
-		opCtx, opCancel = context.WithTimeout(ctx, time.Duration(op.Timeout))
-	} else {
-		opCtx, opCancel = context.WithCancel(ctx)
-	}
-	defer opCancel()
-
-	// Acquire semaphore to bound concurrent executions; blocks if limit reached.
-	r.execSem <- struct{}{}
-	defer func() { <-r.execSem }()
-
-	r.mu.Lock()
-	node.Status = model.NodeRunning
-	r.inFlight[op.ID] = opCancel
-	provider := r.providers[op.Provider]
-	r.mu.Unlock()
-
-	// Safety layer for destructive operations
-	var release func()
-	if op.Destructive && op.Phase == model.PhaseCommit {
-		var err error
-		release, err = r.arbiter.Acquire(opCtx, op.ID)
-		if err != nil {
-			r.emitEvent(opCtx, model.Event{
-				NodeID: op.ID, ConfigID: op.ConfigID,
-				State: model.StepFailed,
-				Result: model.StepResult{State: model.StepFailed,
-					Code: "arbiter_busy", Reason: err.Error()},
-			})
-			r.mu.Lock()
-			delete(r.inFlight, op.ID)
-			r.mu.Unlock()
-			return
-		}
-		defer release()
-	}
-
-	// Execute via provider (uses opCtx which can be cancelled)
-	result, err := provider.Execute(opCtx, op)
-	if err != nil {
-		r.emitEvent(opCtx, model.Event{
-			NodeID: op.ID, ConfigID: op.ConfigID,
-			State: model.StepFailed,
-			Result: model.StepResult{State: model.StepFailed,
-				Code: "execute_error", Reason: err.Error()},
-		})
-		r.mu.Lock()
-		delete(r.inFlight, op.ID)
-		r.mu.Unlock()
-		return
-	}
-
-	r.emitEvent(opCtx, model.Event{
-		NodeID: op.ID, ConfigID: op.ConfigID,
-		State:  result.State,
-		Result: result,
-	})
-}
-
-func (r *Reconciler) emitEvent(ctx context.Context, event model.Event) {
-	if err := r.events.Publish(ctx, event); err != nil {
-		zap.L().Error("converge: event publish failed", zap.Error(err))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Drift detection
-// ---------------------------------------------------------------------------
-
-// tick runs periodic drift detection.
-func (r *Reconciler) tick(ctx context.Context) {
-	r.mu.Lock()
-	configs := make([]*model.ManagedConfig, 0, len(r.configs))
-	for _, mc := range r.configs {
-		// Only re-check converged configs for drift.
-		// Converging configs are already being reconciled by their own
-		// goroutine — triggering another reconcile would race on mc.Graph.
-		if mc.Status == model.ConfigConverged {
-			configs = append(configs, mc)
+func planFailed(plan *model.Plan) bool {
+	for _, n := range plan.Nodes {
+		if n.Status == model.NodeFailed || n.Status == model.NodeCancelled {
+			return true
 		}
 	}
-	r.mu.Unlock()
-
-	for _, mc := range configs {
-		r.reconcile(ctx, mc)
-	}
+	return false
 }

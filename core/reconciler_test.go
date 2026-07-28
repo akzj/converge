@@ -28,12 +28,12 @@ func (m *mockProvider) Replan(_ context.Context, request ReplanRequest) (ReplanR
 	if !observed.Present {
 		return ReplanResult{Operations: []model.Operation{
 			{
-				ID: "provision-" + m.typeName, Action: "provision",
+				ID: "provision-" + m.typeName, Key: model.OperationKey("provision-" + m.typeName), Action: "provision",
 				Phase: model.PhaseCommit, Destructive: false,
 				CancelMode: model.CancelModeSafe,
 			},
 			{
-				ID: "verify-" + m.typeName, Action: "reconcile",
+				ID: "verify-" + m.typeName, Key: model.OperationKey("verify-" + m.typeName), Action: "reconcile",
 				Phase: model.PhaseVerify, Destructive: false,
 				DependsOn: []string{"provision-" + m.typeName},
 			},
@@ -141,14 +141,11 @@ func TestReconcilerSupersessionCancelsInFlight(t *testing.T) {
 		t.Fatal("config not found after supersession")
 	}
 
-	r.mu.Lock()
-	graphSize := len(mc.Graph.Nodes)
-	r.mu.Unlock()
-
-	if graphSize == 0 {
-		t.Fatal("supersession left empty graph")
+	snapshot := r.registry.Snapshot(mc.ID)
+	if snapshot.Plan == nil || len(snapshot.Plan.Nodes) == 0 {
+		t.Fatal("supersession left empty active plan")
 	}
 
-	t.Logf("supersession: %d ops in new graph, provider.Execute called %d times",
-		graphSize, atomic.LoadInt32(&provider.executed))
+	t.Logf("supersession: %d ops in active plan, provider.Execute called %d times",
+		len(snapshot.Plan.Nodes), atomic.LoadInt32(&provider.executed))
 }
