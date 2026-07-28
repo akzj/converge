@@ -194,6 +194,19 @@ func (r *PlanRegistry) Install(ctx context.Context, expected model.Generation, c
 	}
 	if state.active != nil {
 		for _, key := range change.Carry {
+			// Waiting attempts have returned control to Core and can be safely
+			// retired when a new plan replaces their node.
+			for _, key := range change.Drop {
+				oldNode := state.active.Nodes[key]
+				if oldNode == nil || oldNode.Status != model.NodeWaiting || oldNode.AttemptID == "" {
+					continue
+				}
+				if attempt := state.attempts[oldNode.AttemptID]; attempt != nil {
+					attempt.Status = model.AttemptCancelled
+					state.retired[attempt.ID] = attempt
+					delete(state.attempts, attempt.ID)
+				}
+			}
 			oldNode, newNode := state.active.Nodes[key], installed.Nodes[key]
 			if oldNode.Status == model.NodeRunning {
 				attempt := state.attempts[oldNode.AttemptID]

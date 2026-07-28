@@ -156,3 +156,17 @@ func TestBuildCandidateNormalizesProviderAndConflictKey(t *testing.T) {
 		t.Fatal("expected mismatched provider error")
 	}
 }
+
+func TestClassifyWaitingNodeOnSupersession(t *testing.T) {
+	oldPlan := testPlan(t, "digest", model.Operation{Key: "wait", Action: "old"})
+	oldPlan.Nodes["wait"].Status = model.NodeWaiting
+	oldPlan.Nodes["wait"].AttemptID = "waiting-attempt"
+	candidate := testPlan(t, "digest", model.Operation{Key: "wait", Action: "new"})
+	change, err := ClassifyPlanChange(oldPlan, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(change.Drop) != 1 || change.Drop[0] != "wait" || len(change.Add) != 1 || change.Add[0] != "wait" {
+		t.Fatalf("waiting supersession classification=%#v", change)
+	}
+}
