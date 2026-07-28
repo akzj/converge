@@ -421,15 +421,25 @@ func (r *Reconciler) wakeDependents(ctx context.Context, name string) {
 }
 
 func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
-	r.mu.Lock()
+	r.mu.RLock()
 	managed := r.configs[name]
+	r.mu.RUnlock()
 	if managed == nil {
-		r.mu.Unlock()
 		return
 	}
+	// Delete durable execution and final state before publishing the deletion in
+	// memory. Any failure leaves the config visible for a safe retry.
+	if err := r.registry.Delete(ctx, managed.ID); err != nil {
+		zap.L().Error("converge: delete execution state", zap.String("config", name), zap.Error(err))
+		return
+	}
+	if err := r.store.Delete(ctx, managed.ID); err != nil {
+		zap.L().Error("converge: delete recorded state", zap.String("config", name), zap.Error(err))
+		return
+	}
+	r.mu.Lock()
 	delete(r.configs, name)
 	r.mu.Unlock()
-	_ = r.store.Delete(ctx, managed.ID)
 }
 
 func (r *Reconciler) detectDrift(ctx context.Context) {

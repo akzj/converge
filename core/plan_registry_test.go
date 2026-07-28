@@ -224,3 +224,29 @@ func TestPlanRegistryPersistsAndRestoresRunningAsUnknown(t *testing.T) {
 		t.Fatalf("unknown effect did not block conflicting work: %#v", ready)
 	}
 }
+
+func TestPlanRegistryDeleteRemovesMemoryAndDurableState(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	registry := NewPlanRegistry(store)
+	installed, _, err := registry.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Delete(ctx, installed.ConfigID); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := registry.Snapshot(installed.ConfigID); snapshot.Plan != nil {
+		t.Fatalf("registry state remains: %#v", snapshot)
+	}
+	if stored, err := store.LoadExecution(ctx, installed.ConfigID); err != nil || stored != nil {
+		t.Fatalf("durable state remains: %#v err=%v", stored, err)
+	}
+	recovered := NewPlanRegistry(store)
+	if err := recovered.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := recovered.Snapshot(installed.ConfigID); snapshot.Plan != nil {
+		t.Fatalf("deleted state reappeared: %#v", snapshot)
+	}
+}

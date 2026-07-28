@@ -398,3 +398,18 @@ func (r *PlanRegistry) AckOutbox(ctx context.Context, configID model.ConfigID, e
 	r.configs[configID.Name] = state
 	return nil
 }
+
+// Delete removes a configuration from memory and durable execution storage.
+// Durable deletion happens first so a failed delete cannot expose a partially
+// deleted in-memory state that would reappear after restart.
+func (r *PlanRegistry) Delete(ctx context.Context, configID model.ConfigID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.store != nil {
+		if err := r.store.DeleteExecution(ctx, configID); err != nil {
+			return err
+		}
+	}
+	delete(r.configs, configID.Name)
+	return nil
+}
