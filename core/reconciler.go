@@ -308,6 +308,20 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 		}
 		return
 	}
+	if event.State == model.StepFailed && event.Result.Retryable {
+		retried, exhausted, err := r.registry.ApplyRetryableFailure(ctx, event)
+		if err != nil {
+			zap.L().Warn("converge: invalid retry event", zap.Error(err))
+			return
+		}
+		if retried {
+			r.executeReady(ctx)
+			return
+		}
+		if !exhausted {
+			return
+		}
+	}
 	changed, retiredFinished, err := r.registry.ApplyEvent(event)
 	if err != nil {
 		zap.L().Warn("converge: ignored invalid event", zap.Error(err))
