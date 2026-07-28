@@ -87,6 +87,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "subscribe")
 	}
+	r.dispatchOutbox(ctx)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -292,16 +293,33 @@ func (r *Reconciler) executeAttempt(ctx context.Context, plan *model.Plan, opera
 }
 
 func (r *Reconciler) publishResult(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, result model.StepResult) {
-	event := model.Event{EventID: string(attempt.ID) + "/terminal", PlanID: plan.ID, Generation: plan.Generation, NodeKey: operation.Key, AttemptID: attempt.ID, ConfigID: plan.ConfigID.Name, State: result.State, Result: result}
-	if err := r.events.Publish(ctx, event); err != nil {
-		zap.L().Error("converge: publish event", zap.Error(err))
+	event := model.Event{EventID: string(attempt.ID) + "/result", PlanID: plan.ID, Generation: plan.Generation, NodeKey: operation.Key, AttemptID: attempt.ID, ConfigID: plan.ConfigID.Name, State: result.State, Result: result}
+	if err := r.registry.EnqueueOutbox(ctx, event); err != nil {
+		zap.L().Error("converge: persist event outbox", zap.Error(err))
+		return
+	}
+	r.dispatchOutbox(ctx)
+}
+
+func (r *Reconciler) dispatchOutbox(ctx context.Context) {
+	for _, event := range r.registry.PendingOutbox() {
+		if err := r.events.Publish(ctx, event); err != nil {
+			zap.L().Warn("converge: publish outbox event", zap.Error(err))
+			return
+		}
 	}
 }
 
 func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	if err := r.journal.Append(ctx, event); err != nil {
 		zap.L().Error("converge: append journal", zap.Error(err))
+		return
 	}
+	defer func() {
+		if err := r.registry.AckOutbox(ctx, model.ConfigID{Name: event.ConfigID}, event.EventID); err != nil {
+			zap.L().Error("converge: acknowledge outbox", zap.Error(err))
+		}
+	}()
 	if event.State == model.StepWaiting {
 		if err := r.registry.ApplyWaiting(ctx, event); err != nil {
 			zap.L().Warn("converge: invalid waiting event", zap.Error(err))
@@ -415,6 +433,7 @@ func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
 }
 
 func (r *Reconciler) detectDrift(ctx context.Context) {
+	r.dispatchOutbox(ctx)
 	if err := r.registry.WakeDueWaiting(ctx, time.Now()); err != nil {
 		zap.L().Error("converge: wake waiting", zap.Error(err))
 	}
