@@ -134,19 +134,19 @@ func NewMemoryEventBus() *MemoryEventBus {
 
 func (b *MemoryEventBus) Publish(ctx context.Context, event model.Event) error {
 	b.mu.RLock()
-	defer b.mu.RUnlock()
+	configSubscribers := append([]chan model.Event(nil), b.channels[event.ConfigID]...)
+	globalSubscribers := append([]chan model.Event(nil), b.channels[""]...)
+	b.mu.RUnlock()
 
-	// MemoryEventBus provides at-least-once delivery while Publish's context
-	// remains live. It deliberately applies backpressure instead of silently
-	// dropping correctness-critical terminal events.
-	for _, ch := range b.channels[event.ConfigID] {
+	// Apply backpressure without holding the subscription lock.
+	for _, ch := range configSubscribers {
 		select {
 		case ch <- event:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	for _, ch := range b.channels[""] {
+	for _, ch := range globalSubscribers {
 		select {
 		case ch <- event:
 		case <-ctx.Done():
