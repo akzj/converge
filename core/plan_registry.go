@@ -23,6 +23,8 @@ type PlanRegistry struct {
 	configs map[string]*configExecution
 }
 
+var ErrDesiredConflict = errors.New("desired revision conflict")
+
 func NewPlanRegistry() *PlanRegistry {
 	return &PlanRegistry{configs: make(map[string]*configExecution)}
 }
@@ -62,6 +64,12 @@ func (r *PlanRegistry) Install(expected model.Generation, candidate *model.Plan)
 	}
 	if current != expected {
 		return nil, PlanChange{}, ErrGenerationChanged
+	}
+	if state.active != nil {
+		if candidate.DesiredVersion < state.active.DesiredVersion ||
+			(candidate.DesiredVersion == state.active.DesiredVersion && candidate.DesiredDigest != state.active.DesiredDigest) {
+			return nil, PlanChange{}, ErrDesiredConflict
+		}
 	}
 
 	installed := candidate.Clone()

@@ -128,6 +128,26 @@ func TestPlanRegistryEventIdentityAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestPlanRegistryRejectsNonMonotonicDesiredRevision(t *testing.T) {
+	r := NewPlanRegistry()
+	first, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{Version: 2, Digest: "v2"}, "test", "digest", []model.Operation{{Key: "apply"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.Install(0, first); err != nil {
+		t.Fatal(err)
+	}
+	for _, desired := range []model.DesiredState{{Version: 1, Digest: "v1"}, {Version: 2, Digest: "different"}} {
+		candidate, err := BuildCandidate(model.ConfigID{Name: "config"}, desired, "test", "digest", []model.Operation{{Key: "apply"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := r.Install(1, candidate); !errors.Is(err, ErrDesiredConflict) {
+			t.Fatalf("desired %#v error=%v, want conflict", desired, err)
+		}
+	}
+}
+
 func TestPlanRegistryUnknownOldEventCannotMutateActive(t *testing.T) {
 	r := NewPlanRegistry()
 	installed, _, err := r.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
