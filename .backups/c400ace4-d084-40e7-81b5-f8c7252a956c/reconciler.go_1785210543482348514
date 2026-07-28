@@ -867,10 +867,8 @@ func (r *Reconciler) tick(ctx context.Context) {
 	r.mu.Lock()
 	configs := make([]*model.ManagedConfig, 0, len(r.configs))
 	for _, mc := range r.configs {
-		// Only re-check converged configs for drift.
-		// Converging configs are already being reconciled by their own
-		// goroutine — triggering another reconcile would race on mc.Graph.
-		if mc.Status == model.ConfigConverged {
+		// Scan both converged (drift detection) and converging (stale/blocked re-entry)
+		if mc.Status == model.ConfigConverged || mc.Status == model.ConfigConverging {
 			configs = append(configs, mc)
 		}
 	}
