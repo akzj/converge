@@ -31,7 +31,7 @@ func (r *PlanRegistry) ApplyWaiting(ctx context.Context, event model.Event) erro
 	}
 	attempt.Status, attempt.NextCheckAt = model.AttemptWaiting, event.Result.NextCheckAt
 	node.Status = model.NodeWaiting
-	if err := r.persistLocked(ctx, attempt.ConfigID, state.active.Generation, state); err != nil {
+	if err := r.persistLocked(ctx, attempt.ConfigID, state.revision, state); err != nil {
 		return err
 	}
 	r.configs[event.ConfigID] = state
@@ -61,7 +61,7 @@ func (r *PlanRegistry) WakeDueWaiting(ctx context.Context, now time.Time) error 
 			changed = true
 		}
 		if changed {
-			if err := r.persistLocked(ctx, state.active.ConfigID, state.active.Generation, state); err != nil {
+			if err := r.persistLocked(ctx, state.active.ConfigID, state.revision, state); err != nil {
 				return err
 			}
 			r.configs[name] = state

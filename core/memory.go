@@ -88,14 +88,14 @@ func (s *MemoryExecutionStore) ListExecutions(_ context.Context) ([]model.Config
 	return ids, nil
 }
 
-func (s *MemoryExecutionStore) CommitExecutionCAS(_ context.Context, id model.ConfigID, expected model.Generation, snapshot ExecutionSnapshot) error {
+func (s *MemoryExecutionStore) CommitExecutionCAS(_ context.Context, id model.ConfigID, expectedRevision uint64, snapshot ExecutionSnapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	current := model.Generation(0)
-	if stored, ok := s.executions[id]; ok && stored.Plan != nil {
-		current = stored.Plan.Generation
+	var currentRevision uint64
+	if stored, ok := s.executions[id]; ok {
+		currentRevision = stored.Revision
 	}
-	if current != expected {
+	if currentRevision != expectedRevision {
 		return ErrGenerationChanged
 	}
 	s.executions[id] = cloneExecutionSnapshot(snapshot)
@@ -111,6 +111,7 @@ func (s *MemoryExecutionStore) DeleteExecution(_ context.Context, id model.Confi
 
 func cloneExecutionSnapshot(snapshot ExecutionSnapshot) ExecutionSnapshot {
 	copy := ExecutionSnapshot{
+		Revision: snapshot.Revision,
 		Plan:     snapshot.Plan.Clone(),
 		Attempts: append([]model.Attempt(nil), snapshot.Attempts...),
 		Outbox:   make([]model.Event, len(snapshot.Outbox)),

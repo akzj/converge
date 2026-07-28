@@ -19,7 +19,7 @@ func (s *failingExecutionStore) LoadExecution(ctx context.Context, id model.Conf
 func (s *failingExecutionStore) ListExecutions(ctx context.Context) ([]model.ConfigID, error) {
 	return s.inner.ListExecutions(ctx)
 }
-func (s *failingExecutionStore) CommitExecutionCAS(ctx context.Context, id model.ConfigID, expected model.Generation, snapshot ExecutionSnapshot) error {
+func (s *failingExecutionStore) CommitExecutionCAS(ctx context.Context, id model.ConfigID, expected uint64, snapshot ExecutionSnapshot) error {
 	if s.fail {
 		return errors.New("injected commit failure")
 	}

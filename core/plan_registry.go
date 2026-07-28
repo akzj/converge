@@ -13,6 +13,7 @@ import (
 var ErrGenerationChanged = errors.New("active plan generation changed")
 
 type configExecution struct {
+	revision uint64
 	active   *model.Plan
 	attempts map[model.AttemptID]*model.Attempt
 	retired  map[model.AttemptID]*model.Attempt
@@ -56,7 +57,7 @@ func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) Execution
 	if state == nil {
 		return ExecutionSnapshot{}
 	}
-	snapshot := ExecutionSnapshot{Plan: state.active.Clone()}
+	snapshot := ExecutionSnapshot{Revision: state.revision, Plan: state.active.Clone()}
 	for _, attempt := range state.attempts {
 		snapshot.Attempts = append(snapshot.Attempts, *attempt)
 	}
@@ -69,11 +70,12 @@ func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) Execution
 	return snapshot
 }
 
-func (r *PlanRegistry) persistLocked(ctx context.Context, id model.ConfigID, expected model.Generation, state *configExecution) error {
+func (r *PlanRegistry) persistLocked(ctx context.Context, id model.ConfigID, expectedRevision uint64, state *configExecution) error {
+	state.revision = expectedRevision + 1
 	if r.store == nil {
 		return nil
 	}
-	return r.store.CommitExecutionCAS(ctx, id, expected, r.executionSnapshotLocked(state))
+	return r.store.CommitExecutionCAS(ctx, id, expectedRevision, r.executionSnapshotLocked(state))
 }
 
 // Restore loads durable state. Previously-running attempts become Unknown and
@@ -96,7 +98,7 @@ func (r *PlanRegistry) Restore(ctx context.Context) error {
 		if snapshot == nil || snapshot.Plan == nil {
 			continue
 		}
-		state := &configExecution{active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
+		state := &configExecution{revision: snapshot.Revision, active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
 		for i := range snapshot.Attempts {
 			attempt := snapshot.Attempts[i]
 			copy := attempt
@@ -122,7 +124,7 @@ func cloneConfigExecution(state *configExecution) *configExecution {
 	if state == nil {
 		return nil
 	}
-	copy := &configExecution{active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
+	copy := &configExecution{revision: state.revision, active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
 	for id, attempt := range state.attempts {
 		value := *attempt
 		copy.attempts[id] = &value
@@ -192,7 +194,7 @@ func (r *PlanRegistry) Install(ctx context.Context, expected model.Generation, c
 		r.retire(state, change.Drain, model.AttemptDraining)
 	}
 	state.active = installed
-	if err := r.persistLocked(ctx, candidate.ConfigID, current, state); err != nil {
+	if err := r.persistLocked(ctx, candidate.ConfigID, state.revision, state); err != nil {
 		return nil, PlanChange{}, err
 	}
 	r.configs[candidate.ConfigID.Name] = state
@@ -240,7 +242,7 @@ func (r *PlanRegistry) StartAttempt(ctx context.Context, configID model.ConfigID
 	attempt := &model.Attempt{ID: attemptID, PlanID: state.active.ID, Generation: generation, ConfigID: configID, NodeKey: key, Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey, Status: model.AttemptRunning}
 	node.Status, node.AttemptID = model.NodeRunning, attemptID
 	state.attempts[attemptID] = attempt
-	if err := r.persistLocked(ctx, configID, generation, state); err != nil {
+	if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
 		return nil, err
 	}
 	r.configs[configID.Name] = state
@@ -287,14 +289,14 @@ func (r *PlanRegistry) ApplyEvent(ctx context.Context, event model.Event) (activ
 			return false, false, errors.New("active attempt generation mismatch")
 		}
 		node.Status = terminal
-		if err := r.persistLocked(ctx, attempt.ConfigID, state.active.Generation, state); err != nil {
+		if err := r.persistLocked(ctx, attempt.ConfigID, state.revision, state); err != nil {
 			return false, false, err
 		}
 		r.configs[event.ConfigID] = state
 		return true, false, nil
 	}
 	delete(state.retired, event.AttemptID)
-	if err := r.persistLocked(ctx, attempt.ConfigID, state.active.Generation, state); err != nil {
+	if err := r.persistLocked(ctx, attempt.ConfigID, state.revision, state); err != nil {
 		return false, false, err
 	}
 	r.configs[event.ConfigID] = state
@@ -365,7 +367,7 @@ func (r *PlanRegistry) EnqueueOutbox(ctx context.Context, event model.Event) err
 	}
 	state := cloneConfigExecution(current)
 	state.outbox[event.EventID] = event
-	if err := r.persistLocked(ctx, state.active.ConfigID, state.active.Generation, state); err != nil {
+	if err := r.persistLocked(ctx, state.active.ConfigID, state.revision, state); err != nil {
 		return err
 	}
 	r.configs[event.ConfigID] = state
@@ -398,7 +400,7 @@ func (r *PlanRegistry) AckOutbox(ctx context.Context, configID model.ConfigID, e
 	}
 	state := cloneConfigExecution(current)
 	delete(state.outbox, eventID)
-	if err := r.persistLocked(ctx, configID, state.active.Generation, state); err != nil {
+	if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
 		return err
 	}
 	r.configs[configID.Name] = state

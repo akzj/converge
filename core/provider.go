@@ -56,6 +56,7 @@ type Arbiter interface {
 
 // ExecutionSnapshot is the durable execution state for one configuration.
 type ExecutionSnapshot struct {
+	Revision uint64
 	Plan     *model.Plan
 	Attempts []model.Attempt
 	Outbox   []model.Event
@@ -65,7 +66,7 @@ type ExecutionSnapshot struct {
 type ExecutionStore interface {
 	LoadExecution(ctx context.Context, configID model.ConfigID) (*ExecutionSnapshot, error)
 	ListExecutions(ctx context.Context) ([]model.ConfigID, error)
-	CommitExecutionCAS(ctx context.Context, configID model.ConfigID, expected model.Generation, snapshot ExecutionSnapshot) error
+	CommitExecutionCAS(ctx context.Context, configID model.ConfigID, expectedRevision uint64, snapshot ExecutionSnapshot) error
 	DeleteExecution(ctx context.Context, configID model.ConfigID) error
 }
 

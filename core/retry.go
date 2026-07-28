@@ -41,7 +41,7 @@ func (r *PlanRegistry) ApplyRetryableFailure(ctx context.Context, event model.Ev
 	delete(state.attempts, attempt.ID)
 	node.RetryCount++
 	node.Status, node.AttemptID = model.NodePending, ""
-	if err := r.persistLocked(ctx, attempt.ConfigID, state.active.Generation, state); err != nil {
+	if err := r.persistLocked(ctx, attempt.ConfigID, state.revision, state); err != nil {
 		return false, false, err
 	}
 	r.configs[event.ConfigID] = state
