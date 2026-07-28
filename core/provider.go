@@ -68,6 +68,7 @@ type Arbiter interface {
 // ExecutionSnapshot is the durable execution state for one configuration.
 type ExecutionSnapshot struct {
 	Revision uint64
+	Deleting bool
 	Plan     *model.Plan
 	Attempts []model.Attempt
 	Outbox   []model.Event

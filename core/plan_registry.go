@@ -14,6 +14,7 @@ var ErrGenerationChanged = errors.New("active plan generation changed")
 
 type configExecution struct {
 	revision uint64
+	deleting bool
 	active   *model.Plan
 	attempts map[model.AttemptID]*model.Attempt
 	retired  map[model.AttemptID]*model.Attempt
@@ -71,7 +72,7 @@ func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) Execution
 	if state == nil {
 		return ExecutionSnapshot{}
 	}
-	snapshot := ExecutionSnapshot{Revision: state.revision, Plan: state.active.Clone()}
+	snapshot := ExecutionSnapshot{Revision: state.revision, Deleting: state.deleting, Plan: state.active.Clone()}
 	for _, attempt := range state.attempts {
 		snapshot.Attempts = append(snapshot.Attempts, *attempt)
 	}
@@ -112,7 +113,7 @@ func (r *PlanRegistry) Restore(ctx context.Context) error {
 		if snapshot == nil || snapshot.Plan == nil {
 			continue
 		}
-		state := &configExecution{revision: snapshot.Revision, active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
+		state := &configExecution{revision: snapshot.Revision, deleting: snapshot.Deleting, active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
 		for i := range snapshot.Attempts {
 			attempt := snapshot.Attempts[i]
 			copy := attempt
@@ -138,7 +139,7 @@ func cloneConfigExecution(state *configExecution) *configExecution {
 	if state == nil {
 		return nil
 	}
-	copy := &configExecution{revision: state.revision, active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
+	copy := &configExecution{revision: state.revision, deleting: state.deleting, active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
 	for id, attempt := range state.attempts {
 		value := *attempt
 		copy.attempts[id] = &value
