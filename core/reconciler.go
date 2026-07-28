@@ -233,7 +233,7 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		}
 		r.cancelRetired(snapshot, change)
 		if len(installed.Nodes) == 0 || planCompleted(installed) {
-			r.verifyAndRecord(ctx, managed, provider)
+			r.verifyAndRecord(ctx, installed, provider)
 			return
 		}
 		r.setConfigStatus(name, model.ConfigConverging)
@@ -414,29 +414,39 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	}
 	if planCompleted(snapshot.Plan) {
 		r.mu.RLock()
-		managed, provider := r.configs[event.ConfigID], r.providers[snapshot.Plan.ProviderType]
+		provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]
 		r.mu.RUnlock()
-		if managed != nil && provider != nil {
-			r.verifyAndRecord(ctx, managed, provider)
+		if provider != nil {
+			r.verifyAndRecord(ctx, snapshot.Plan, provider)
 		}
 	}
 }
 
-func (r *Reconciler) verifyAndRecord(ctx context.Context, managed *model.ManagedConfig, provider Provider) {
-	observed, err := provider.Verify(ctx, model.ResourceID{Name: managed.ID.Name}, managed.Desired)
+func (r *Reconciler) verifyAndRecord(ctx context.Context, plan *model.Plan, provider Provider) {
+	desired := model.CloneDesiredState(plan.Desired)
+	observed, err := provider.Verify(ctx, model.ResourceID{Name: plan.ConfigID.Name}, desired)
 	if err != nil {
-		r.setConfigStatus(managed.ID.Name, model.ConfigError)
+		r.setConfigStatus(plan.ConfigID.Name, model.ConfigError)
 		return
 	}
-	recorded := model.RecordedState{ConfigID: managed.ID, ProviderType: provider.Type(), DesiredVersion: managed.Desired.Version, DesiredDigest: managed.Desired.Digest, HandlerDigest: provider.Digest(), Status: model.ConfigConverged, UpdatedAt: time.Now()}
+	// Do not let completion of an old plan record a newer mutable desired state.
+	current := r.registry.Snapshot(plan.ConfigID).Plan
+	if current == nil || current.ID != plan.ID || current.Generation != plan.Generation ||
+		current.DesiredVersion != desired.Version || current.DesiredDigest != desired.Digest {
+		return
+	}
+	recorded := model.RecordedState{ConfigID: plan.ConfigID, ProviderType: provider.Type(), DesiredVersion: desired.Version, DesiredDigest: desired.Digest, HandlerDigest: provider.Digest(), Status: model.ConfigConverged, UpdatedAt: time.Now()}
 	if err := r.store.Record(ctx, recorded); err != nil {
-		r.setConfigStatus(managed.ID.Name, model.ConfigError)
+		r.setConfigStatus(plan.ConfigID.Name, model.ConfigError)
 		return
 	}
 	r.mu.Lock()
-	managed.Observed, managed.Recorded, managed.Status = observed, recorded, model.ConfigConverged
+	managed := r.configs[plan.ConfigID.Name]
+	if managed != nil && managed.Desired.Version == desired.Version && managed.Desired.Digest == desired.Digest {
+		managed.Observed, managed.Recorded, managed.Status = observed, recorded, model.ConfigConverged
+	}
 	r.mu.Unlock()
-	r.wakeDependents(ctx, managed.ID.Name)
+	r.wakeDependents(ctx, plan.ConfigID.Name)
 }
 
 func (r *Reconciler) dependenciesMet(managed *model.ManagedConfig) bool {
