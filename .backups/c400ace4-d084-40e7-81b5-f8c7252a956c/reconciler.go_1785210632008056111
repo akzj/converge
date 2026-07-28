@@ -826,10 +826,6 @@ func (r *Reconciler) executeNode(ctx context.Context, node *model.Node) {
 	}
 	defer opCancel()
 
-	// Acquire semaphore to bound concurrent executions; blocks if limit reached.
-	r.execSem <- struct{}{}
-	defer func() { <-r.execSem }()
-
 	r.mu.Lock()
 	node.Status = model.NodeRunning
 	r.inFlight[op.ID] = opCancel

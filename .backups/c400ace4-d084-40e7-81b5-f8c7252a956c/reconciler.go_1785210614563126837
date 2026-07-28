@@ -659,10 +659,6 @@ func (r *Reconciler) dependenciesMet(mc *model.ManagedConfig) bool {
 // with Retryable=true will be retried before marking the config as error.
 const maxRetriesPerNode = 3
 
-// maxConcurrentExecutions limits the number of simultaneous node executions
-// to prevent unbounded goroutine growth under high submission load.
-const maxConcurrentExecutions = 10
-
 // handleEvent processes an Event from a completed Operation.
 func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	r.mu.Lock()
@@ -825,10 +821,6 @@ func (r *Reconciler) executeNode(ctx context.Context, node *model.Node) {
 		opCtx, opCancel = context.WithCancel(ctx)
 	}
 	defer opCancel()
-
-	// Acquire semaphore to bound concurrent executions; blocks if limit reached.
-	r.execSem <- struct{}{}
-	defer func() { <-r.execSem }()
 
 	r.mu.Lock()
 	node.Status = model.NodeRunning
