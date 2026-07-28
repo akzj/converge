@@ -130,10 +130,16 @@ func cloneConfigExecution(state *configExecution) *configExecution {
 	for id, attempt := range state.retired {
 		value := *attempt
 		copy.retired[id] = &value
-		for id, event := range state.outbox {
-			copy.outbox[id] = event
-		}
 	}
+	for id, event := range state.outbox {
+		copy.outbox[id] = cloneEvent(event)
+	}
+	return copy
+}
+
+func cloneEvent(event model.Event) model.Event {
+	copy := event
+	copy.Observed.Properties = append([]byte(nil), event.Observed.Properties...)
 	return copy
 }
 

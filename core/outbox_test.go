@@ -62,3 +62,45 @@ func TestOutboxEnqueueIsIdempotentByEventID(t *testing.T) {
 		t.Fatalf("pending=%d, want 1", got)
 	}
 }
+
+func TestOutboxSurvivesUnrelatedRegistryTransitions(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	registry := NewPlanRegistry(store)
+	installed, _, err := registry.Install(ctx, 0, testPlan(t, "digest", model.Operation{Key: "first"}, model.Operation{Key: "second"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := model.Event{EventID: "first-event", ConfigID: installed.ConfigID.Name, Observed: model.ObservedState{Properties: []byte("original")}}
+	second := model.Event{EventID: "second-event", ConfigID: installed.ConfigID.Name}
+	if err := registry.EnqueueOutbox(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.StartAttempt(ctx, installed.ConfigID, installed.Generation, "second", "attempt-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.EnqueueOutbox(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	first.Observed.Properties[0] = 'X'
+
+	pending := registry.PendingOutbox()
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d, want 2: %#v", len(pending), pending)
+	}
+	if err := registry.AckOutbox(ctx, installed.ConfigID, "second-event"); err != nil {
+		t.Fatal(err)
+	}
+	pending = registry.PendingOutbox()
+	if len(pending) != 1 || pending[0].EventID != "first-event" || string(pending[0].Observed.Properties) != "original" {
+		t.Fatalf("unrelated transition lost or aliased event: %#v", pending)
+	}
+
+	recovered := NewPlanRegistry(store)
+	if err := recovered.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if pending := recovered.PendingOutbox(); len(pending) != 1 || pending[0].EventID != "first-event" {
+		t.Fatalf("event not durable: %#v", pending)
+	}
+}

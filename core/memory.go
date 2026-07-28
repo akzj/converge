@@ -113,7 +113,10 @@ func cloneExecutionSnapshot(snapshot ExecutionSnapshot) ExecutionSnapshot {
 	copy := ExecutionSnapshot{
 		Plan:     snapshot.Plan.Clone(),
 		Attempts: append([]model.Attempt(nil), snapshot.Attempts...),
-		Outbox:   append([]model.Event(nil), snapshot.Outbox...),
+		Outbox:   make([]model.Event, len(snapshot.Outbox)),
+	}
+	for i, event := range snapshot.Outbox {
+		copy.Outbox[i] = cloneEvent(event)
 	}
 	return copy
 }
