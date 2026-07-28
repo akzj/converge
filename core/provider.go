@@ -58,6 +58,7 @@ type Arbiter interface {
 type ExecutionSnapshot struct {
 	Plan     *model.Plan
 	Attempts []model.Attempt
+	Outbox   []model.Event
 }
 
 // ExecutionStore persists plan/attempt transitions used for crash recovery.

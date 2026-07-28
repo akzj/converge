@@ -110,8 +110,11 @@ func (s *MemoryExecutionStore) DeleteExecution(_ context.Context, id model.Confi
 }
 
 func cloneExecutionSnapshot(snapshot ExecutionSnapshot) ExecutionSnapshot {
-	copy := ExecutionSnapshot{Plan: snapshot.Plan.Clone(), Attempts: make([]model.Attempt, len(snapshot.Attempts))}
-	copy.Attempts = append(copy.Attempts[:0], snapshot.Attempts...)
+	copy := ExecutionSnapshot{
+		Plan:     snapshot.Plan.Clone(),
+		Attempts: append([]model.Attempt(nil), snapshot.Attempts...),
+		Outbox:   append([]model.Event(nil), snapshot.Outbox...),
+	}
 	return copy
 }
 
