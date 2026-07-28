@@ -364,7 +364,7 @@ func (r *PlanRegistry) ReadyOperations(configID model.ConfigID) (*model.Plan, []
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	state := r.configs[configID.Name]
-	if state == nil || state.active == nil {
+	if state == nil || state.active == nil || state.deleting {
 		return nil, nil
 	}
 	blocked := make(map[string]bool)
