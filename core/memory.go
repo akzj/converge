@@ -67,23 +67,25 @@ func NewMemoryEventBus() *MemoryEventBus {
 	return &MemoryEventBus{channels: make(map[string][]chan model.Event)}
 }
 
-func (b *MemoryEventBus) Publish(_ context.Context, event model.Event) error {
+func (b *MemoryEventBus) Publish(ctx context.Context, event model.Event) error {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	// Publish to config-specific subscribers
+	// MemoryEventBus provides at-least-once delivery while Publish's context
+	// remains live. It deliberately applies backpressure instead of silently
+	// dropping correctness-critical terminal events.
 	for _, ch := range b.channels[event.ConfigID] {
 		select {
 		case ch <- event:
-		default:
-			// drop if buffer full (non-blocking)
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	// Also publish to global subscribers (empty configID)
 	for _, ch := range b.channels[""] {
 		select {
 		case ch <- event:
-		default:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	return nil
@@ -99,8 +101,8 @@ func (b *MemoryEventBus) Subscribe(_ context.Context, configID string) (<-chan m
 
 // MemoryArbiter is an in-memory Arbiter for testing and development.
 type MemoryArbiter struct {
-	mu          sync.Mutex
-	activeOpID  string
+	mu         sync.Mutex
+	activeOpID string
 }
 
 func NewMemoryArbiter() *MemoryArbiter {
