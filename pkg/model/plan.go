@@ -20,6 +20,7 @@ type AttemptStatus string
 const (
 	AttemptPending    AttemptStatus = "pending"
 	AttemptRunning    AttemptStatus = "running"
+	AttemptWaiting    AttemptStatus = "waiting"
 	AttemptCancelling AttemptStatus = "cancelling"
 	AttemptDraining   AttemptStatus = "draining"
 	AttemptCompleted  AttemptStatus = "completed"

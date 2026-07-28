@@ -189,6 +189,7 @@ const (
 	NodePending    NodeStatus = "pending"
 	NodeReady      NodeStatus = "ready"
 	NodeRunning    NodeStatus = "running"
+	NodeWaiting    NodeStatus = "waiting"
 	NodeCancelling NodeStatus = "cancelling"
 	NodeDraining   NodeStatus = "draining"
 	NodeCompleted  NodeStatus = "completed"
