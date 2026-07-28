@@ -21,7 +21,7 @@ func TestRetryableFailureUsesFreshAttemptAndStopsAtLimit(t *testing.T) {
 		if _, err := registry.StartAttempt(context.Background(), installed.ConfigID, installed.Generation, "apply", attemptID); err != nil {
 			t.Fatal(err)
 		}
-		event := model.Event{ConfigID: "config", NodeKey: "apply", AttemptID: attemptID, State: model.StepFailed, Result: model.StepResult{State: model.StepFailed, Retryable: true}}
+		event := model.Event{ConfigID: "config", PlanID: installed.ID, Generation: installed.Generation, NodeKey: "apply", AttemptID: attemptID, State: model.StepFailed, Result: model.StepResult{State: model.StepFailed, Retryable: true}}
 		retried, exhausted, err := registry.ApplyRetryableFailure(ctx, event)
 		if err != nil {
 			t.Fatal(err)
@@ -49,7 +49,7 @@ func TestRetryableDuplicateFailureIsIdempotent(t *testing.T) {
 	if _, err := registry.StartAttempt(context.Background(), installed.ConfigID, installed.Generation, "apply", "attempt-1"); err != nil {
 		t.Fatal(err)
 	}
-	event := model.Event{ConfigID: "config", NodeKey: "apply", AttemptID: "attempt-1", State: model.StepFailed, Result: model.StepResult{State: model.StepFailed, Retryable: true}}
+	event := model.Event{ConfigID: "config", PlanID: installed.ID, Generation: installed.Generation, NodeKey: "apply", AttemptID: "attempt-1", State: model.StepFailed, Result: model.StepResult{State: model.StepFailed, Retryable: true}}
 	if _, _, err := registry.ApplyRetryableFailure(ctx, event); err != nil {
 		t.Fatal(err)
 	}

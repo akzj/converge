@@ -22,7 +22,7 @@ func (r *PlanRegistry) ApplyWaiting(ctx context.Context, event model.Event) erro
 	}
 	state := cloneConfigExecution(current)
 	attempt := state.attempts[event.AttemptID]
-	if attempt == nil || attempt.NodeKey != event.NodeKey {
+	if attempt == nil || attempt.NodeKey != event.NodeKey || attempt.PlanID != event.PlanID || attempt.Generation != event.Generation {
 		return errors.New("waiting event identity does not match attempt")
 	}
 	node := state.active.Nodes[event.NodeKey]

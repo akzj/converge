@@ -21,7 +21,7 @@ func TestWaitingTransitionIsDurableAndUsesFreshAttempt(t *testing.T) {
 	}
 
 	due := time.Now().Add(time.Minute)
-	event := model.Event{ConfigID: "config", NodeKey: "wait", AttemptID: "attempt-1", State: model.StepWaiting, Result: model.StepResult{State: model.StepWaiting, NextCheckAt: due}}
+	event := model.Event{ConfigID: "config", PlanID: installed.ID, Generation: installed.Generation, NodeKey: "wait", AttemptID: "attempt-1", State: model.StepWaiting, Result: model.StepResult{State: model.StepWaiting, NextCheckAt: due}}
 	if err := registry.ApplyWaiting(ctx, event); err != nil {
 		t.Fatal(err)
 	}

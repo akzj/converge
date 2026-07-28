@@ -30,7 +30,8 @@ func (r *PlanRegistry) ApplyRetryableFailure(ctx context.Context, event model.Ev
 		return false, false, nil
 	}
 	node := state.active.Nodes[event.NodeKey]
-	if node == nil || node.AttemptID != event.AttemptID || attempt.NodeKey != event.NodeKey {
+	if node == nil || node.AttemptID != event.AttemptID || attempt.NodeKey != event.NodeKey ||
+		attempt.PlanID != event.PlanID || attempt.Generation != event.Generation {
 		return false, false, errors.New("retry event identity does not match active attempt")
 	}
 	if node.RetryCount+1 >= maxAttemptsPerNode {

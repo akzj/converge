@@ -2,9 +2,9 @@ package core
 
 import (
 	"context"
-	"fmt"
+	"crypto/rand"
+	"encoding/hex"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -32,7 +32,6 @@ type Reconciler struct {
 	pendingDesired chan model.DesiredState
 	pendingDelete  chan string
 	execSem        chan struct{}
-	attemptSeq     atomic.Uint64
 }
 
 func NewReconciler(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
@@ -241,7 +240,11 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 			continue
 		}
 		for _, operation := range operations {
-			attemptID := model.AttemptID(fmt.Sprintf("%s/%d", plan.ID, r.attemptSeq.Add(1)))
+			attemptID, err := newAttemptID()
+			if err != nil {
+				zap.L().Error("converge: generate attempt ID", zap.Error(err))
+				continue
+			}
 			attempt, err := r.registry.StartAttempt(ctx, id, plan.Generation, operation.Key, attemptID)
 			if err != nil {
 				continue
@@ -249,6 +252,14 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 			go r.executeAttempt(ctx, plan, operation, attempt)
 		}
 	}
+}
+
+func newAttemptID() (model.AttemptID, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return model.AttemptID(hex.EncodeToString(value[:])), nil
 }
 
 func (r *Reconciler) executeAttempt(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt) {

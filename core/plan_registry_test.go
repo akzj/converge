@@ -171,6 +171,7 @@ func TestPlanRegistryRetiredConflictBarrier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	oldPlanID, oldGeneration := installed.ID, installed.Generation
 	if _, err := r.StartAttempt(context.Background(), installed.ConfigID, installed.Generation, "old", "attempt-old"); err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +187,7 @@ func TestPlanRegistryRetiredConflictBarrier(t *testing.T) {
 	if len(ready) != 1 || ready[0].Key != "free" {
 		t.Fatalf("barrier ready set=%#v, want only free", ready)
 	}
-	_, retiredFinished, err := r.ApplyEvent(context.Background(), model.Event{ConfigID: "config", NodeKey: "old", AttemptID: "attempt-old", State: model.StepCompleted})
+	_, retiredFinished, err := r.ApplyEvent(context.Background(), model.Event{ConfigID: "config", PlanID: oldPlanID, Generation: oldGeneration, NodeKey: "old", AttemptID: "attempt-old", State: model.StepCompleted})
 	if err != nil || !retiredFinished {
 		t.Fatalf("retired completion failed: %v %v", retiredFinished, err)
 	}
@@ -248,5 +249,52 @@ func TestPlanRegistryDeleteRemovesMemoryAndDurableState(t *testing.T) {
 	}
 	if snapshot := recovered.Snapshot(installed.ConfigID); snapshot.Plan != nil {
 		t.Fatalf("deleted state reappeared: %#v", snapshot)
+	}
+}
+
+func TestAttemptIdentityRejectsReuseAndWrongGeneration(t *testing.T) {
+	ctx := context.Background()
+	registry := NewPlanRegistry()
+	installed, _, err := registry.Install(ctx, 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.StartAttempt(ctx, installed.ConfigID, installed.Generation, "apply", "unique"); err != nil {
+		t.Fatal(err)
+	}
+	wrong := model.Event{ConfigID: "config", PlanID: installed.ID, Generation: installed.Generation + 1, NodeKey: "apply", AttemptID: "unique", State: model.StepCompleted}
+	if _, _, err := registry.ApplyEvent(ctx, wrong); err == nil {
+		t.Fatal("wrong generation event was accepted")
+	}
+	correct := wrong
+	correct.Generation = installed.Generation
+	if _, _, err := registry.ApplyEvent(ctx, correct); err != nil {
+		t.Fatal(err)
+	}
+
+	// A completed attempt remains reserved and cannot be reused after a waiting/retry-style reset.
+	registry.mu.Lock()
+	state := registry.configs["config"]
+	attempt := state.attempts["unique"]
+	state.retired["unique"] = attempt
+	delete(state.attempts, "unique")
+	state.active.Nodes["apply"].Status, state.active.Nodes["apply"].AttemptID = model.NodePending, ""
+	registry.mu.Unlock()
+	if _, err := registry.StartAttempt(ctx, installed.ConfigID, installed.Generation, "apply", "unique"); err == nil {
+		t.Fatal("retired attempt ID was reused")
+	}
+}
+
+func TestNewAttemptIDIsRandomAndUnique(t *testing.T) {
+	seen := make(map[model.AttemptID]bool)
+	for i := 0; i < 1000; i++ {
+		id, err := newAttemptID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(id) != 32 || seen[id] {
+			t.Fatalf("invalid or duplicate ID %q", id)
+		}
+		seen[id] = true
 	}
 }

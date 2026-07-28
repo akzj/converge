@@ -239,6 +239,14 @@ func (r *PlanRegistry) StartAttempt(ctx context.Context, configID model.ConfigID
 	if _, exists := state.attempts[attemptID]; exists {
 		return nil, errors.Errorf("attempt %q already exists", attemptID)
 	}
+	if _, exists := state.retired[attemptID]; exists {
+		return nil, errors.Errorf("attempt %q was already retired", attemptID)
+	}
+	for _, event := range state.outbox {
+		if event.AttemptID == attemptID {
+			return nil, errors.Errorf("attempt %q exists in pending outbox", attemptID)
+		}
+	}
 	attempt := &model.Attempt{ID: attemptID, PlanID: state.active.ID, Generation: generation, ConfigID: configID, NodeKey: key, Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey, Status: model.AttemptRunning}
 	node.Status, node.AttemptID = model.NodeRunning, attemptID
 	state.attempts[attemptID] = attempt
@@ -269,7 +277,7 @@ func (r *PlanRegistry) ApplyEvent(ctx context.Context, event model.Event) (activ
 	if attempt == nil {
 		return false, false, nil
 	}
-	if attempt.NodeKey != event.NodeKey {
+	if attempt.NodeKey != event.NodeKey || attempt.PlanID != event.PlanID || attempt.Generation != event.Generation {
 		return false, false, errors.New("event identity does not match attempt")
 	}
 	next, terminal, err := terminalAttemptStatus(event.State)
