@@ -186,18 +186,21 @@ type RecordedState struct {
 type NodeStatus string
 
 const (
-	NodePending   NodeStatus = "pending"
-	NodeReady     NodeStatus = "ready"
-	NodeRunning   NodeStatus = "running"
-	NodeCompleted NodeStatus = "completed"
-	NodeFailed    NodeStatus = "failed"
-	NodeCancelled NodeStatus = "cancelled"
+	NodePending    NodeStatus = "pending"
+	NodeReady      NodeStatus = "ready"
+	NodeRunning    NodeStatus = "running"
+	NodeCancelling NodeStatus = "cancelling"
+	NodeDraining   NodeStatus = "draining"
+	NodeCompleted  NodeStatus = "completed"
+	NodeFailed     NodeStatus = "failed"
+	NodeCancelled  NodeStatus = "cancelled"
 )
 
 // Node wraps an Operation with its runtime status.
 type Node struct {
 	Operation  Operation  `json:"operation"`
 	Status     NodeStatus `json:"status"`
+	AttemptID  AttemptID  `json:"attempt_id,omitempty"`
 	RetryCount int        `json:"-"` // number of times this node has been retried
 }
 
