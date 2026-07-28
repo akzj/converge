@@ -180,9 +180,8 @@ const (
 
 // Node wraps an Operation with its runtime status.
 type Node struct {
-	Operation  Operation  `json:"operation"`
-	Status     NodeStatus `json:"status"`
-	RetryCount int        `json:"-"` // number of times this node has been retried
+	Operation Operation  `json:"operation"`
+	Status    NodeStatus `json:"status"`
 }
 
 // Graph is a DAG of Operations ready for scheduling.

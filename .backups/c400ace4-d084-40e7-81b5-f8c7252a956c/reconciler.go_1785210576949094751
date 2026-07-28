@@ -652,10 +652,6 @@ func (r *Reconciler) dependenciesMet(mc *model.ManagedConfig) bool {
 // Event handling
 // ---------------------------------------------------------------------------
 
-// maxRetriesPerNode is the maximum number of times a failed operation
-// with Retryable=true will be retried before marking the config as error.
-const maxRetriesPerNode = 3
-
 // handleEvent processes an Event from a completed Operation.
 func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	r.mu.Lock()
@@ -665,18 +661,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 		case model.StepCompleted:
 			node.Status = model.NodeCompleted
 		case model.StepFailed:
-			// Retry logic: if the result is retryable and we haven't exceeded
-			// the max retry count, reset the node to pending for re-execution.
-			if event.Result.Retryable && node.RetryCount < maxRetriesPerNode {
-				node.RetryCount++
-				node.Status = model.NodePending
-				zap.L().Info("converge: retrying failed op",
-					zap.String("op", event.NodeID),
-					zap.Int("retry", node.RetryCount),
-					zap.String("reason", event.Result.Reason))
-			} else {
-				node.Status = model.NodeFailed
-			}
+			node.Status = model.NodeFailed
 		case model.StepCancelled:
 			node.Status = model.NodeCancelled
 		default:
