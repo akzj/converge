@@ -96,11 +96,11 @@ func ClassifyPlanChange(oldPlan, candidate *model.Plan) (PlanChange, error) {
 		for key := range candidate.Nodes {
 			change.Add = append(change.Add, key)
 		}
-		if err := validatePlan(oldPlan); err != nil {
-			return change, errors.Wrap(err, "invalid old plan")
-		}
 		sortChange(&change)
 		return change, nil
+	}
+	if err := validatePlan(oldPlan); err != nil {
+		return change, errors.Wrap(err, "invalid old plan")
 	}
 
 	for key, oldNode := range oldPlan.Nodes {
