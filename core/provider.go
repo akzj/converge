@@ -29,10 +29,21 @@ type ReplanRequest struct {
 	ProviderDigest string
 }
 
+// EffectResolution is a provider's authoritative assessment of an Unknown
+// attempt after inspecting real state.
+type EffectResolution string
+
+const (
+	EffectStillActive EffectResolution = "still_active"
+	EffectCompleted   EffectResolution = "completed"
+	EffectAbsent      EffectResolution = "absent"
+)
+
 // ReplanResult is provisional. Core assigns identity/generation, validates
 // fingerprints and DAG structure, then installs it atomically.
 type ReplanResult struct {
-	Operations []model.Operation
+	Operations  []model.Operation
+	Resolutions map[model.AttemptID]EffectResolution
 }
 
 // StateStore persists the last-known applied state for each configuration.

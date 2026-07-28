@@ -218,6 +218,17 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 			r.setConfigStatus(name, model.ConfigError)
 			return
 		}
+		if err := r.registry.ResolveEffects(ctx, desired.ConfigID, result.Resolutions); err != nil {
+			r.setConfigStatus(name, model.ConfigError)
+			return
+		}
+		// Resolutions change execution revision/state; re-snapshot before plan CAS.
+		if len(result.Resolutions) > 0 {
+			snapshot = r.registry.Snapshot(desired.ConfigID)
+			if snapshot.Plan != nil {
+				expected = snapshot.Plan.Generation
+			}
+		}
 		candidate, err := BuildCandidate(desired.ConfigID, desired, provider.Type(), provider.Digest(), result.Operations)
 		if err != nil {
 			r.setConfigStatus(name, model.ConfigError)
