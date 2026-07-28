@@ -277,9 +277,6 @@ func (r *Reconciler) executeAttempt(ctx context.Context, plan *model.Plan, opera
 	if err != nil {
 		result = model.StepResult{State: model.StepFailed, Code: "execute_error", Reason: err.Error()}
 	}
-	if result.State == model.StepWaiting {
-		result = model.StepResult{State: model.StepFailed, Code: "waiting_unsupported", Reason: "provider returned waiting without a resumable attempt"}
-	}
 	r.publishResult(ctx, plan, operation, attempt, result)
 }
 
@@ -293,6 +290,12 @@ func (r *Reconciler) publishResult(ctx context.Context, plan *model.Plan, operat
 func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	if err := r.journal.Append(ctx, event); err != nil {
 		zap.L().Error("converge: append journal", zap.Error(err))
+	}
+	if event.State == model.StepWaiting {
+		if err := r.registry.ApplyWaiting(ctx, event); err != nil {
+			zap.L().Warn("converge: invalid waiting event", zap.Error(err))
+		}
+		return
 	}
 	changed, retiredFinished, err := r.registry.ApplyEvent(event)
 	if err != nil {
@@ -387,6 +390,9 @@ func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
 }
 
 func (r *Reconciler) detectDrift(ctx context.Context) {
+	if err := r.registry.WakeDueWaiting(ctx, time.Now()); err != nil {
+		zap.L().Error("converge: wake waiting", zap.Error(err))
+	}
 	r.mu.RLock()
 	var names []string
 	for name, c := range r.configs {
