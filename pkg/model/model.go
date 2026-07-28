@@ -12,6 +12,17 @@ import (
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
+// PlanID uniquely identifies one immutable execution plan.
+type PlanID string
+
+// Generation is a monotonically increasing plan generation within a config.
+type Generation uint64
+
+// OperationKey is a provider-defined stable logical operation identity.
+type OperationKey string
+
+// AttemptID uniquely identifies one execution attempt.
+type AttemptID string
 
 // ConfigID uniquely identifies a managed configuration within a Converge instance.
 type ConfigID struct {
@@ -31,11 +42,11 @@ type ResourceID struct {
 type Phase string
 
 const (
-	PhasePrepare    Phase = "prepare"    // side-effect-free preparation
-	PhaseWait       Phase = "wait"       // waiting for a runtime condition
-	PhaseCommit     Phase = "commit"     // destructive, potentially irreversible mutation
-	PhaseVerify     Phase = "verify"     // read-back from real system
-	PhaseCleanup    Phase = "cleanup"    // removal of artifacts owned by a superseded version
+	PhasePrepare Phase = "prepare" // side-effect-free preparation
+	PhaseWait    Phase = "wait"    // waiting for a runtime condition
+	PhaseCommit  Phase = "commit"  // destructive, potentially irreversible mutation
+	PhaseVerify  Phase = "verify"  // read-back from real system
+	PhaseCleanup Phase = "cleanup" // removal of artifacts owned by a superseded version
 )
 
 // ---------------------------------------------------------------------------
@@ -55,10 +66,10 @@ const (
 // StepResult is returned by a Provider after executing an Operation.
 type StepResult struct {
 	State       StepState `json:"state"`
-	Code        string    `json:"code,omitempty"`         // stable error code
-	Reason      string    `json:"reason,omitempty"`       // human-readable explanation
-	Retryable   bool      `json:"retryable"`              // true=may retry; false=wait for new desired
-	NextCheckAt time.Time `json:"next_check_at,omitempty"`// when Waiting should be re-evaluated
+	Code        string    `json:"code,omitempty"`          // stable error code
+	Reason      string    `json:"reason,omitempty"`        // human-readable explanation
+	Retryable   bool      `json:"retryable"`               // true=may retry; false=wait for new desired
+	NextCheckAt time.Time `json:"next_check_at,omitempty"` // when Waiting should be re-evaluated
 }
 
 // ---------------------------------------------------------------------------
@@ -67,9 +78,9 @@ type StepResult struct {
 
 // Condition is a runtime guard evaluated before an Operation becomes ready.
 type Condition struct {
-	Name     string     `json:"name"`               // e.g. "no_active_players"
+	Name     string     `json:"name"` // e.g. "no_active_players"
 	Resource ResourceID `json:"resource,omitempty"`
-	Input    []byte     `json:"input,omitempty"`    // condition-specific parameters
+	Input    []byte     `json:"input,omitempty"` // condition-specific parameters
 }
 
 // ---------------------------------------------------------------------------
@@ -80,9 +91,9 @@ type Condition struct {
 type CancelMode string
 
 const (
-	CancelModeSafe  CancelMode = "safe"   // cancellable at any point (download, inspect)
-	CancelModeAsync CancelMode = "async"  // cancellable between sub-steps
-	CancelModeNone  CancelMode = "none"   // not cancellable once started
+	CancelModeSafe  CancelMode = "safe"  // cancellable at any point (download, inspect)
+	CancelModeAsync CancelMode = "async" // cancellable between sub-steps
+	CancelModeNone  CancelMode = "none"  // not cancellable once started
 )
 
 // ---------------------------------------------------------------------------
@@ -91,18 +102,21 @@ const (
 
 // Operation is the smallest atomic execution unit in Converge.
 type Operation struct {
-	ID          string      `json:"id"`                     // unique within the DAG
-	ConfigID    string      `json:"config_id"`              // owning configuration name
-	Provider    string      `json:"provider"`               // target provider name
-	Action      string      `json:"action"`                 // "provision"|"deprovision"|"reconcile"
-	Input       []byte      `json:"input,omitempty"`        // action-specific parameters (JSON)
-	Phase       Phase       `json:"phase"`
-	Destructive bool        `json:"destructive"`
-	DependsOn   []string    `json:"depends_on,omitempty"`
-	Conditions  []Condition `json:"conditions,omitempty"`
-	Timeout     Duration    `json:"timeout,omitempty"`
-	CancelMode  CancelMode  `json:"cancel_mode"`
-	HandlerRef  string      `json:"handler_ref,omitempty"`
+	ID          string       `json:"id"` // deprecated: use Key for stable logical identity
+	Key         OperationKey `json:"key,omitempty"`
+	Fingerprint string       `json:"fingerprint,omitempty"`
+	ConflictKey string       `json:"conflict_key,omitempty"`
+	ConfigID    string       `json:"config_id"` // owning configuration name
+	Provider    string       `json:"provider"`  // target provider name
+	Action      string       `json:"action"`    // "provision"|"deprovision"|"reconcile"
+	Input       []byte       `json:"input,omitempty"`
+	Phase       Phase        `json:"phase"`
+	Destructive bool         `json:"destructive"`
+	DependsOn   []string     `json:"depends_on,omitempty"` // operation keys; string retained for source compatibility
+	Conditions  []Condition  `json:"conditions,omitempty"`
+	Timeout     Duration     `json:"timeout,omitempty"`
+	CancelMode  CancelMode   `json:"cancel_mode"`
+	HandlerRef  string       `json:"handler_ref,omitempty"`
 }
 
 // Duration is a JSON-serializable time.Duration.
@@ -132,10 +146,10 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 // DesiredState is the full specification for one configuration.
 type DesiredState struct {
 	ConfigID     ConfigID `json:"config_id"`
-	ProviderType string   `json:"provider_type"`     // which provider handles this (e.g. "nginx.config")
+	ProviderType string   `json:"provider_type"` // which provider handles this (e.g. "nginx.config")
 	Version      uint64   `json:"version"`
-	Spec         []byte   `json:"spec"`               // provider-specific desired spec (JSON)
-	Digest       string   `json:"digest"`             // sha256 of Spec
+	Spec         []byte   `json:"spec"`                 // provider-specific desired spec (JSON)
+	Digest       string   `json:"digest"`               // sha256 of Spec
 	DependsOn    []string `json:"depends_on,omitempty"` // config names that must converge first
 }
 
@@ -145,7 +159,7 @@ type ObservedState struct {
 	Version    string   `json:"version,omitempty"`
 	Properties []byte   `json:"properties,omitempty"`
 	Digest     string   `json:"digest,omitempty"` // sha256 of Properties
-	Present    bool     `json:"present"`           // false = resource does not exist
+	Present    bool     `json:"present"`          // false = resource does not exist
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +229,7 @@ func allDepsCompleted(deps []string, nodes map[string]*Node) bool {
 	}
 	return true
 }
+
 // Validate checks the graph for structural errors:
 //   - cycles (nodes that depend on each other transitively)
 //   - dangling intra-graph dependencies (DependsOn references a node ID
@@ -280,17 +295,16 @@ func (g *Graph) Validate() error {
 	return nil
 }
 
-
 // ---------------------------------------------------------------------------
 // Event
 // ---------------------------------------------------------------------------
 
 // Event is sent from Executor to Orchestrator after an Operation completes.
 type Event struct {
-	NodeID   string       `json:"node_id"`
-	ConfigID string       `json:"config_id"`
-	State    StepState    `json:"state"`
-	Result   StepResult   `json:"result"`
+	NodeID   string        `json:"node_id"`
+	ConfigID string        `json:"config_id"`
+	State    StepState     `json:"state"`
+	Result   StepResult    `json:"result"`
 	Observed ObservedState `json:"observed,omitempty"`
 }
 
