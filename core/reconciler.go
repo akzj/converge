@@ -358,6 +358,14 @@ func (r *Reconciler) executeAttempt(ctx, opCtx context.Context, cancel context.C
 		defer release()
 	}
 	result, err := provider.Execute(opCtx, operation)
+	if opCtx.Err() == context.DeadlineExceeded {
+		if transitionErr := r.registry.MarkAttemptUnknown(ctx, plan.ConfigID, attempt.ID); transitionErr != nil {
+			zap.L().Error("converge: persist timed-out unknown effect", zap.Error(transitionErr))
+		}
+		// Inspect/Replan is the only safe way to decide whether the effect happened.
+		r.planLatest(ctx, plan.ConfigID.Name)
+		return
+	}
 	if err != nil {
 		result = model.StepResult{State: model.StepFailed, Code: "execute_error", Reason: err.Error()}
 	}
