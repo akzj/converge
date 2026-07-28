@@ -105,3 +105,92 @@ func (r *PlanRegistry) retire(state *configExecution, keys []model.OperationKey,
 		delete(state.attempts, attempt.ID)
 	}
 }
+
+// StartAttempt atomically transitions one pending/ready node to Running.
+func (r *PlanRegistry) StartAttempt(configID model.ConfigID, generation model.Generation, key model.OperationKey, attemptID model.AttemptID) (*model.Attempt, error) {
+	if attemptID == "" {
+		return nil, errors.New("attempt ID is empty")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.configs[configID.Name]
+	if state == nil || state.active == nil || state.active.Generation != generation {
+		return nil, ErrGenerationChanged
+	}
+	node := state.active.Nodes[key]
+	if node == nil {
+		return nil, errors.Errorf("operation %q not found", key)
+	}
+	if node.Status != model.NodePending && node.Status != model.NodeReady {
+		return nil, errors.Errorf("operation %q is not startable: %s", key, node.Status)
+	}
+	if _, exists := state.attempts[attemptID]; exists {
+		return nil, errors.Errorf("attempt %q already exists", attemptID)
+	}
+	attempt := &model.Attempt{ID: attemptID, PlanID: state.active.ID, Generation: generation, ConfigID: configID, NodeKey: key, Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey, Status: model.AttemptRunning}
+	node.Status, node.AttemptID = model.NodeRunning, attemptID
+	state.attempts[attemptID] = attempt
+	copy := *attempt
+	return &copy, nil
+}
+
+// ApplyEvent routes a terminal event strictly by attempt identity.
+func (r *PlanRegistry) ApplyEvent(event model.Event) (activeChanged, retiredFinished bool, err error) {
+	if event.AttemptID == "" {
+		return false, false, errors.New("event attempt ID is empty")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.configs[event.ConfigID]
+	if state == nil {
+		return false, false, nil
+	}
+	attempt, active := state.attempts[event.AttemptID]
+	if !active {
+		attempt = state.retired[event.AttemptID]
+	}
+	if attempt == nil {
+		return false, false, nil
+	}
+	if attempt.NodeKey != event.NodeKey {
+		return false, false, errors.New("event identity does not match attempt")
+	}
+	next, terminal, err := terminalAttemptStatus(event.State)
+	if err != nil {
+		return false, false, err
+	}
+	if isTerminalAttempt(attempt.Status) {
+		return false, false, nil
+	}
+	attempt.Status = next
+	if active {
+		node := state.active.Nodes[event.NodeKey]
+		if node == nil || node.AttemptID != event.AttemptID {
+			return false, false, errors.New("active node does not match attempt")
+		}
+		if attempt.PlanID != state.active.ID || attempt.Generation != state.active.Generation {
+			return false, false, errors.New("active attempt generation mismatch")
+		}
+		node.Status = terminal
+		return true, false, nil
+	}
+	delete(state.retired, event.AttemptID)
+	return false, true, nil
+}
+
+func terminalAttemptStatus(state model.StepState) (model.AttemptStatus, model.NodeStatus, error) {
+	switch state {
+	case model.StepCompleted:
+		return model.AttemptCompleted, model.NodeCompleted, nil
+	case model.StepFailed:
+		return model.AttemptFailed, model.NodeFailed, nil
+	case model.StepCancelled:
+		return model.AttemptCancelled, model.NodeCancelled, nil
+	default:
+		return "", "", errors.Errorf("event state %q is not terminal", state)
+	}
+}
+
+func isTerminalAttempt(status model.AttemptStatus) bool {
+	return status == model.AttemptCompleted || status == model.AttemptFailed || status == model.AttemptCancelled
+}

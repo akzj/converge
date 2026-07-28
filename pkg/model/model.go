@@ -304,11 +304,17 @@ func (g *Graph) Validate() error {
 
 // Event is sent from Executor to Orchestrator after an Operation completes.
 type Event struct {
-	NodeID   string        `json:"node_id"`
-	ConfigID string        `json:"config_id"`
-	State    StepState     `json:"state"`
-	Result   StepResult    `json:"result"`
-	Observed ObservedState `json:"observed,omitempty"`
+	EventID    string        `json:"event_id,omitempty"`
+	Sequence   uint64        `json:"sequence,omitempty"`
+	PlanID     PlanID        `json:"plan_id,omitempty"`
+	Generation Generation    `json:"generation,omitempty"`
+	NodeKey    OperationKey  `json:"node_key,omitempty"`
+	AttemptID  AttemptID     `json:"attempt_id,omitempty"`
+	NodeID     string        `json:"node_id,omitempty"` // deprecated
+	ConfigID   string        `json:"config_id"`
+	State      StepState     `json:"state"`
+	Result     StepResult    `json:"result"`
+	Observed   ObservedState `json:"observed,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

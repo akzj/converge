@@ -87,3 +87,58 @@ func TestPlanRegistrySnapshotIsDeepCopy(t *testing.T) {
 		t.Fatalf("snapshot mutated registry: %s", got)
 	}
 }
+
+func TestPlanRegistryAttemptStartsAtMostOnce(t *testing.T) {
+	r := NewPlanRegistry()
+	installed, _, err := r.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.StartAttempt(installed.ConfigID, installed.Generation, "apply", "attempt-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.StartAttempt(installed.ConfigID, installed.Generation, "apply", "attempt-2"); err == nil {
+		t.Fatal("duplicate start succeeded")
+	}
+}
+
+func TestPlanRegistryEventIdentityAndIdempotency(t *testing.T) {
+	r := NewPlanRegistry()
+	installed, _, err := r.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.StartAttempt(installed.ConfigID, installed.Generation, "apply", "attempt-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.ApplyEvent(model.Event{ConfigID: "config", NodeKey: "other", AttemptID: "attempt-1", State: model.StepCompleted}); err == nil {
+		t.Fatal("mismatched event succeeded")
+	}
+	event := model.Event{ConfigID: "config", PlanID: installed.ID, Generation: installed.Generation, NodeKey: "apply", AttemptID: "attempt-1", State: model.StepCompleted}
+	changed, _, err := r.ApplyEvent(event)
+	if err != nil || !changed {
+		t.Fatalf("completion failed: changed=%v err=%v", changed, err)
+	}
+	changed, _, err = r.ApplyEvent(event)
+	if err != nil || changed {
+		t.Fatalf("duplicate event was not idempotent: changed=%v err=%v", changed, err)
+	}
+	if got := r.Snapshot(installed.ConfigID).Plan.Nodes["apply"].Status; got != model.NodeCompleted {
+		t.Fatalf("status=%s, want completed", got)
+	}
+}
+
+func TestPlanRegistryUnknownOldEventCannotMutateActive(t *testing.T) {
+	r := NewPlanRegistry()
+	installed, _, err := r.Install(0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, retired, err := r.ApplyEvent(model.Event{ConfigID: "config", NodeKey: "apply", AttemptID: "old-attempt", State: model.StepCompleted})
+	if err != nil || changed || retired {
+		t.Fatalf("unknown event changed state: %v %v %v", changed, retired, err)
+	}
+	if got := r.Snapshot(installed.ConfigID).Plan.Nodes["apply"].Status; got != model.NodePending {
+		t.Fatalf("unknown event mutated node: %s", got)
+	}
+}
