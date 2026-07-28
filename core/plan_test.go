@@ -9,7 +9,7 @@ import (
 
 func testPlan(t *testing.T, digest string, operations ...model.Operation) *model.Plan {
 	t.Helper()
-	plan, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{Version: 1, Digest: "desired"}, digest, operations)
+	plan, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{Version: 1, Digest: "desired"}, "test", digest, operations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestBuildCandidateValidatesIdentityAndGraph(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{}, "digest", test.ops); err == nil {
+			if _, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{}, "test", "digest", test.ops); err == nil {
 				t.Fatal("expected candidate validation error")
 			}
 		})
@@ -48,6 +48,7 @@ func TestClassifyPlanChangeIsExhaustive(t *testing.T) {
 	oldPlan.Nodes["cancel"].Status = model.NodeRunning
 	oldPlan.Nodes["drain"].Status = model.NodeRunning
 	oldPlan.Nodes["changed"].Status = model.NodeCompleted
+	oldPlan.Nodes["carry"].AttemptID = "attempt-carry"
 
 	candidate := testPlan(t, "digest",
 		model.Operation{Key: "carry", Action: "same"},
@@ -97,5 +98,61 @@ func TestClassifyPlanChangeCarriesCompletedEquivalentNode(t *testing.T) {
 	}
 	if !reflect.DeepEqual(change.Carry, []model.OperationKey{"apply"}) || len(change.Add) != 0 {
 		t.Fatalf("equivalent completed node was not carried: %#v", change)
+	}
+}
+
+func TestClassifyPlanChangeRejectsCarryWhenAncestorChanges(t *testing.T) {
+	oldPlan := testPlan(t, "digest", model.Operation{Key: "parent", Action: "v1"}, model.Operation{Key: "child", Action: "same", DependsOn: []string{"parent"}})
+	oldPlan.Nodes["parent"].Status = model.NodeCompleted
+	oldPlan.Nodes["child"].Status = model.NodeCompleted
+	candidate := testPlan(t, "digest", model.Operation{Key: "parent", Action: "v2"}, model.Operation{Key: "child", Action: "same", DependsOn: []string{"parent"}})
+	change, err := ClassifyPlanChange(oldPlan, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(change.Carry) != 0 {
+		t.Fatalf("child with changed ancestor was carried: %#v", change)
+	}
+}
+
+func TestClassifyPlanChangeCarryStateEligibility(t *testing.T) {
+	tests := []struct {
+		status  model.NodeStatus
+		attempt model.AttemptID
+		want    bool
+	}{
+		{model.NodePending, "", true}, {model.NodeReady, "", true},
+		{model.NodeRunning, "attempt", true}, {model.NodeRunning, "", false},
+		{model.NodeCompleted, "", true}, {model.NodeFailed, "", false},
+		{model.NodeCancelled, "", false}, {model.NodeCancelling, "attempt", false},
+		{model.NodeDraining, "attempt", false},
+	}
+	for _, test := range tests {
+		t.Run(string(test.status)+"/"+string(test.attempt), func(t *testing.T) {
+			op := model.Operation{Key: "apply", Action: "same"}
+			oldPlan := testPlan(t, "digest", op)
+			oldPlan.Nodes["apply"].Status, oldPlan.Nodes["apply"].AttemptID = test.status, test.attempt
+			change, err := ClassifyPlanChange(oldPlan, testPlan(t, "digest", op))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(change.Carry) == 1; got != test.want {
+				t.Fatalf("carry=%v, want %v: %#v", got, test.want, change)
+			}
+		})
+	}
+}
+
+func TestBuildCandidateNormalizesProviderAndConflictKey(t *testing.T) {
+	plan, err := BuildCandidate(model.ConfigID{Name: "example"}, model.DesiredState{}, "provider-a", "digest", []model.Operation{{Key: "apply"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := plan.Nodes["apply"].Operation
+	if op.Provider != "provider-a" || op.ConflictKey != "config/example" {
+		t.Fatalf("candidate was not normalized: %#v", op)
+	}
+	if _, err := BuildCandidate(model.ConfigID{Name: "example"}, model.DesiredState{}, "provider-a", "digest", []model.Operation{{Key: "apply", Provider: "provider-b"}}); err == nil {
+		t.Fatal("expected mismatched provider error")
 	}
 }

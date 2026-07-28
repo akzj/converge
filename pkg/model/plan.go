@@ -8,6 +8,7 @@ type Plan struct {
 	ConfigID       ConfigID               `json:"config_id"`
 	DesiredVersion uint64                 `json:"desired_version"`
 	DesiredDigest  string                 `json:"desired_digest"`
+	ProviderType   string                 `json:"provider_type"`
 	ProviderDigest string                 `json:"provider_digest"`
 	Generation     Generation             `json:"generation"`
 	Nodes          map[OperationKey]*Node `json:"nodes"`

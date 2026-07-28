@@ -22,16 +22,24 @@ type PlanChange struct {
 // BuildCandidate validates provider output, assigns semantic fingerprints, and
 // creates an immutable plan candidate. Identity/generation are assigned by the
 // atomic installer.
-func BuildCandidate(config model.ConfigID, desired model.DesiredState, providerDigest string, operations []model.Operation) (*model.Plan, error) {
+func BuildCandidate(config model.ConfigID, desired model.DesiredState, providerType, providerDigest string, operations []model.Operation) (*model.Plan, error) {
 	plan := &model.Plan{
 		ConfigID:       config,
 		DesiredVersion: desired.Version,
 		DesiredDigest:  desired.Digest,
+		ProviderType:   providerType,
 		ProviderDigest: providerDigest,
 		Nodes:          make(map[model.OperationKey]*model.Node, len(operations)),
 	}
 	for _, original := range operations {
 		op := original
+		if op.Provider != "" && op.Provider != providerType {
+			return nil, errors.Errorf("operation %q provider %q does not match %q", op.Key, op.Provider, providerType)
+		}
+		op.Provider = providerType
+		if op.ConflictKey == "" {
+			op.ConflictKey = "config/" + config.Name
+		}
 		if op.Key == "" {
 			return nil, errors.Errorf("operation %q has no stable key", op.ID)
 		}
@@ -56,8 +64,20 @@ func BuildCandidate(config model.ConfigID, desired model.DesiredState, providerD
 }
 
 func validatePlan(plan *model.Plan) error {
+	if plan == nil {
+		return errors.New("plan is nil")
+	}
 	graph := &model.Graph{Nodes: make(map[string]*model.Node, len(plan.Nodes))}
 	for key, node := range plan.Nodes {
+		if node == nil {
+			return errors.Errorf("operation %q has nil node", key)
+		}
+		if node.Operation.Key != key {
+			return errors.Errorf("operation map key %q does not match operation key %q", key, node.Operation.Key)
+		}
+		if node.Operation.Fingerprint == "" {
+			return errors.Errorf("operation %q has empty fingerprint", key)
+		}
 		graph.Nodes[string(key)] = node
 	}
 	return graph.Validate()
@@ -69,17 +89,23 @@ func ClassifyPlanChange(oldPlan, candidate *model.Plan) (PlanChange, error) {
 	if candidate == nil {
 		return change, errors.New("candidate plan is nil")
 	}
+	if err := validatePlan(candidate); err != nil {
+		return change, errors.Wrap(err, "invalid candidate plan")
+	}
 	if oldPlan == nil {
 		for key := range candidate.Nodes {
 			change.Add = append(change.Add, key)
+		}
+		if err := validatePlan(oldPlan); err != nil {
+			return change, errors.Wrap(err, "invalid old plan")
 		}
 		sortChange(&change)
 		return change, nil
 	}
 
 	for key, oldNode := range oldPlan.Nodes {
-		newNode, exists := candidate.Nodes[key]
-		if exists && carryCompatible(oldPlan, candidate, oldNode, newNode) {
+		_, exists := candidate.Nodes[key]
+		if exists && carryCompatible(oldPlan, candidate, key, make(map[model.OperationKey]bool)) {
 			change.Carry = append(change.Carry, key)
 			continue
 		}
@@ -108,11 +134,33 @@ func ClassifyPlanChange(oldPlan, candidate *model.Plan) (PlanChange, error) {
 	return change, nil
 }
 
-func carryCompatible(oldPlan, candidate *model.Plan, oldNode, newNode *model.Node) bool {
-	return oldPlan.ProviderDigest == candidate.ProviderDigest &&
-		oldNode.Operation.Key == newNode.Operation.Key &&
-		oldNode.Operation.Fingerprint != "" &&
-		oldNode.Operation.Fingerprint == newNode.Operation.Fingerprint
+func carryCompatible(oldPlan, candidate *model.Plan, key model.OperationKey, visiting map[model.OperationKey]bool) bool {
+	oldNode, oldOK := oldPlan.Nodes[key]
+	newNode, newOK := candidate.Nodes[key]
+	if !oldOK || !newOK || oldNode == nil || newNode == nil || visiting[key] {
+		return false
+	}
+	if oldPlan.ProviderType != candidate.ProviderType || oldPlan.ProviderDigest != candidate.ProviderDigest ||
+		oldNode.Operation.Fingerprint == "" || oldNode.Operation.Fingerprint != newNode.Operation.Fingerprint {
+		return false
+	}
+	switch oldNode.Status {
+	case model.NodePending, model.NodeReady, model.NodeCompleted:
+	case model.NodeRunning:
+		if oldNode.AttemptID == "" {
+			return false
+		}
+	default:
+		return false
+	}
+	visiting[key] = true
+	defer delete(visiting, key)
+	for _, dependency := range oldNode.Operation.DependsOn {
+		if !carryCompatible(oldPlan, candidate, model.OperationKey(dependency), visiting) {
+			return false
+		}
+	}
+	return true
 }
 
 func validatePartition(oldPlan, candidate *model.Plan, change PlanChange) error {
