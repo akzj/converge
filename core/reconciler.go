@@ -33,13 +33,14 @@ type Reconciler struct {
 	pendingDesired chan model.DesiredState
 	pendingDelete  chan string
 	execSem        chan struct{}
+	outboxWake     chan struct{}
 }
 
 func NewReconciler(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
 	return &Reconciler{
 		providers: make(map[string]Provider), providerVersions: make(map[string]map[string]Provider), store: store, events: events, arbiter: arbiter, journal: journal,
 		registry: NewPlanRegistry(executionStore), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc),
-		pendingDesired: make(chan model.DesiredState, 128), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions),
+		pendingDesired: make(chan model.DesiredState, 128), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions), outboxWake: make(chan struct{}, 1),
 	}
 }
 
@@ -91,7 +92,8 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "subscribe")
 	}
-	r.dispatchOutbox(ctx)
+	go r.runOutboxDispatcher(ctx)
+	r.wakeOutbox()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -392,7 +394,7 @@ func (r *Reconciler) publishResult(ctx context.Context, plan *model.Plan, operat
 		zap.L().Error("converge: persist event outbox", zap.Error(err))
 		return
 	}
-	r.dispatchOutbox(ctx)
+	r.wakeOutbox()
 }
 
 func (r *Reconciler) dispatchOutbox(ctx context.Context) {
@@ -404,9 +406,32 @@ func (r *Reconciler) dispatchOutbox(ctx context.Context) {
 	}
 }
 
+func (r *Reconciler) wakeOutbox() {
+	select {
+	case r.outboxWake <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Reconciler) runOutboxDispatcher(ctx context.Context) {
+	retry := time.NewTicker(time.Second)
+	defer retry.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.outboxWake:
+			r.dispatchOutbox(ctx)
+		case <-retry.C:
+			r.dispatchOutbox(ctx)
+		}
+	}
+}
+
 func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	if err := r.journal.Append(ctx, event); err != nil {
 		zap.L().Error("converge: append journal", zap.Error(err))
+
 		return
 	}
 	ack := func() {
@@ -576,7 +601,7 @@ func (r *Reconciler) finalizeDeletion(ctx context.Context, configID model.Config
 }
 
 func (r *Reconciler) detectDrift(ctx context.Context) {
-	r.dispatchOutbox(ctx)
+	r.wakeOutbox()
 	if err := r.registry.WakeDueWaiting(ctx, time.Now()); err != nil {
 		zap.L().Error("converge: wake waiting", zap.Error(err))
 	}
