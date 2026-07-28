@@ -305,7 +305,7 @@ func (r *Reconciler) dispatchOutbox(ctx context.Context) {
 	for _, event := range r.registry.PendingOutbox() {
 		if err := r.events.Publish(ctx, event); err != nil {
 			zap.L().Warn("converge: publish outbox event", zap.Error(err))
-			return
+			continue
 		}
 	}
 }
