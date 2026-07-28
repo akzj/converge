@@ -168,14 +168,14 @@ type ObservedState struct {
 
 // RecordedState is persisted after each successful convergence.
 type RecordedState struct {
-	ConfigID       ConfigID  `json:"config_id"`
-	ProviderType   string    `json:"provider_type"` // which provider owns this config
-	DesiredVersion uint64    `json:"desired_version"`
-	DesiredDigest  string    `json:"desired_digest"`
-	HandlerDigest  string    `json:"handler_digest"`
-	HandlerRef     string    `json:"handler_ref"`
-	Status         string    `json:"status"` // "converged"|"converging"|"error"
-	UpdatedAt      time.Time `json:"updated_at"`
+	ConfigID       ConfigID     `json:"config_id"`
+	ProviderType   string       `json:"provider_type"` // which provider owns this config
+	DesiredVersion uint64       `json:"desired_version"`
+	DesiredDigest  string       `json:"desired_digest"`
+	HandlerDigest  string       `json:"handler_digest"`
+	HandlerRef     string       `json:"handler_ref"`
+	Status         ConfigStatus `json:"status"`
+	UpdatedAt      time.Time    `json:"updated_at"`
 }
 
 // ---------------------------------------------------------------------------

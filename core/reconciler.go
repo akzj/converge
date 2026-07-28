@@ -376,7 +376,7 @@ func (r *Reconciler) verifyAndRecord(ctx context.Context, managed *model.Managed
 		r.setConfigStatus(managed.ID.Name, model.ConfigError)
 		return
 	}
-	recorded := model.RecordedState{ConfigID: managed.ID, ProviderType: provider.Type(), DesiredVersion: managed.Desired.Version, DesiredDigest: managed.Desired.Digest, HandlerDigest: provider.Digest(), Status: string(model.ConfigConverged), UpdatedAt: time.Now()}
+	recorded := model.RecordedState{ConfigID: managed.ID, ProviderType: provider.Type(), DesiredVersion: managed.Desired.Version, DesiredDigest: managed.Desired.Digest, HandlerDigest: provider.Digest(), Status: model.ConfigConverged, UpdatedAt: time.Now()}
 	if err := r.store.Record(ctx, recorded); err != nil {
 		r.setConfigStatus(managed.ID.Name, model.ConfigError)
 		return
