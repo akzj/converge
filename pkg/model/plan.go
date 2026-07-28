@@ -42,6 +42,7 @@ type Attempt struct {
 	CarriedTo   Generation    `json:"carried_to,omitempty"`
 	StartedAt   time.Time     `json:"started_at,omitempty"`
 	UpdatedAt   time.Time     `json:"updated_at,omitempty"`
+	NextCheckAt time.Time     `json:"next_check_at,omitempty"`
 }
 
 // PlanSnapshot is a deep-copy view passed to providers during replanning.
