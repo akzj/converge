@@ -5,8 +5,6 @@ package model
 import (
 	"encoding/json"
 	"time"
-
-	"github.com/cockroachdb/errors"
 )
 
 // ---------------------------------------------------------------------------
@@ -215,55 +213,6 @@ func allDepsCompleted(deps []string, nodes map[string]*Node) bool {
 	}
 	return true
 }
-// Validate checks the graph for structural errors such as cycles.
-// Returns an error listing all cycles found.
-func (g *Graph) Validate() error {
-	// DFS three-color cycle detection: 0=white(unvisited), 1=gray(in stack), 2=black(done)
-	type color int
-	const (
-		white color = 0
-		gray  color = 1
-		black color = 2
-	)
-	colors := make(map[string]color, len(g.Nodes))
-	for id := range g.Nodes {
-		colors[id] = white
-	}
-
-	var cycles []string
-	var dfs func(id string) bool
-	dfs = func(id string) bool {
-		colors[id] = gray
-		for _, dep := range g.Nodes[id].Operation.DependsOn {
-			if _, ok := g.Nodes[dep]; !ok {
-				continue // dependency outside this graph (e.g. cross-config)
-			}
-			switch colors[dep] {
-			case gray:
-				cycles = append(cycles, dep+"->"+id)
-				return true
-			case white:
-				if dfs(dep) {
-					return true
-				}
-			}
-		}
-		colors[id] = black
-		return false
-	}
-
-	for id := range g.Nodes {
-		if colors[id] == white {
-			dfs(id)
-		}
-	}
-
-	if len(cycles) > 0 {
-		return errors.Errorf("graph contains %d cycle(s): %v", len(cycles), cycles)
-	}
-	return nil
-}
-
 
 // ---------------------------------------------------------------------------
 // Event

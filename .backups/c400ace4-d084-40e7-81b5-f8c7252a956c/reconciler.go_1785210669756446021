@@ -610,17 +610,6 @@ func (r *Reconciler) reconcile(ctx context.Context, mc *model.ManagedConfig) {
 		graph.Nodes[op.ID] = n
 	}
 
-	// Validate the DAG for cycles before accepting it into the engine.
-	if err := graph.Validate(); err != nil {
-		zap.L().Error("converge: DAG validation failed, rejecting graph",
-			zap.String("config", mc.ID.Name),
-			zap.Error(err))
-		r.mu.Lock()
-		mc.Status = model.ConfigError
-		r.mu.Unlock()
-		return
-	}
-
 	r.mu.Lock()
 	mc.Graph = graph
 	r.mergeGlobalGraphLocked(mc)
