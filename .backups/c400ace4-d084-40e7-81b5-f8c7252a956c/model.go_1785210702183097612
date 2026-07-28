@@ -215,32 +215,10 @@ func allDepsCompleted(deps []string, nodes map[string]*Node) bool {
 	}
 	return true
 }
-// Validate checks the graph for structural errors:
-//   - cycles (nodes that depend on each other transitively)
-//   - dangling intra-graph dependencies (DependsOn references a node ID
-//     that does not exist in this graph)
-//
-// Cross-config dependencies (references to node IDs outside this graph)
-// are silently skipped — they are resolved by the global graph scheduler.
+// Validate checks the graph for structural errors such as cycles.
+// Returns an error listing all cycles found.
 func (g *Graph) Validate() error {
-	if g == nil || len(g.Nodes) == 0 {
-		return nil
-	}
-
-	// --- Check 1: dangling intra-graph dependencies ---
-	var dangles []string
-	for id, n := range g.Nodes {
-		for _, dep := range n.Operation.DependsOn {
-			if _, ok := g.Nodes[dep]; !ok {
-				dangles = append(dangles, id+" depends on missing node: "+dep)
-			}
-		}
-	}
-	if len(dangles) > 0 {
-		return errors.Errorf("graph has %d dangling dependency(ies): %v", len(dangles), dangles)
-	}
-
-	// --- Check 2: cycle detection (DFS three-color) ---
+	// DFS three-color cycle detection: 0=white(unvisited), 1=gray(in stack), 2=black(done)
 	type color int
 	const (
 		white color = 0
@@ -253,19 +231,25 @@ func (g *Graph) Validate() error {
 	}
 
 	var cycles []string
-	var dfs func(id string)
-	dfs = func(id string) {
+	var dfs func(id string) bool
+	dfs = func(id string) bool {
 		colors[id] = gray
 		for _, dep := range g.Nodes[id].Operation.DependsOn {
-			// All DependsOn references are guaranteed to exist after check 1.
+			if _, ok := g.Nodes[dep]; !ok {
+				continue // dependency outside this graph (e.g. cross-config)
+			}
 			switch colors[dep] {
 			case gray:
 				cycles = append(cycles, dep+"->"+id)
+				return true
 			case white:
-				dfs(dep)
+				if dfs(dep) {
+					return true
+				}
 			}
 		}
 		colors[id] = black
+		return false
 	}
 
 	for id := range g.Nodes {
