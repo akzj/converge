@@ -1,6 +1,8 @@
 package core
 
 import (
+	"strconv"
+
 	"github.com/cockroachdb/errors"
 
 	"github.com/akzj/converge/pkg/model"
@@ -21,6 +23,7 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 		effects[effect.ID] = effect
 	}
 	references := make(map[ReferenceID]EffectReference, len(snapshot.EffectReferences))
+	logicalSlots := make(map[string]ReferenceID, len(snapshot.EffectReferences))
 	for _, reference := range snapshot.EffectReferences {
 		if reference.ID == "" {
 			return errors.New("reference ID is empty")
@@ -34,6 +37,17 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 		if reference.EffectKey == "" {
 			return errors.Errorf("reference %q has empty effect key", reference.ID)
 		}
+		if snapshot.Plan != nil && (reference.ConfigID != snapshot.Plan.ConfigID || reference.PlanID != snapshot.Plan.ID || reference.Generation != snapshot.Plan.Generation) {
+			return errors.Errorf("reference %q does not belong to snapshot plan", reference.ID)
+		}
+		if !validReferenceState(reference.State) {
+			return errors.Errorf("reference %q has unknown state %q", reference.ID, reference.State)
+		}
+		slot := reference.ConfigID.Name + "\x00" + string(reference.PlanID) + "\x00" + strconv.FormatUint(uint64(reference.Generation), 10) + "\x00" + reference.EffectKey
+		if prior, exists := logicalSlots[slot]; exists && prior != reference.ID {
+			return errors.Errorf("logical effect slot has references %q and %q", prior, reference.ID)
+		}
+		logicalSlots[slot] = reference.ID
 		references[reference.ID] = reference
 	}
 	controls := make(map[ControlRequestID]struct{}, len(snapshot.EffectControls))
@@ -49,8 +63,16 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 		if _, exists := effects[control.EffectID]; !exists {
 			return errors.Errorf("control %q has missing effect %q", control.ID, control.EffectID)
 		}
-		if _, exists := references[control.ReferenceID]; !exists {
+		reference, exists := references[control.ReferenceID]
+		if !exists {
 			return errors.Errorf("control %q has missing reference %q", control.ID, control.ReferenceID)
+		}
+		effect := effects[control.EffectID]
+		if reference.EffectID != control.EffectID || control.ConfigID != reference.ConfigID || control.ProviderType != effect.ProviderType || control.ProviderDigest != effect.ProviderDigest {
+			return errors.Errorf("control %q identity does not match effect/reference", control.ID)
+		}
+		if !validControlKind(control.Kind) || !validControlState(control.State) {
+			return errors.Errorf("control %q has unknown kind/state", control.ID)
 		}
 		if control.State == EffectControlInFlight {
 			if control.InFlightAttemptID == "" || control.PollRequestID == "" || control.LeaseExpiresAt.IsZero() {
@@ -63,9 +85,38 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 				return errors.Errorf("duplicate poll request ID %q", control.PollRequestID)
 			}
 			attempts[control.InFlightAttemptID], polls[control.PollRequestID] = struct{}{}, struct{}{}
+		} else if control.InFlightAttemptID != "" || control.PollRequestID != "" || !control.LeaseExpiresAt.IsZero() {
+			return errors.Errorf("non-in-flight control %q retains claim identity", control.ID)
 		}
 	}
 	return nil
+}
+
+func validReferenceState(state EffectReferenceState) bool {
+	switch state {
+	case EffectReferenceEnsuring, EffectReferenceActive, EffectReferenceReleaseRequested, EffectReferenceReleased:
+		return true
+	default:
+		return false
+	}
+}
+
+func validControlKind(kind EffectControlKind) bool {
+	switch kind {
+	case EffectControlEnsureRetry, EffectControlEnsureReference, EffectControlObserve, EffectControlRelease, EffectControlObserveCancellation:
+		return true
+	default:
+		return false
+	}
+}
+
+func validControlState(state EffectControlState) bool {
+	switch state {
+	case EffectControlPending, EffectControlInFlight, EffectControlYielded, EffectControlCompleted:
+		return true
+	default:
+		return false
+	}
 }
 
 func ValidateActiveEffect(effect ActiveEffect) error {
@@ -114,11 +165,13 @@ func effectBlocksConflict(effect ActiveEffect) bool {
 	}
 }
 
-func OperationBlockedByEffect(operation model.Operation, effect ActiveEffect, reference EffectReference) bool {
+func OperationBlockedByEffect(operation model.Operation, plan *model.Plan, effect ActiveEffect, reference EffectReference) bool {
 	if !effectBlocksConflict(effect) || operation.ConflictKey != effect.ConflictKey {
 		return false
 	}
-	isControl := operation.EffectKey == reference.EffectKey && reference.EffectID == effect.ID &&
+	exactActiveReference := plan != nil && reference.State == EffectReferenceActive &&
+		reference.ConfigID == plan.ConfigID && reference.PlanID == plan.ID && reference.Generation == plan.Generation
+	isControl := exactActiveReference && operation.EffectKey == reference.EffectKey && reference.EffectID == effect.ID &&
 		(operation.ExecutionKind == model.ExecutionEffectEnsure || operation.ExecutionKind == model.ExecutionEffectObserve || operation.ExecutionKind == model.ExecutionEffectRelease)
 	return !isControl
 }
