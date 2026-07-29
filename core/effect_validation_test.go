@@ -39,13 +39,14 @@ func TestValidateActiveEffectBindingMatrix(t *testing.T) {
 			e := validEffect()
 			e.Binding, e.State, e.ExternalJobID, e.ExternalRevision = EffectBindingUnbound, ExternalEffectFailed, "", 0
 			return e
-		}()},
+		}(), valid: true},
 		{name: "terminal requires resolution", effect: func() ActiveEffect { e := validEffect(); e.State = ExternalEffectCompleted; return e }()},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if (ValidateActiveEffect(test.effect) == nil) != test.valid {
-				t.Fatalf("valid=%v", test.valid)
+			err := ValidateActiveEffect(test.effect)
+			if (err == nil) != test.valid {
+				t.Fatalf("valid=%v err=%v effect=%#v", test.valid, err, test.effect)
 			}
 		})
 	}

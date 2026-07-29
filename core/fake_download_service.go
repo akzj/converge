@@ -39,21 +39,33 @@ type FakeDownloadService struct {
 	jobs  map[string]*fakeJob
 	byKey map[string]string // idempotency key → job ID
 	seq   atomic.Uint64
+
+	// Injectables for Phase E fault matrix.
+	DropNextEnsureResponse bool // create job then pretend RPC lost
+	NextEnsureError        error
+	NextObserveError       error
+	GoneJobs               map[string]bool
 }
 
 func NewFakeDownloadService() *FakeDownloadService {
 	return &FakeDownloadService{
-		jobs:  make(map[string]*fakeJob),
-		byKey: make(map[string]string),
+		jobs:     make(map[string]*fakeJob),
+		byKey:    make(map[string]string),
+		GoneJobs: make(map[string]bool),
 	}
 }
 
 // CreateOrGetJobAndEnsureReference is the atomic external operation.
 // It returns the existing job if the idempotency key is known, otherwise creates
 // one. The reference is always added to the set.
-func (s *FakeDownloadService) CreateOrGetJobAndEnsureReference(idempotencyKey, artifactID, referenceID string) (jobID string, revision uint64, newJob bool) {
+func (s *FakeDownloadService) CreateOrGetJobAndEnsureReference(idempotencyKey, artifactID, referenceID string) (jobID string, revision uint64, newJob bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.NextEnsureError != nil {
+		err = s.NextEnsureError
+		s.NextEnsureError = nil
+		return "", 0, false, err
+	}
 	existingID, exists := s.byKey[idempotencyKey]
 	if exists {
 		job := s.jobs[existingID]
@@ -62,7 +74,11 @@ func (s *FakeDownloadService) CreateOrGetJobAndEnsureReference(idempotencyKey, a
 				job.References = make(map[string]bool)
 			}
 			job.References[referenceID] = true
-			return job.ID, job.Revision, false
+			if s.DropNextEnsureResponse {
+				s.DropNextEnsureResponse = false
+				return "", 0, false, fmt.Errorf("ensure response lost after create")
+			}
+			return job.ID, job.Revision, false, nil
 		}
 	}
 	jobID = fmt.Sprintf("download-%d", s.seq.Add(1))
@@ -77,7 +93,11 @@ func (s *FakeDownloadService) CreateOrGetJobAndEnsureReference(idempotencyKey, a
 	}
 	s.jobs[jobID] = job
 	s.byKey[idempotencyKey] = jobID
-	return jobID, 1, true
+	if s.DropNextEnsureResponse {
+		s.DropNextEnsureResponse = false
+		return "", 0, true, fmt.Errorf("ensure response lost after create")
+	}
+	return jobID, 1, true, nil
 }
 
 // AdvanceJob moves the job to the next expected state for testing.
@@ -140,6 +160,9 @@ func (s *FakeDownloadService) AddReference(jobID, referenceID string) {
 func (s *FakeDownloadService) GetJob(jobID string) (state FakeDownloadJobState, revision uint64, references []string, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.GoneJobs[jobID] {
+		return "", 0, nil, fmt.Errorf("job %q gone", jobID)
+	}
 	job := s.jobs[jobID]
 	if job == nil {
 		return "", 0, nil, fmt.Errorf("job %q not found", jobID)
@@ -149,6 +172,28 @@ func (s *FakeDownloadService) GetJob(jobID string) (state FakeDownloadJobState, 
 		refs = append(refs, ref)
 	}
 	return job.State, job.Revision, refs, nil
+}
+
+// MarkGone simulates authoritative Gone for a job.
+func (s *FakeDownloadService) MarkGone(jobID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.GoneJobs[jobID] = true
+	delete(s.jobs, jobID)
+}
+
+func (s *FakeDownloadService) isGone(jobID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.GoneJobs[jobID]
+}
+
+func (s *FakeDownloadService) consumeObserveError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.NextObserveError
+	s.NextObserveError = nil
+	return err
 }
 
 // RemoveReference idempotently removes one reference. If no references remain,

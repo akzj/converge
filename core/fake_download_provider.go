@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/akzj/converge/pkg/model"
@@ -54,7 +55,14 @@ func (p *FakeDownloadProvider) EnsureEffect(_ context.Context, req EnsureEffectR
 	p.mu.Lock()
 	p.ensureCount++
 	p.mu.Unlock()
-	jobID, revision, _ := p.service.CreateOrGetJobAndEnsureReference(req.IdempotencyKey, req.ArtifactID, string(req.Identity.ReferenceID))
+	jobID, revision, _, err := p.service.CreateOrGetJobAndEnsureReference(req.IdempotencyKey, req.ArtifactID, string(req.Identity.ReferenceID))
+	if err != nil {
+		return EnsureEffectResult{
+			EffectID: req.Identity.EffectID, ReferenceID: req.Identity.ReferenceID,
+			Disposition: EnsureUnknown, Failure: EnsureFailureUnknownOutcome,
+			Code: "ensure_response_lost", Reason: err.Error(),
+		}, nil
+	}
 	p.mu.Lock()
 	p.LastJobID = jobID
 	p.mu.Unlock()
@@ -69,6 +77,9 @@ func (p *FakeDownloadProvider) EnsureEffect(_ context.Context, req EnsureEffectR
 }
 
 func (p *FakeDownloadProvider) ObserveEffects(_ context.Context, requests []ObserveEffectRequest) (map[PollRequestID]EffectObservationResult, error) {
+	if err := p.service.consumeObserveError(); err != nil {
+		return nil, err
+	}
 	result := make(map[PollRequestID]EffectObservationResult, len(requests))
 	for _, req := range requests {
 		p.mu.Lock()
@@ -80,6 +91,16 @@ func (p *FakeDownloadProvider) ObserveEffects(_ context.Context, requests []Obse
 		}
 		state, revision, refs, err := p.service.GetJob(jobID)
 		if err != nil {
+			if p.service.isGone(jobID) || strings.Contains(err.Error(), "gone") {
+				result[req.PollRequestID] = EffectObservationResult{
+					Observation: &EffectObservation{
+						EffectID: req.Identity.EffectID, AttemptID: req.AttemptID, PollRequestID: req.PollRequestID,
+						ExternalJobID: req.ExternalJobID, ExternalRevision: req.ExternalRevision + 1,
+						Disposition: DispositionAbsent, Code: "gone", Reason: err.Error(),
+					},
+				}
+				continue
+			}
 			result[req.PollRequestID] = EffectObservationResult{
 				Error: &ProviderEffectError{Code: "job_not_found", Reason: err.Error(), Retryable: true},
 			}

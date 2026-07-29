@@ -493,10 +493,33 @@ func (r *Reconciler) executeEffectEnsure(ctx context.Context, plan *model.Plan, 
 		EnsureSpec:          spec.EnsureSpec,
 	})
 	if err != nil {
+		if disposition, applyErr := r.registry.ApplyEnsureResult(ctx, identity, EnsureEffectResult{
+			EffectID: identity.EffectIdentity.EffectID, ReferenceID: identity.EffectIdentity.ReferenceID,
+			Disposition: EnsureUnknown, Failure: EnsureFailureUnknownOutcome,
+			Code: "ensure_rpc_error", Reason: err.Error(),
+		}); applyErr == nil && (disposition == TransitionApplied || disposition == TransitionDuplicate) {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepWaiting, Code: "ensure_unknown", NextCheckAt: time.Now().Add(time.Second), Retryable: true})
+			return
+		}
 		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_failed", Reason: err.Error(), Retryable: true})
 		return
 	}
+	if ensureResult.Disposition == EnsureUnknown || ensureResult.Failure == EnsureFailureUnknownOutcome || ensureResult.Failure == EnsureFailureTransientKnownNotApplied {
+		if disposition, err := r.registry.ApplyEnsureResult(ctx, identity, ensureResult); err != nil {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_ensure_failed", Reason: err.Error(), Retryable: true})
+			return
+		} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_ensure_rejected", Reason: string(disposition), Retryable: true})
+			return
+		}
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepWaiting, Code: "ensure_unknown", NextCheckAt: time.Now().Add(time.Second), Retryable: true})
+		return
+	}
 	if ensureResult.Disposition != EnsureBound {
+		if disposition, err := r.registry.ApplyEnsureResult(ctx, identity, ensureResult); err == nil && disposition == TransitionApplied {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_not_bound", Reason: string(ensureResult.Disposition), Retryable: ensureResult.Failure != EnsureFailureAuthoritativeRejected})
+			return
+		}
 		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_not_bound", Reason: string(ensureResult.Disposition), Retryable: true})
 		return
 	}

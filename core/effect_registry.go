@@ -40,8 +40,14 @@ func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureReq
 	if state == nil {
 		return TransitionRejected, errors.New("config not found")
 	}
-	if _, exists := state.effects[req.Identity.EffectIdentity.EffectID]; exists {
-		return TransitionDuplicate, nil
+	if existing, exists := state.effects[req.Identity.EffectIdentity.EffectID]; exists {
+		if existing.IdempotencyKey == req.Spec.IdempotencyKey &&
+			existing.ArtifactID == req.Spec.ArtifactID &&
+			existing.SemanticFingerprint == req.Spec.SemanticFingerprint &&
+			string(existing.EnsureSpec) == string(req.Spec.EnsureSpec) {
+			return TransitionDuplicate, nil
+		}
+		return TransitionRejected, errors.New("effect id reuse with different immutable ensure spec")
 	}
 	if _, exists := state.references[req.Identity.EffectIdentity.ReferenceID]; exists {
 		return TransitionDuplicate, nil
@@ -80,9 +86,9 @@ func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureReq
 	return TransitionApplied, nil
 }
 
-// ApplyEnsureResult transitions an Ensuring effect to Active with its external
-// JobID and revision. The effect is bound, the reference becomes Active, and
-// an Observe control replaces the EnsureRetry control.
+// ApplyEnsureResult applies an Ensure disposition to an unbound effect.
+// Bound success becomes Active or CancelRequested Bound (late ensure after delete).
+// Unknown/Failed outcomes stay unbound and retain EnsureRetry when retryable.
 func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity TransitionIdentity, result EnsureEffectResult) (TransitionDisposition, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -95,39 +101,123 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 	if effect.ID == "" {
 		return TransitionStale, nil
 	}
-	if effect.State != ExternalEffectEnsuring {
+	if result.EffectID != "" && result.EffectID != effect.ID {
+		return TransitionRejected, errors.New("ensure result effect id mismatch")
+	}
+	if result.ReferenceID != "" && result.ReferenceID != identity.EffectIdentity.ReferenceID {
+		return TransitionRejected, errors.New("ensure result reference id mismatch")
+	}
+	if effect.Binding == EffectBindingBound {
+		if effect.ExternalJobID == result.ExternalJobID && result.Disposition == EnsureBound {
+			return TransitionDuplicate, nil
+		}
+		return TransitionRejected, errors.New("effect already bound")
+	}
+	switch effect.State {
+	case ExternalEffectEnsuring, ExternalEffectUnknown, ExternalEffectCancelRequested:
+	default:
 		return TransitionDuplicate, nil
 	}
+
 	oldEffect := effect
 	oldReference := state.references[identity.EffectIdentity.ReferenceID]
-	effect.Binding = EffectBindingBound
-	effect.ExternalJobID = result.ExternalJobID
-	effect.ExternalRevision = result.ExternalRevision
-	effect.State = ExternalEffectActive
-	effect.ResolutionRequired = true
-	if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionEnsureResult); err != nil {
-		return TransitionRejected, err
-	}
-	state.effects[effect.ID] = effect
+	reference := oldReference
 
-	reference := state.references[identity.EffectIdentity.ReferenceID]
-	reference.State = EffectReferenceActive
-	if oldReference.ID != "" {
-		if err := ValidateReferenceTransition(oldReference, reference); err != nil {
+	switch result.Disposition {
+	case EnsureBound:
+		if result.ExternalJobID == "" || result.ExternalRevision == 0 {
+			return TransitionRejected, errors.New("bound ensure result missing job identity")
+		}
+		effect.Binding = EffectBindingBound
+		effect.ExternalJobID = result.ExternalJobID
+		effect.ExternalRevision = result.ExternalRevision
+		effect.ResolutionRequired = true
+		if oldEffect.State == ExternalEffectCancelRequested {
+			effect.State = ExternalEffectCancelRequested
+		} else {
+			effect.State = ExternalEffectActive
+		}
+		if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionEnsureResult); err != nil {
 			return TransitionRejected, err
 		}
-	}
-	state.references[reference.ID] = reference
+		state.effects[effect.ID] = effect
 
-	observeControl := EffectControl{
-		ID:       ControlRequestID("observe-" + string(identity.EffectIdentity.EffectID)),
-		ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
-		ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
-		State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
-		NextCheckAt: time.Now(),
+		if effect.State == ExternalEffectCancelRequested {
+			if reference.ID != "" && reference.State != EffectReferenceReleased {
+				nextRef := reference
+				if nextRef.State != EffectReferenceReleaseRequested {
+					nextRef.State = EffectReferenceReleaseRequested
+					if err := ValidateReferenceTransition(reference, nextRef); err != nil {
+						return TransitionRejected, err
+					}
+					reference = nextRef
+					state.references[reference.ID] = reference
+				}
+				retireObserveControlsLocked(state, reference.ID)
+				releaseID := ControlRequestID("release-" + string(reference.ID))
+				if _, exists := state.controls[releaseID]; !exists {
+					state.controls[releaseID] = EffectControl{
+						ID: releaseID, ConfigID: identity.EffectIdentity.ConfigID,
+						ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
+						Kind: EffectControlRelease, State: EffectControlPending,
+						EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
+					}
+				}
+			}
+			delete(state.controls, identity.RequestID)
+		} else {
+			if reference.ID != "" {
+				nextRef := reference
+				nextRef.State = EffectReferenceActive
+				if err := ValidateReferenceTransition(reference, nextRef); err != nil {
+					return TransitionRejected, err
+				}
+				state.references[nextRef.ID] = nextRef
+			}
+			observeControl := EffectControl{
+				ID:       ControlRequestID("observe-" + string(identity.EffectIdentity.EffectID)),
+				ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
+				ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
+				State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
+				NextCheckAt: time.Now(),
+			}
+			delete(state.controls, identity.RequestID)
+			state.controls[observeControl.ID] = observeControl
+		}
+
+	case EnsureUnknown:
+		effect.State = ExternalEffectUnknown
+		effect.ResolutionRequired = true
+		if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionEnsureResult); err != nil {
+			return TransitionRejected, err
+		}
+		state.effects[effect.ID] = effect
+		if control, ok := state.controls[identity.RequestID]; ok {
+			control.State = EffectControlPending
+			control.InFlightAttemptID = ""
+			control.PollRequestID = ""
+			control.LeaseExpiresAt = time.Time{}
+			control.NextCheckAt = time.Now().Add(time.Second)
+			control.RetryCount++
+			state.controls[control.ID] = control
+		}
+
+	case EnsureFailed:
+		effect.State = ExternalEffectFailed
+		if result.Failure == EnsureFailureAuthoritativeRejected {
+			effect.ResolutionRequired = false
+		} else {
+			effect.ResolutionRequired = true
+		}
+		if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionEnsureResult); err != nil {
+			return TransitionRejected, err
+		}
+		state.effects[effect.ID] = effect
+		delete(state.controls, identity.RequestID)
+
+	default:
+		return TransitionRejected, errors.Errorf("unhandled ensure disposition %q", result.Disposition)
 	}
-	delete(state.controls, identity.RequestID)
-	state.controls[observeControl.ID] = observeControl
 
 	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
 		return TransitionRejected, err
@@ -195,12 +285,21 @@ func (r *PlanRegistry) ApplyEffectObservation(ctx context.Context, identity Tran
 	if identity.AttemptID != "" && identity.AttemptID != control.InFlightAttemptID {
 		return TransitionRejected, errors.New("attempt id mismatch")
 	}
+	if identity.EffectIdentity.EffectID != "" && identity.EffectIdentity.EffectID != control.EffectID {
+		return TransitionRejected, errors.New("effect id mismatch")
+	}
+	if identity.EffectIdentity.ReferenceID != "" && identity.EffectIdentity.ReferenceID != control.ReferenceID {
+		return TransitionRejected, errors.New("reference id mismatch")
+	}
 	effect := state.effects[identity.EffectIdentity.EffectID]
 	if effect.ID == "" {
 		return TransitionStale, nil
 	}
+	if observation.EffectID != "" && observation.EffectID != effect.ID {
+		return TransitionRejected, errors.New("observation effect id mismatch")
+	}
 	reference := state.references[identity.EffectIdentity.ReferenceID]
-	if reference.ID == "" {
+	if reference.ID == "" && observation.Disposition != DispositionAbsent {
 		return TransitionStale, nil
 	}
 	oldEffect, oldControl := effect, control
@@ -249,6 +348,59 @@ func (r *PlanRegistry) ApplyEffectObservation(ctx context.Context, identity Tran
 		state.controls[control.ID] = control
 		state.effects[effect.ID] = effect
 
+	case DispositionFailed:
+		control.State = EffectControlCompleted
+		control.InFlightAttemptID = ""
+		control.PollRequestID = ""
+		control.LeaseExpiresAt = time.Time{}
+		effect.State = ExternalEffectFailed
+		effect.ResolutionRequired = true
+		if observation.ExternalRevision > 0 {
+			effect.ExternalRevision = observation.ExternalRevision
+		}
+		if err := ValidateControlTransition(oldControl, control); err != nil {
+			return TransitionRejected, err
+		}
+		if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionExternalObservation); err != nil {
+			return TransitionRejected, err
+		}
+		state.controls[control.ID] = control
+		state.effects[effect.ID] = effect
+
+	case DispositionAbsent:
+		// Authoritative Gone: remove effect and its references; fail closed until
+		// desired recreates via Ensure if still needed.
+		if effect.Binding != EffectBindingBound {
+			return TransitionRejected, errors.New("absent observation requires bound effect")
+		}
+		if observation.ExternalJobID != "" && observation.ExternalJobID != effect.ExternalJobID {
+			return TransitionRejected, errors.New("absent observation job id mismatch")
+		}
+		control.State = EffectControlCompleted
+		control.InFlightAttemptID = ""
+		control.PollRequestID = ""
+		control.LeaseExpiresAt = time.Time{}
+		if err := ValidateControlTransition(oldControl, control); err != nil {
+			return TransitionRejected, err
+		}
+		state.controls[control.ID] = control
+		delete(state.effects, effect.ID)
+		for id, ref := range state.references {
+			if ref.EffectID != effect.ID {
+				continue
+			}
+			delete(state.references, id)
+			for cid, c := range state.controls {
+				if c.ReferenceID == id || c.EffectID == effect.ID {
+					c.State = EffectControlCompleted
+					c.InFlightAttemptID = ""
+					c.PollRequestID = ""
+					c.LeaseExpiresAt = time.Time{}
+					state.controls[cid] = c
+				}
+			}
+		}
+
 	default:
 		return TransitionRejected, errors.Errorf("unhandled observation disposition %q", observation.Disposition)
 	}
@@ -286,7 +438,7 @@ func (r *PlanRegistry) YieldControl(ctx context.Context, identity TransitionIden
 }
 
 // ListDueControls returns all controls due at or before the given time.
-func (r *PlanRegistry) ListDueControls(now time.Time) []DueControlRef {
+func (r *PlanRegistry) ListDueControls(_ context.Context, now time.Time) ([]DueControlRef, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var refs []DueControlRef
@@ -301,7 +453,7 @@ func (r *PlanRegistry) ListDueControls(now time.Time) []DueControlRef {
 			}
 		}
 	}
-	return refs
+	return refs, nil
 }
 
 type DueControlRef struct {
@@ -767,6 +919,88 @@ func (r *PlanRegistry) HasActiveEffectControl(configID model.ConfigID, effectKey
 	return false
 }
 
+// MarkEffectUnknownBound records transport-unknown after a Bound effect poll/release
+// and reschedules Observe or ObserveCancellation.
+func (r *PlanRegistry) MarkEffectUnknownBound(ctx context.Context, identity TransitionIdentity, nextCheckAt time.Time) (TransitionDisposition, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[identity.EffectIdentity.ConfigID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil {
+		return TransitionRejected, nil
+	}
+	effect := state.effects[identity.EffectIdentity.EffectID]
+	if effect.ID == "" || effect.Binding != EffectBindingBound {
+		return TransitionStale, nil
+	}
+	oldEffect := effect
+	effect.State = ExternalEffectUnknown
+	effect.ResolutionRequired = true
+	if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionExternalObservation); err != nil {
+		if oldEffect.ExternalRevision == effect.ExternalRevision && oldEffect.State != effect.State {
+			effect.ExternalRevision = oldEffect.ExternalRevision + 1
+			if err2 := ValidateEffectTransition(oldEffect, effect, EffectTransitionExternalObservation); err2 != nil {
+				return TransitionRejected, err2
+			}
+		} else {
+			return TransitionRejected, err
+		}
+	}
+	state.effects[effect.ID] = effect
+	control := state.controls[identity.RequestID]
+	if control.ID != "" {
+		oldControl := control
+		if nextCheckAt.IsZero() {
+			nextCheckAt = time.Now().Add(5 * time.Second)
+		}
+		control.State = EffectControlYielded
+		control.NextCheckAt = nextCheckAt
+		control.InFlightAttemptID = ""
+		control.PollRequestID = ""
+		control.LeaseExpiresAt = time.Time{}
+		if oldControl.State == EffectControlInFlight {
+			if err := ValidateControlTransition(oldControl, control); err != nil {
+				return TransitionRejected, err
+			}
+		}
+		state.controls[control.ID] = control
+	}
+	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+		return TransitionRejected, err
+	}
+	r.configs[identity.EffectIdentity.ConfigID.Name] = state
+	return TransitionApplied, nil
+}
+
+// AdministratorResolveFailedEffect clears fail-closed ResolutionRequired on a
+// Failed effect after an audited administrator decision.
+func (r *PlanRegistry) AdministratorResolveFailedEffect(ctx context.Context, configID model.ConfigID, effectID EffectID, auditReason string) (TransitionDisposition, error) {
+	if auditReason == "" {
+		return TransitionRejected, errors.New("administrator resolve requires audit reason")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[configID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil {
+		return TransitionRejected, errors.New("config not found")
+	}
+	effect := state.effects[effectID]
+	if effect.ID == "" {
+		return TransitionStale, nil
+	}
+	if effect.State != ExternalEffectFailed || !effect.ResolutionRequired {
+		return TransitionRejected, errors.New("administrator resolve applies only to failed resolution-required effects")
+	}
+	effect.ResolutionRequired = false
+	state.effects[effect.ID] = effect
+	if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
+		return TransitionRejected, err
+	}
+	r.configs[configID.Name] = state
+	return TransitionApplied, nil
+}
+
 // RegistryCommands is the compile-checked durable effect command surface.
 type RegistryCommands interface {
 	BeginEnsureEffect(context.Context, BeginEnsureRequest) (TransitionDisposition, error)
@@ -776,7 +1010,7 @@ type RegistryCommands interface {
 	ApplyEffectObservation(context.Context, TransitionIdentity, EffectObservation) (TransitionDisposition, error)
 	BeginReleaseEffect(context.Context, BeginReleaseRequest) (TransitionDisposition, error)
 	ApplyReleaseResult(context.Context, TransitionIdentity, ReleaseEffectResult) (TransitionDisposition, error)
-	ListDueControls(time.Time) []DueControlRef
+	ListDueControls(context.Context, time.Time) ([]DueControlRef, error)
 	ClaimDueControl(context.Context, model.ConfigID, ControlRequestID, time.Time, model.AttemptID, PollRequestID, time.Time) (*EffectControl, error)
 	ReclaimExpiredControl(context.Context, model.ConfigID, ControlRequestID, time.Time) (TransitionDisposition, error)
 	YieldControl(context.Context, TransitionIdentity, time.Time) (TransitionDisposition, error)

@@ -197,9 +197,8 @@ func ValidateActiveEffect(effect ActiveEffect) error {
 		switch effect.State {
 		case ExternalEffectEnsuring, ExternalEffectUnknown, ExternalEffectCancelRequested:
 		case ExternalEffectFailed:
-			if effect.ResolutionRequired {
-				return errors.New("unbound failed effect cannot require resolution")
-			}
+			// Authoritative pre-job rejection uses ResolutionRequired=false;
+			// unresolved permanent failure may remain fail-closed while unbound.
 		default:
 			return errors.Errorf("state %q cannot be unbound", effect.State)
 		}

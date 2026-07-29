@@ -39,16 +39,37 @@ func (r *PlanRegistry) MarkDeleting(ctx context.Context, configID model.ConfigID
 		if reference.State == EffectReferenceReleased {
 			continue
 		}
+		effect := state.effects[reference.EffectID]
+		// Terminal unbound failure: no external job to release.
+		if effect.ID != "" && effect.Binding == EffectBindingUnbound && effect.State == ExternalEffectFailed {
+			reference.State = EffectReferenceReleased
+			state.references[id] = reference
+			retireIncompatibleControlsLocked(state, reference.ID)
+			continue
+		}
+		// Ensuring/Unknown Unbound: CancelRequested and retain EnsureRetry for late bind.
+		if effect.ID != "" && effect.Binding == EffectBindingUnbound &&
+			(effect.State == ExternalEffectEnsuring || effect.State == ExternalEffectUnknown || effect.State == ExternalEffectCancelRequested) {
+			if effect.State != ExternalEffectCancelRequested {
+				oldEffect := effect
+				effect.State = ExternalEffectCancelRequested
+				effect.ResolutionRequired = true
+				if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionCoreIntent); err != nil {
+					return nil, err
+				}
+				state.effects[effect.ID] = effect
+			}
+			continue
+		}
 		if reference.State != EffectReferenceReleaseRequested {
 			reference.State = EffectReferenceReleaseRequested
 			state.references[id] = reference
 		}
-		retireIncompatibleControlsLocked(state, reference.ID)
+		retireObserveControlsLocked(state, reference.ID)
 		releaseID := ControlRequestID("release-" + string(reference.ID))
 		if _, exists := state.controls[releaseID]; exists {
 			continue
 		}
-		effect := state.effects[reference.EffectID]
 		state.controls[releaseID] = EffectControl{
 			ID: releaseID, ConfigID: configID,
 			ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
@@ -76,15 +97,31 @@ func deletionAttempts(state *configExecution) []model.Attempt {
 	return attempts
 }
 
-// retireIncompatibleControlsLocked completes Observe/Ensure controls that become
-// illegal once a reference enters ReleaseRequested.
+// retireIncompatibleControlsLocked completes Observe/EnsureReference controls that
+// become illegal once a reference enters ReleaseRequested. EnsureRetry is retained
+// for CancelRequested Unbound late-ensure repair.
 func retireIncompatibleControlsLocked(state *configExecution, referenceID ReferenceID) {
+	retireObserveControlsLocked(state, referenceID)
 	for id, control := range state.controls {
 		if control.ReferenceID != referenceID || control.State == EffectControlCompleted {
 			continue
 		}
-		switch control.Kind {
-		case EffectControlObserve, EffectControlEnsureRetry, EffectControlEnsureReference:
+		if control.Kind == EffectControlEnsureReference {
+			control.State = EffectControlCompleted
+			control.InFlightAttemptID = ""
+			control.PollRequestID = ""
+			control.LeaseExpiresAt = time.Time{}
+			state.controls[id] = control
+		}
+	}
+}
+
+func retireObserveControlsLocked(state *configExecution, referenceID ReferenceID) {
+	for id, control := range state.controls {
+		if control.ReferenceID != referenceID || control.State == EffectControlCompleted {
+			continue
+		}
+		if control.Kind == EffectControlObserve {
 			control.State = EffectControlCompleted
 			control.InFlightAttemptID = ""
 			control.PollRequestID = ""

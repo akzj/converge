@@ -33,14 +33,21 @@ func ValidateEffectTransition(oldEffect, next ActiveEffect, origin EffectTransit
 	}
 	switch origin {
 	case EffectTransitionEnsureResult:
-		if next.Binding != EffectBindingBound || oldEffect.Binding != EffectBindingUnbound {
-			return errors.New("ensure result must bind a previously unbound effect")
+		if oldEffect.Binding != EffectBindingUnbound {
+			return errors.New("ensure result requires a previously unbound effect")
 		}
 		if oldEffect.State != ExternalEffectEnsuring && oldEffect.State != ExternalEffectUnknown && oldEffect.State != ExternalEffectCancelRequested {
 			return errors.Errorf("ensure result from illegal state %q", oldEffect.State)
 		}
 		if oldEffect.IdempotencyKey != next.IdempotencyKey || oldEffect.ArtifactID != next.ArtifactID || string(oldEffect.EnsureSpec) != string(next.EnsureSpec) {
 			return errors.New("ensure result must match original immutable ensure request")
+		}
+		if next.Binding == EffectBindingBound {
+			if next.ExternalJobID == "" || next.ExternalRevision == 0 {
+				return errors.New("bound ensure result lacks external binding")
+			}
+		} else if next.State != ExternalEffectUnknown && next.State != ExternalEffectFailed && next.State != ExternalEffectEnsuring && next.State != ExternalEffectCancelRequested {
+			return errors.Errorf("unbound ensure result has illegal state %q", next.State)
 		}
 	case EffectTransitionExternalObservation:
 		if next.ExternalRevision == oldEffect.ExternalRevision && oldEffect.State != next.State {

@@ -489,6 +489,9 @@ No phase starts until the prior gate is committed and independently reviewed.
 
 ## 14. Required test matrix
 
+Normative coverage lives in `core/effect_acceptance_matrix_test.go` (`TestMatrix*`)
+plus barrier/outbox/journal unit tests.
+
 - Ensure response lost after job creation; retry returns same job.
 - Delete/supersede before late Ensure success; no leaked reference.
 - Unknown Unbound retries Ensure; Unknown Bound observes.

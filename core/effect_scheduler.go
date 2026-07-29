@@ -15,7 +15,8 @@ const effectControlLease = 30 * time.Second
 func (r *Reconciler) processDueControls(ctx context.Context) {
 	now := time.Now()
 	r.registry.ReclaimExpiredControls(ctx, now)
-	for _, ref := range r.registry.ListDueControls(now) {
+	refs, _ := r.registry.ListDueControls(ctx, now)
+	for _, ref := range refs {
 		if err := r.processOneDueControl(ctx, ref, now); err != nil {
 			zap.L().Warn("converge: process due control",
 				zap.String("config", ref.ConfigID.Name),
@@ -94,11 +95,23 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 		ExternalJobID: effect.ExternalJobID, ExternalRevision: effect.ExternalRevision,
 	}})
 	if err != nil {
-		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		_, _ = r.registry.MarkEffectUnknownBound(ctx, identity, time.Now().Add(5*time.Second))
 		return err
 	}
 	obs, ok := observations[pollID]
-	if !ok || obs.Observation == nil {
+	if !ok {
+		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		return nil
+	}
+	if obs.Error != nil {
+		if obs.Error.Retryable {
+			_, _ = r.registry.MarkEffectUnknownBound(ctx, identity, time.Now().Add(5*time.Second))
+		} else {
+			_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		}
+		return nil
+	}
+	if obs.Observation == nil {
 		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
 		return nil
 	}
@@ -111,7 +124,7 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 		obs.Observation.NextCheckAt = next
 		_, err = r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
 		return err
-	case DispositionCompleted, DispositionCancelled:
+	case DispositionCompleted, DispositionCancelled, DispositionFailed, DispositionAbsent:
 		disposition, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
 		if err != nil {
 			return err
@@ -133,15 +146,21 @@ func (r *Reconciler) runEnsureRetryControl(ctx context.Context, provider EffectP
 		EnsureSpec: append([]byte(nil), effect.EnsureSpec...),
 	})
 	if err != nil {
-		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		_, _ = r.registry.ApplyEnsureResult(ctx, identity, EnsureEffectResult{
+			EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
+			Disposition: EnsureUnknown, Failure: EnsureFailureUnknownOutcome,
+			Code: "ensure_rpc_error", Reason: err.Error(),
+		})
 		return err
 	}
-	if result.Disposition != EnsureBound {
+	switch result.Disposition {
+	case EnsureBound, EnsureUnknown, EnsureFailed:
+		_, err = r.registry.ApplyEnsureResult(ctx, identity, result)
+		return err
+	default:
 		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
 		return nil
 	}
-	_, err = r.registry.ApplyEnsureResult(ctx, identity, result)
-	return err
 }
 
 func (r *Reconciler) runReleaseControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect) error {
