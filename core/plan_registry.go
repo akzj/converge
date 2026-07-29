@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -267,6 +268,10 @@ func (r *PlanRegistry) Install(ctx context.Context, expected model.Generation, c
 		r.retire(state, change.Cancel, model.AttemptCancelling)
 		r.retire(state, change.Drain, model.AttemptDraining)
 	}
+	// Transfer effect references for ensure/observe/release operations.
+	if err := r.transferEffectReferences(ctx, state, state.active, installed, change); err != nil {
+		return nil, PlanChange{}, err
+	}
 	state.active = installed
 	if err := r.persistLocked(ctx, candidate.ConfigID, state.revision, state); err != nil {
 		return nil, PlanChange{}, err
@@ -289,6 +294,120 @@ func (r *PlanRegistry) retire(state *configExecution, keys []model.OperationKey,
 		state.retired[attempt.ID] = attempt
 		delete(state.attempts, attempt.ID)
 	}
+}
+
+// transferEffectReferences creates, carries, or releases EffectReferences based
+// on plan change classification. It handles same-artifact reuse (carry reference
+// to new generation), changed-artifact release, and new effect creation.
+func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *configExecution, oldPlan, installed *model.Plan, change PlanChange) error {
+	if installed == nil {
+		return nil
+	}
+	// Collect all effect ensure operations by EffectKey.
+	type ensureInfo struct {
+		key            model.OperationKey
+		effectKey      string
+		fingerprint    string
+		artifactID     string
+		providerType   string
+		providerDigest string
+	}
+	newEnsures := make(map[string]ensureInfo)
+	for key, node := range installed.Nodes {
+		op := node.Operation
+		if op.ExecutionKind != model.ExecutionEffectEnsure {
+			continue
+		}
+		newEnsures[op.EffectKey] = ensureInfo{
+			key: key, effectKey: op.EffectKey,
+			fingerprint: op.Fingerprint, artifactID: installed.DesiredDigest,
+			providerType: installed.ProviderType, providerDigest: installed.ProviderDigest,
+		}
+	}
+
+	// Same-artifact carry: find existing references for the same EffectKey and
+	// fingerprint; create a new EffectReference for the new plan generation.
+	for _, info := range newEnsures {
+		newRefID := ReferenceID(fmt.Sprintf("%s/%s/%d/%s", installed.ConfigID.Name, installed.ID, installed.Generation, info.effectKey))
+		// Find any matching existing reference for same EffectKey with compatible fingerprint.
+		var oldRef *EffectReference
+		for id := range state.references {
+			ref := state.references[id]
+			if ref.EffectKey == info.effectKey {
+				oldRef = &ref
+				break
+			}
+		}
+		if oldRef == nil {
+			if _, exists := state.references[newRefID]; exists {
+				continue
+			}
+			newEffectID := EffectID("eff-" + installed.ConfigID.Name + "-" + info.effectKey + "-" + string(installed.ID))
+			if _, exists := state.effects[newEffectID]; !exists {
+				state.effects[newEffectID] = ActiveEffect{
+					ID: newEffectID, Binding: EffectBindingUnbound,
+					ArtifactID:          info.artifactID,
+					IdempotencyKey:      "idem-" + string(newEffectID),
+					SemanticFingerprint: info.fingerprint,
+					ProviderType:        info.providerType, ProviderDigest: info.providerDigest,
+					ConflictKey: "effect/" + string(newEffectID),
+					State:       ExternalEffectEnsuring, ResolutionRequired: true,
+				}
+			}
+			newRef := EffectReference{
+				ID: newRefID, EffectID: newEffectID,
+				ConfigID: installed.ConfigID, PlanID: installed.ID,
+				Generation: installed.Generation, EffectKey: info.effectKey,
+				State: EffectReferenceEnsuring,
+			}
+			state.references[newRef.ID] = newRef
+			continue
+		}
+		oldEffect := state.effects[oldRef.EffectID]
+		if oldEffect.SemanticFingerprint != info.fingerprint {
+			continue // artifact changed, don't carry
+		}
+		if _, exists := state.references[newRefID]; exists {
+			continue
+		}
+		newRef := EffectReference{
+			ID: newRefID, EffectID: oldRef.EffectID,
+			ConfigID: installed.ConfigID, PlanID: installed.ID,
+			Generation: installed.Generation, EffectKey: info.effectKey,
+			State: EffectReferenceActive,
+		}
+		state.references[newRef.ID] = newRef
+	}
+
+	// For dropped ensure nodes with existing references: mark for release.
+	if oldPlan != nil {
+		for _, key := range change.Drop {
+			oldNode := oldPlan.Nodes[key]
+			if oldNode == nil || oldNode.Operation.ExecutionKind != model.ExecutionEffectEnsure {
+				continue
+			}
+			effectKey := oldNode.Operation.EffectKey
+			if _, exists := newEnsures[effectKey]; exists {
+				continue
+			}
+			expectedRefID := ReferenceID(fmt.Sprintf("%s/%s/%d/%s", installed.ConfigID.Name, oldPlan.ID, oldPlan.Generation, effectKey))
+			if ref, exists := state.references[expectedRefID]; exists {
+				ref.State = EffectReferenceReleaseRequested
+				state.references[ref.ID] = ref
+				releaseControlID := ControlRequestID("release-" + string(ref.ID))
+				if _, exists := state.controls[releaseControlID]; !exists {
+					state.controls[releaseControlID] = EffectControl{
+						ID: releaseControlID, ConfigID: installed.ConfigID,
+						ProviderType: installed.ProviderType, ProviderDigest: installed.ProviderDigest,
+						Kind: EffectControlRelease, State: EffectControlPending,
+						EffectID: ref.EffectID, ReferenceID: ref.ID,
+						NextCheckAt: time.Now(),
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // StartAttempt atomically transitions one pending/ready node to Running.

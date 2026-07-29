@@ -109,3 +109,70 @@ func TestEffectEnsureThenObserveThenCompletedE2E(t *testing.T) {
 
 	t.Logf("ensure called %d times, observe called %d times, config converged", provider.Counts().EnsureCount, provider.Counts().ObserveCount)
 }
+
+func TestEffectSupersessionSameArtifactReuses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	service := NewFakeDownloadService()
+	provider := NewFakeDownloadProvider("sha256:mock-fake", service)
+	r := NewReconciler(NewMemoryStateStore(), NewMemoryExecutionStore(), NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
+	r.RegisterProvider(ctx, provider)
+	go func() { _ = r.Run(ctx) }()
+
+	v1 := model.DesiredState{
+		ConfigID: model.ConfigID{Name: "supersede-config"}, ProviderType: "fake_download",
+		Version: 1, Digest: "artifacts/v1", Spec: []byte(`{"version":1}`),
+	}
+	if err := r.SubmitDesired(ctx, v1); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if provider.Counts().EnsureCount >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	_ = r.SubmitDesired(ctx, model.DesiredState{
+		ConfigID: model.ConfigID{Name: "supersede-config"}, ProviderType: "fake_download",
+		Version: 2, Digest: "artifacts/v2", Spec: []byte(`{"version":2}`),
+	})
+	time.Sleep(50 * time.Millisecond)
+	t.Logf("ensure=%d observe=%d release=%d", provider.Counts().EnsureCount, provider.Counts().ObserveCount, provider.Counts().ReleaseCount)
+}
+
+func TestEffectSupersessionDifferentArtifact(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	service := NewFakeDownloadService()
+	provider := NewFakeDownloadProvider("sha256:mock-fake", service)
+	r := NewReconciler(NewMemoryStateStore(), NewMemoryExecutionStore(), NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
+	r.RegisterProvider(ctx, provider)
+	go func() { _ = r.Run(ctx) }()
+
+	if err := r.SubmitDesired(ctx, model.DesiredState{
+		ConfigID: model.ConfigID{Name: "diff-config"}, ProviderType: "fake_download",
+		Version: 1, Digest: "v1", Spec: []byte(`{"v":1}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if provider.Counts().EnsureCount >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := r.SubmitDesired(ctx, model.DesiredState{
+		ConfigID: model.ConfigID{Name: "diff-config"}, ProviderType: "fake_download",
+		Version: 2, Digest: "v2", Spec: []byte(`{"v":2}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	t.Logf("ensure=%d observe=%d release=%d", provider.Counts().EnsureCount, provider.Counts().ObserveCount, provider.Counts().ReleaseCount)
+}
