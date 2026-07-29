@@ -13,12 +13,15 @@ import (
 var ErrGenerationChanged = errors.New("active plan generation changed")
 
 type configExecution struct {
-	revision uint64
-	deleting bool
-	active   *model.Plan
-	attempts map[model.AttemptID]*model.Attempt
-	retired  map[model.AttemptID]*model.Attempt
-	outbox   map[string]model.Event
+	revision   uint64
+	deleting   bool
+	active     *model.Plan
+	attempts   map[model.AttemptID]*model.Attempt
+	retired    map[model.AttemptID]*model.Attempt
+	outbox     map[string]model.Event
+	effects    map[EffectID]ActiveEffect
+	references map[ReferenceID]EffectReference
+	controls   map[ControlRequestID]EffectControl
 }
 
 // PlanRegistry is the concurrency boundary for plans and attempts.
@@ -82,6 +85,15 @@ func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) Execution
 	for _, event := range state.outbox {
 		snapshot.Outbox = append(snapshot.Outbox, event)
 	}
+	for _, effect := range state.effects {
+		snapshot.Effects = append(snapshot.Effects, effect.Clone())
+	}
+	for _, reference := range state.references {
+		snapshot.EffectReferences = append(snapshot.EffectReferences, reference)
+	}
+	for _, control := range state.controls {
+		snapshot.EffectControls = append(snapshot.EffectControls, control)
+	}
 	return snapshot
 }
 
@@ -113,7 +125,10 @@ func (r *PlanRegistry) Restore(ctx context.Context) error {
 		if snapshot == nil || snapshot.Plan == nil {
 			continue
 		}
-		state := &configExecution{revision: snapshot.Revision, deleting: snapshot.Deleting, active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
+		if err := ValidateEffectSnapshot(*snapshot); err != nil {
+			return errors.Wrapf(err, "invalid execution snapshot for %q", id.Name)
+		}
+		state := &configExecution{revision: snapshot.Revision, deleting: snapshot.Deleting, active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event), effects: make(map[EffectID]ActiveEffect), references: make(map[ReferenceID]EffectReference), controls: make(map[ControlRequestID]EffectControl)}
 		for i := range snapshot.Attempts {
 			attempt := snapshot.Attempts[i]
 			copy := attempt
@@ -128,7 +143,16 @@ func (r *PlanRegistry) Restore(ctx context.Context) error {
 			}
 		}
 		for _, event := range snapshot.Outbox {
-			state.outbox[event.EventID] = event
+			state.outbox[event.EventID] = cloneEvent(event)
+		}
+		for _, effect := range snapshot.Effects {
+			state.effects[effect.ID] = effect.Clone()
+		}
+		for _, reference := range snapshot.EffectReferences {
+			state.references[reference.ID] = reference
+		}
+		for _, control := range snapshot.EffectControls {
+			state.controls[control.ID] = control
 		}
 		r.configs[id.Name] = state
 	}
@@ -139,7 +163,7 @@ func cloneConfigExecution(state *configExecution) *configExecution {
 	if state == nil {
 		return nil
 	}
-	copy := &configExecution{revision: state.revision, deleting: state.deleting, active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
+	copy := &configExecution{revision: state.revision, deleting: state.deleting, active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event), effects: make(map[EffectID]ActiveEffect), references: make(map[ReferenceID]EffectReference), controls: make(map[ControlRequestID]EffectControl)}
 	for id, attempt := range state.attempts {
 		value := *attempt
 		copy.attempts[id] = &value
@@ -150,6 +174,15 @@ func cloneConfigExecution(state *configExecution) *configExecution {
 	}
 	for id, event := range state.outbox {
 		copy.outbox[id] = cloneEvent(event)
+	}
+	for id, effect := range state.effects {
+		copy.effects[id] = effect.Clone()
+	}
+	for id, reference := range state.references {
+		copy.references[id] = reference
+	}
+	for id, control := range state.controls {
+		copy.controls[id] = control
 	}
 	return copy
 }
@@ -170,7 +203,7 @@ func (r *PlanRegistry) Install(ctx context.Context, expected model.Generation, c
 	original := r.configs[candidate.ConfigID.Name]
 	state := cloneConfigExecution(original)
 	if state == nil {
-		state = &configExecution{attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event)}
+		state = &configExecution{attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event), effects: make(map[EffectID]ActiveEffect), references: make(map[ReferenceID]EffectReference), controls: make(map[ControlRequestID]EffectControl)}
 	}
 	current := model.Generation(0)
 	if state.active != nil {
