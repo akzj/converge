@@ -170,3 +170,33 @@ func TestClassifyWaitingNodeOnSupersession(t *testing.T) {
 		t.Fatalf("waiting supersession classification=%#v", change)
 	}
 }
+
+func TestBuildCandidateValidatesEffectOperationTopology(t *testing.T) {
+	tests := []struct {
+		name string
+		ops  []model.Operation
+	}{
+		{name: "direct effect key", ops: []model.Operation{{Key: "direct", ExecutionKind: model.ExecutionDirect, EffectKey: "bad"}}},
+		{name: "ensure missing key", ops: []model.Operation{{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure}}},
+		{name: "observe without ensure", ops: []model.Operation{{Key: "observe", ExecutionKind: model.ExecutionEffectObserve, EffectKey: "download"}}},
+		{name: "observe lacks dependency", ops: []model.Operation{{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"}, {Key: "observe", ExecutionKind: model.ExecutionEffectObserve, EffectKey: "download"}}},
+		{name: "duplicate ensure", ops: []model.Operation{{Key: "a", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"}, {Key: "b", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"}}},
+		{name: "unknown kind", ops: []model.Operation{{Key: "bad", ExecutionKind: "invalid"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{}, "test", "digest", test.ops); err == nil {
+				t.Fatal("expected topology validation error")
+			}
+		})
+	}
+
+	valid := []model.Operation{
+		{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"},
+		{Key: "observe", ExecutionKind: model.ExecutionEffectObserve, EffectKey: "download", DependsOn: []string{"ensure"}},
+		{Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download", DependsOn: []string{"observe"}},
+	}
+	if _, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{}, "test", "digest", valid); err != nil {
+		t.Fatalf("valid effect topology rejected: %v", err)
+	}
+}

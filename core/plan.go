@@ -61,6 +61,9 @@ func BuildCandidate(config model.ConfigID, desired model.DesiredState, providerT
 	if err := validatePlan(plan); err != nil {
 		return nil, err
 	}
+	if err := validateEffectOperationTopology(plan); err != nil {
+		return nil, err
+	}
 	return plan, nil
 }
 
@@ -82,6 +85,55 @@ func validatePlan(plan *model.Plan) error {
 		graph.Nodes[string(key)] = node
 	}
 	return graph.Validate()
+}
+func validateEffectOperationTopology(plan *model.Plan) error {
+	ensures := make(map[string]model.OperationKey)
+	for key, node := range plan.Nodes {
+		op := node.Operation
+		switch op.ExecutionKind {
+		case "", model.ExecutionDirect:
+			if op.EffectKey != "" {
+				return errors.Errorf("direct operation %q has effect key", key)
+			}
+		case model.ExecutionEffectEnsure:
+			if op.EffectKey == "" {
+				return errors.Errorf("effect ensure %q has empty effect key", key)
+			}
+			if prior, exists := ensures[op.EffectKey]; exists {
+				return errors.Errorf("effect key %q has multiple ensure nodes %q and %q", op.EffectKey, prior, key)
+			}
+			ensures[op.EffectKey] = key
+		case model.ExecutionEffectObserve, model.ExecutionEffectRelease:
+			if op.EffectKey == "" {
+				return errors.Errorf("effect operation %q has empty effect key", key)
+			}
+		default:
+			return errors.Errorf("operation %q has unknown execution kind %q", key, op.ExecutionKind)
+		}
+	}
+	for key, node := range plan.Nodes {
+		op := node.Operation
+		if op.ExecutionKind != model.ExecutionEffectObserve {
+			continue
+		}
+		ensure, exists := ensures[op.EffectKey]
+		if !exists {
+			return errors.Errorf("effect observe %q has no ensure for effect key %q", key, op.EffectKey)
+		}
+		if !containsString(op.DependsOn, string(ensure)) {
+			return errors.Errorf("effect observe %q does not depend on ensure %q", key, ensure)
+		}
+	}
+	return nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // ClassifyPlanChange decides lifecycle actions without mutating either plan.
