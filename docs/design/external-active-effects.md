@@ -127,7 +127,7 @@ tombstone, and outbox.
 
 | Binding | Allowed states | Job binding |
 |---|---|---|
-| Unbound | Ensuring, Unknown, CancelRequested | JobID empty, external revision 0 |
+| Unbound | Ensuring, Unknown, CancelRequested, Failed(authoritative pre-job rejection only) | JobID empty, external revision 0 |
 | Bound | Active, CancelRequested, Cancelling, Completed, Cancelled, Failed, Unknown | JobID non-empty, revision > 0 |
 
 A late exact Ensure success changes Unbound to Bound without clearing a
