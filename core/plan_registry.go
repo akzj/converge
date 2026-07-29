@@ -98,11 +98,21 @@ func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) Execution
 }
 
 func (r *PlanRegistry) persistLocked(ctx context.Context, id model.ConfigID, expectedRevision uint64, state *configExecution) error {
+	originalRevision := state.revision
 	state.revision = expectedRevision + 1
+	snapshot := r.executionSnapshotLocked(state)
+	if err := ValidateEffectSnapshot(snapshot); err != nil {
+		state.revision = originalRevision
+		return errors.Wrap(err, "validate execution snapshot before persist")
+	}
 	if r.store == nil {
 		return nil
 	}
-	return r.store.CommitExecutionCAS(ctx, id, expectedRevision, r.executionSnapshotLocked(state))
+	if err := r.store.CommitExecutionCAS(ctx, id, expectedRevision, snapshot); err != nil {
+		state.revision = originalRevision
+		return err
+	}
+	return nil
 }
 
 // Restore loads durable state. Previously-running attempts become Unknown and

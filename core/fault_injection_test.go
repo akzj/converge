@@ -52,9 +52,8 @@ func TestPersistenceFailureDoesNotStartAttemptInMemory(t *testing.T) {
 	if _, err := registry.StartAttempt(context.Background(), installed.ConfigID, installed.Generation, "apply", "attempt-1"); err == nil {
 		t.Fatal("expected injected persistence failure")
 	}
-	snapshot := registry.Snapshot(installed.ConfigID)
-	if node := snapshot.Plan.Nodes["apply"]; node.Status != model.NodePending || node.AttemptID != "" {
-		t.Fatalf("failed start leaked into memory: %#v", node)
+	if node := registry.Snapshot(installed.ConfigID).Plan.Nodes["apply"]; node.Status != model.NodePending || node.AttemptID != "" {
+		t.Fatalf("failed start leaked: %#v", node)
 	}
 }
 
@@ -66,12 +65,11 @@ func TestPersistenceFailureDoesNotEnqueueOutboxInMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.fail = true
-	event := model.Event{EventID: "event", ConfigID: installed.ConfigID.Name}
-	if err := registry.EnqueueOutbox(context.Background(), event); err == nil {
+	if err := registry.EnqueueOutbox(context.Background(), model.Event{EventID: "event", ConfigID: installed.ConfigID.Name}); err == nil {
 		t.Fatal("expected injected persistence failure")
 	}
 	if events := registry.PendingOutbox(); len(events) != 0 {
-		t.Fatalf("failed enqueue leaked into memory: %#v", events)
+		t.Fatalf("failed enqueue leaked: %#v", events)
 	}
 }
 
@@ -90,24 +88,53 @@ func TestEventTransitionFailureRetainsOutboxForRetry(t *testing.T) {
 	if err := registry.EnqueueOutbox(ctx, event); err != nil {
 		t.Fatal(err)
 	}
-
 	r := NewReconciler(NewMemoryStateStore(), store, NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
 	r.registry = registry
 	store.fail = true
 	r.handleEvent(ctx, event)
 	if pending := registry.PendingOutbox(); len(pending) != 1 {
-		t.Fatalf("failed transition acknowledged event: %#v", pending)
+		t.Fatalf("failed transition acknowledged: %#v", pending)
 	}
 	if status := registry.Snapshot(installed.ConfigID).Plan.Nodes["apply"].Status; status != model.NodeRunning {
-		t.Fatalf("failed transition changed status: %s", status)
+		t.Fatalf("failed transition status: %s", status)
 	}
-
 	store.fail = false
 	r.handleEvent(ctx, event)
 	if pending := registry.PendingOutbox(); len(pending) != 0 {
-		t.Fatalf("successful retry did not acknowledge event: %#v", pending)
+		t.Fatalf("successful retry did not acknowledge: %#v", pending)
 	}
 	if status := registry.Snapshot(installed.ConfigID).Plan.Nodes["apply"].Status; status != model.NodeCompleted {
-		t.Fatalf("retry status=%s, want completed", status)
+		t.Fatalf("retry status=%s", status)
+	}
+}
+
+func TestInvalidEffectStateCannotBePersistedByUnrelatedTransition(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	registry := NewPlanRegistry(store)
+	installed, _, err := registry.Install(ctx, 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry.mu.Lock()
+	state := registry.configs[installed.ConfigID.Name]
+	state.effects["bad"] = ActiveEffect{ID: "bad", Binding: EffectBindingBound, State: ExternalEffectActive}
+	beforeRevision := state.revision
+	registry.mu.Unlock()
+	if err := registry.EnqueueOutbox(ctx, model.Event{EventID: "event", ConfigID: installed.ConfigID.Name}); err == nil {
+		t.Fatal("expected validation failure")
+	}
+	registry.mu.RLock()
+	afterRevision := registry.configs[installed.ConfigID.Name].revision
+	registry.mu.RUnlock()
+	if afterRevision != beforeRevision {
+		t.Fatalf("revision changed: %d -> %d", beforeRevision, afterRevision)
+	}
+	stored, err := store.LoadExecution(ctx, installed.ConfigID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Revision != beforeRevision || len(stored.Effects) != 0 || len(stored.Outbox) != 0 {
+		t.Fatalf("invalid state reached store: %#v", stored)
 	}
 }
