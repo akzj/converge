@@ -114,8 +114,11 @@ func validateEffectOperationTopology(plan *model.Plan) error {
 			if op.EffectKey == "" {
 				return errors.Errorf("effect operation %q has empty effect key", key)
 			}
-			if op.TargetReference == "" {
-				return errors.Errorf("effect release %q has empty target reference", key)
+			if op.ReleaseTarget == "" {
+				op.ReleaseTarget = model.ReleaseCurrentPlan
+			}
+			if op.ReleaseTarget == model.ReleaseRetiredReference && op.TargetReference == "" {
+				return errors.Errorf("retired reference release %q has empty target reference", key)
 			}
 		default:
 			return errors.Errorf("operation %q has unknown execution kind %q", key, op.ExecutionKind)
@@ -133,12 +136,19 @@ func validateEffectOperationTopology(plan *model.Plan) error {
 				return errors.Errorf("effect observe %q does not depend on ensure %q", key, ensure)
 			}
 		case model.ExecutionEffectRelease:
-			ensure, samePlan := ensures[op.EffectKey]
-			if samePlan && !dependsTransitivelyOn(plan, key, ensure, make(map[model.OperationKey]bool)) {
-				return errors.Errorf("effect release %q is not downstream of ensure %q", key, ensure)
+			targetKind := op.ReleaseTarget
+			if targetKind == "" {
+				targetKind = model.ReleaseCurrentPlan
 			}
-			// Without a same-plan ensure, TargetReference explicitly names a
-			// retired generation reference; runtime lookup validates it exactly.
+			if targetKind == model.ReleaseCurrentPlan {
+				ensure, exists := ensures[op.EffectKey]
+				if !exists {
+					return errors.Errorf("current-plan release %q has no ensure for effect key %q", key, op.EffectKey)
+				}
+				if !dependsTransitivelyOn(plan, key, ensure, make(map[model.OperationKey]bool)) {
+					return errors.Errorf("current-plan release %q is not downstream of ensure %q", key, ensure)
+				}
+			}
 		}
 	}
 	return nil

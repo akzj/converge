@@ -72,6 +72,7 @@ type fingerprintOperation struct {
 	ExecutionKind   OperationExecutionKind `json:"execution_kind"`
 	EffectKey       string                 `json:"effect_key"`
 	TargetReference string                 `json:"target_reference"`
+	ReleaseTarget   ReleaseTargetKind      `json:"release_target"`
 	ProviderDigest  string                 `json:"provider_digest"`
 	Action          string                 `json:"action"`
 	Input           json.RawMessage        `json:"input"`

@@ -197,14 +197,19 @@ func TestRetiredReferenceReleaseCrossesExactBarrier(t *testing.T) {
 	effect := validEffect()
 	plan := &model.Plan{ID: "new-plan", ConfigID: model.ConfigID{Name: "config"}, Generation: 2}
 	old := EffectReference{ID: "old-ref", EffectID: effect.ID, ConfigID: plan.ConfigID, PlanID: "old-plan", Generation: 1, EffectKey: "download", State: EffectReferenceReleaseRequested}
-	exact := model.Operation{ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download", TargetReference: "old-ref", ConflictKey: effect.ConflictKey}
+	exact := model.Operation{ExecutionKind: model.ExecutionEffectRelease, ReleaseTarget: model.ReleaseRetiredReference, EffectKey: "download", TargetReference: "old-ref", ConflictKey: effect.ConflictKey}
 	if OperationBlockedByEffect(exact, plan, effect, old) {
 		t.Fatal("exact retired release was blocked")
 	}
 	wrong := exact
-	wrong.TargetReference = "other"
+	wrong.ReleaseTarget = model.ReleaseCurrentPlan
 	if !OperationBlockedByEffect(wrong, plan, effect, old) {
-		t.Fatal("wrong reference release crossed barrier")
+		t.Fatal("wrong release kind crossed retired barrier")
+	}
+	wrongTarget := exact
+	wrongTarget.TargetReference = "other"
+	if !OperationBlockedByEffect(wrongTarget, plan, effect, old) {
+		t.Fatal("wrong target reference release crossed barrier")
 	}
 	observe := exact
 	observe.ExecutionKind = model.ExecutionEffectObserve

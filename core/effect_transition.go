@@ -6,6 +6,7 @@ type EffectTransitionOrigin string
 
 const (
 	EffectTransitionCoreIntent          EffectTransitionOrigin = "core_intent"
+	EffectTransitionEnsureResult        EffectTransitionOrigin = "ensure_result"
 	EffectTransitionExternalObservation EffectTransitionOrigin = "external_observation"
 )
 
@@ -25,7 +26,22 @@ func ValidateEffectTransition(oldEffect, next ActiveEffect, origin EffectTransit
 	if next.ExternalRevision < oldEffect.ExternalRevision {
 		return errors.New("external revision regressed")
 	}
+	if oldEffect.Binding != next.Binding {
+		if origin != EffectTransitionEnsureResult || oldEffect.Binding != EffectBindingUnbound || next.Binding != EffectBindingBound {
+			return errors.New("only ensure result may bind an unbound effect")
+		}
+	}
 	switch origin {
+	case EffectTransitionEnsureResult:
+		if next.Binding != EffectBindingBound || oldEffect.Binding != EffectBindingUnbound {
+			return errors.New("ensure result must bind a previously unbound effect")
+		}
+		if oldEffect.State != ExternalEffectEnsuring && oldEffect.State != ExternalEffectUnknown && oldEffect.State != ExternalEffectCancelRequested {
+			return errors.Errorf("ensure result from illegal state %q", oldEffect.State)
+		}
+		if oldEffect.IdempotencyKey != next.IdempotencyKey || oldEffect.ArtifactID != next.ArtifactID || string(oldEffect.EnsureSpec) != string(next.EnsureSpec) {
+			return errors.New("ensure result must match original immutable ensure request")
+		}
 	case EffectTransitionExternalObservation:
 		if next.ExternalRevision == oldEffect.ExternalRevision && oldEffect.State != next.State {
 			return errors.New("effect state changed at equal external revision")

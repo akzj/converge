@@ -49,6 +49,11 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 		}
 		logicalSlots[slot] = reference.ID
 		references[reference.ID] = reference
+		effect := effects[reference.EffectID]
+		if err := validateReferenceEffectCompatibility(effect, reference); err != nil {
+			return errors.Wrapf(err, "reference %q", reference.ID)
+		}
+
 	}
 	controls := make(map[ControlRequestID]struct{}, len(snapshot.EffectControls))
 	attempts, polls := make(map[model.AttemptID]struct{}), make(map[PollRequestID]struct{})
@@ -90,6 +95,24 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 			attempts[control.InFlightAttemptID], polls[control.PollRequestID] = struct{}{}, struct{}{}
 		} else if control.InFlightAttemptID != "" || control.PollRequestID != "" || !control.LeaseExpiresAt.IsZero() {
 			return errors.Errorf("non-in-flight control %q retains claim identity", control.ID)
+		}
+	}
+	return nil
+}
+
+func validateReferenceEffectCompatibility(effect ActiveEffect, reference EffectReference) error {
+	switch reference.State {
+	case EffectReferenceEnsuring:
+		if effect.Binding != EffectBindingUnbound {
+			return errors.New("ensuring reference requires unbound effect")
+		}
+	case EffectReferenceActive:
+		if effect.Binding != EffectBindingBound {
+			return errors.New("active reference requires bound effect")
+		}
+	case EffectReferenceReleaseRequested:
+		if effect.Binding != EffectBindingBound {
+			return errors.New("release-requested reference requires bound effect")
 		}
 	}
 	return nil
@@ -208,6 +231,7 @@ func OperationBlockedByEffect(operation model.Operation, plan *model.Plan, effec
 	exactCurrentReference := plan != nil && reference.State == EffectReferenceActive &&
 		reference.ConfigID == plan.ConfigID && reference.PlanID == plan.ID && reference.Generation == plan.Generation
 	exactRetiredRelease := plan != nil && operation.ExecutionKind == model.ExecutionEffectRelease &&
+		operation.ReleaseTarget == model.ReleaseRetiredReference &&
 		reference.State == EffectReferenceReleaseRequested && reference.ConfigID == plan.ConfigID &&
 		operation.TargetReference == string(reference.ID)
 	isControl := (exactCurrentReference || exactRetiredRelease) && operation.EffectKey == reference.EffectKey && reference.EffectID == effect.ID &&

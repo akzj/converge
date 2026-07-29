@@ -121,3 +121,47 @@ func TestValidateControlTransitionMatrix(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateEffectEnsureResultBindsAndMatchesIdentity(t *testing.T) {
+	oldEffect := validEffect()
+	oldEffect.Binding, oldEffect.State, oldEffect.ExternalJobID, oldEffect.ExternalRevision = EffectBindingUnbound, ExternalEffectEnsuring, "", 0
+	bound := oldEffect
+	bound.Binding, bound.State, bound.ExternalJobID, bound.ExternalRevision = EffectBindingBound, ExternalEffectActive, "job", 1
+	if err := ValidateEffectTransition(oldEffect, bound, EffectTransitionEnsureResult); err != nil {
+		t.Fatalf("valid ensure result rejected: %v", err)
+	}
+	mismatched := bound
+	mismatched.EnsureSpec = []byte(`{"different":true}`)
+	if err := ValidateEffectTransition(oldEffect, mismatched, EffectTransitionEnsureResult); err == nil {
+		t.Fatal("mismatched ensure spec accepted")
+	}
+	boundFromActive := bound
+	boundFromActive.Binding, boundFromActive.State, boundFromActive.ExternalRevision = EffectBindingBound, ExternalEffectActive, 2
+	if err := ValidateEffectTransition(bound, boundFromActive, EffectTransitionEnsureResult); err == nil {
+		t.Fatal("ensure result allowed on already-bound effect")
+	}
+}
+
+func TestObservationsCannotBind(t *testing.T) {
+	oldEffect := validEffect()
+	oldEffect.Binding, oldEffect.State, oldEffect.ExternalJobID, oldEffect.ExternalRevision = EffectBindingUnbound, ExternalEffectEnsuring, "", 0
+	bound := oldEffect
+	bound.Binding, bound.State, bound.ExternalJobID, bound.ExternalRevision = EffectBindingBound, ExternalEffectActive, "job", 1
+	if err := ValidateEffectTransition(oldEffect, bound, EffectTransitionExternalObservation); err == nil {
+		t.Fatal("external observation should not be able to bind effect")
+	}
+}
+
+func TestExternalObservationCannotBeIntentTransition(t *testing.T) {
+	oldEffect := validEffect()
+	next := oldEffect
+	next.State = ExternalEffectCancelRequested
+	next.ExternalRevision = oldEffect.ExternalRevision
+	if err := ValidateEffectTransition(oldEffect, next, EffectTransitionExternalObservation); err == nil {
+		t.Fatal("external observation should not accept same-revision state change")
+	}
+	next.ExternalRevision++
+	if err := ValidateEffectTransition(oldEffect, next, EffectTransitionExternalObservation); err != nil {
+		t.Fatalf("observation with higher revision should be valid: %v", err)
+	}
+}

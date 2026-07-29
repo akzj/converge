@@ -94,6 +94,13 @@ const (
 	ExecutionEffectRelease OperationExecutionKind = "effect_release"
 )
 
+type ReleaseTargetKind string
+
+const (
+	ReleaseCurrentPlan      ReleaseTargetKind = "current_plan"
+	ReleaseRetiredReference ReleaseTargetKind = "retired_reference"
+)
+
 // ---------------------------------------------------------------------------
 // CancelMode
 // ---------------------------------------------------------------------------
@@ -117,6 +124,7 @@ type Operation struct {
 	Key             OperationKey           `json:"key,omitempty"`
 	ExecutionKind   OperationExecutionKind `json:"execution_kind"`
 	EffectKey       string                 `json:"effect_key,omitempty"`
+	ReleaseTarget   ReleaseTargetKind      `json:"release_target,omitempty"`
 	TargetReference string                 `json:"target_reference,omitempty"`
 	Fingerprint     string                 `json:"fingerprint,omitempty"`
 	ConflictKey     string                 `json:"conflict_key,omitempty"`
