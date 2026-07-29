@@ -103,9 +103,19 @@ func validateEffectOperationTopology(plan *model.Plan) error {
 				return errors.Errorf("effect key %q has multiple ensure nodes %q and %q", op.EffectKey, prior, key)
 			}
 			ensures[op.EffectKey] = key
-		case model.ExecutionEffectObserve, model.ExecutionEffectRelease:
+		case model.ExecutionEffectObserve:
 			if op.EffectKey == "" {
 				return errors.Errorf("effect operation %q has empty effect key", key)
+			}
+			if op.TargetReference != "" {
+				return errors.Errorf("effect observe %q has target reference", key)
+			}
+		case model.ExecutionEffectRelease:
+			if op.EffectKey == "" {
+				return errors.Errorf("effect operation %q has empty effect key", key)
+			}
+			if op.TargetReference == "" {
+				return errors.Errorf("effect release %q has empty target reference", key)
 			}
 		default:
 			return errors.Errorf("operation %q has unknown execution kind %q", key, op.ExecutionKind)
@@ -123,13 +133,12 @@ func validateEffectOperationTopology(plan *model.Plan) error {
 				return errors.Errorf("effect observe %q does not depend on ensure %q", key, ensure)
 			}
 		case model.ExecutionEffectRelease:
-			ensure, exists := ensures[op.EffectKey]
-			if !exists {
-				return errors.Errorf("effect release %q has no ensure for effect key %q", key, op.EffectKey)
-			}
-			if !dependsTransitivelyOn(plan, key, ensure, make(map[model.OperationKey]bool)) {
+			ensure, samePlan := ensures[op.EffectKey]
+			if samePlan && !dependsTransitivelyOn(plan, key, ensure, make(map[model.OperationKey]bool)) {
 				return errors.Errorf("effect release %q is not downstream of ensure %q", key, ensure)
 			}
+			// Without a same-plan ensure, TargetReference explicitly names a
+			// retired generation reference; runtime lookup validates it exactly.
 		}
 	}
 	return nil

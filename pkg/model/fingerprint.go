@@ -43,20 +43,21 @@ func OperationFingerprint(op Operation, providerDigest string) (string, error) {
 	})
 
 	canonical := fingerprintOperation{
-		Provider:       op.Provider,
-		ExecutionKind:  op.ExecutionKind,
-		EffectKey:      op.EffectKey,
-		ProviderDigest: providerDigest,
-		Action:         op.Action,
-		Input:          input,
-		Phase:          op.Phase,
-		Destructive:    op.Destructive,
-		DependsOn:      deps,
-		Conditions:     conditions,
-		Timeout:        op.Timeout,
-		CancelMode:     op.CancelMode,
-		HandlerRef:     op.HandlerRef,
-		ConflictKey:    op.ConflictKey,
+		Provider:        op.Provider,
+		ExecutionKind:   op.ExecutionKind,
+		EffectKey:       op.EffectKey,
+		TargetReference: op.TargetReference,
+		ProviderDigest:  providerDigest,
+		Action:          op.Action,
+		Input:           input,
+		Phase:           op.Phase,
+		Destructive:     op.Destructive,
+		DependsOn:       deps,
+		Conditions:      conditions,
+		Timeout:         op.Timeout,
+		CancelMode:      op.CancelMode,
+		HandlerRef:      op.HandlerRef,
+		ConflictKey:     op.ConflictKey,
 	}
 	encoded, err := json.Marshal(canonical)
 	if err != nil {
@@ -67,20 +68,21 @@ func OperationFingerprint(op Operation, providerDigest string) (string, error) {
 }
 
 type fingerprintOperation struct {
-	Provider       string                 `json:"provider"`
-	ExecutionKind  OperationExecutionKind `json:"execution_kind"`
-	EffectKey      string                 `json:"effect_key"`
-	ProviderDigest string                 `json:"provider_digest"`
-	Action         string                 `json:"action"`
-	Input          json.RawMessage        `json:"input"`
-	Phase          Phase                  `json:"phase"`
-	Destructive    bool                   `json:"destructive"`
-	DependsOn      []string               `json:"depends_on"`
-	Conditions     []fingerprintCondition `json:"conditions"`
-	Timeout        Duration               `json:"timeout"`
-	CancelMode     CancelMode             `json:"cancel_mode"`
-	HandlerRef     string                 `json:"handler_ref"`
-	ConflictKey    string                 `json:"conflict_key"`
+	Provider        string                 `json:"provider"`
+	ExecutionKind   OperationExecutionKind `json:"execution_kind"`
+	EffectKey       string                 `json:"effect_key"`
+	TargetReference string                 `json:"target_reference"`
+	ProviderDigest  string                 `json:"provider_digest"`
+	Action          string                 `json:"action"`
+	Input           json.RawMessage        `json:"input"`
+	Phase           Phase                  `json:"phase"`
+	Destructive     bool                   `json:"destructive"`
+	DependsOn       []string               `json:"depends_on"`
+	Conditions      []fingerprintCondition `json:"conditions"`
+	Timeout         Duration               `json:"timeout"`
+	CancelMode      CancelMode             `json:"cancel_mode"`
+	HandlerRef      string                 `json:"handler_ref"`
+	ConflictKey     string                 `json:"conflict_key"`
 }
 
 type fingerprintCondition struct {

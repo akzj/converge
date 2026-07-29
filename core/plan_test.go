@@ -199,7 +199,7 @@ func TestBuildCandidateValidatesEffectOperationTopology(t *testing.T) {
 	valid := []model.Operation{
 		{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"},
 		{Key: "observe", ExecutionKind: model.ExecutionEffectObserve, EffectKey: "download", DependsOn: []string{"ensure"}},
-		{Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download", DependsOn: []string{"observe"}},
+		{Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download", TargetReference: "ref", DependsOn: []string{"observe"}},
 	}
 	if _, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{}, "test", "digest", valid); err != nil {
 		t.Fatalf("valid effect topology rejected: %v", err)
@@ -211,8 +211,8 @@ func TestBuildCandidateRejectsInvalidEffectReleaseTopology(t *testing.T) {
 		name string
 		ops  []model.Operation
 	}{
-		{name: "release without ensure", ops: []model.Operation{{Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download"}}},
-		{name: "release unrelated to ensure", ops: []model.Operation{{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"}, {Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download"}}},
+		{name: "release missing target", ops: []model.Operation{{Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download"}}},
+		{name: "release unrelated to ensure", ops: []model.Operation{{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"}, {Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download", TargetReference: "ref"}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -220,5 +220,12 @@ func TestBuildCandidateRejectsInvalidEffectReleaseTopology(t *testing.T) {
 				t.Fatal("expected release topology error")
 			}
 		})
+	}
+}
+
+func TestBuildCandidateAllowsRetiredReferenceReleasePlan(t *testing.T) {
+	ops := []model.Operation{{Key: "release-old", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download", TargetReference: "old-reference"}}
+	if _, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{}, "test", "digest", ops); err != nil {
+		t.Fatalf("retired reference release rejected: %v", err)
 	}
 }

@@ -205,9 +205,12 @@ func OperationBlockedByEffect(operation model.Operation, plan *model.Plan, effec
 	if !effectBlocksConflict(effect) || operation.ConflictKey != effect.ConflictKey {
 		return false
 	}
-	exactActiveReference := plan != nil && reference.State == EffectReferenceActive &&
+	exactCurrentReference := plan != nil && reference.State == EffectReferenceActive &&
 		reference.ConfigID == plan.ConfigID && reference.PlanID == plan.ID && reference.Generation == plan.Generation
-	isControl := exactActiveReference && operation.EffectKey == reference.EffectKey && reference.EffectID == effect.ID &&
+	exactRetiredRelease := plan != nil && operation.ExecutionKind == model.ExecutionEffectRelease &&
+		reference.State == EffectReferenceReleaseRequested && reference.ConfigID == plan.ConfigID &&
+		operation.TargetReference == string(reference.ID)
+	isControl := (exactCurrentReference || exactRetiredRelease) && operation.EffectKey == reference.EffectKey && reference.EffectID == effect.ID &&
 		(operation.ExecutionKind == model.ExecutionEffectEnsure || operation.ExecutionKind == model.ExecutionEffectObserve || operation.ExecutionKind == model.ExecutionEffectRelease)
 	return !isControl
 }
