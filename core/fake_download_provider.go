@@ -2,7 +2,7 @@ package core
 
 import (
 	"context"
-	"fmt"
+	"sync"
 
 	"github.com/akzj/converge/pkg/model"
 )
@@ -10,11 +10,13 @@ import (
 // FakeDownloadProvider implements EffectProvider by delegating to a
 // FakeDownloadService. It is a testing adapter, not a production provider.
 type FakeDownloadProvider struct {
+	mu           sync.Mutex
 	digest       string
 	service      *FakeDownloadService
 	ensureCount  int
 	observeCount int
 	releaseCount int
+	LastJobID    string
 }
 
 func NewFakeDownloadProvider(digest string, service *FakeDownloadService) *FakeDownloadProvider {
@@ -32,16 +34,28 @@ func (p *FakeDownloadProvider) EvaluateCondition(_ context.Context, _ model.Cond
 func (p *FakeDownloadProvider) Verify(_ context.Context, _ model.ResourceID, _ model.DesiredState) (model.ObservedState, error) {
 	return model.ObservedState{Present: true}, nil
 }
-func (p *FakeDownloadProvider) Replan(_ context.Context, _ ReplanRequest) (ReplanResult, error) {
-	return ReplanResult{}, fmt.Errorf("FakeDownloadProvider: Replan not implemented for direct use")
+func (p *FakeDownloadProvider) Replan(_ context.Context, request ReplanRequest) (ReplanResult, error) {
+	return ReplanResult{Operations: []model.Operation{
+		{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"},
+		{Key: "observe", ExecutionKind: model.ExecutionEffectObserve, EffectKey: "download", DependsOn: []string{"ensure"}},
+		{Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download", ReleaseTarget: model.ReleaseCurrentPlan, DependsOn: []string{"observe"}},
+		{Key: "activate", ExecutionKind: model.ExecutionDirect, DependsOn: []string{"verify"}},
+		{Key: "verify", ExecutionKind: model.ExecutionDirect, DependsOn: []string{"release"}},
+		{Key: "cleanup", ExecutionKind: model.ExecutionDirect, DependsOn: []string{"verify"}},
+	}}, nil
 }
 func (p *FakeDownloadProvider) Execute(_ context.Context, _ model.Operation) (model.StepResult, error) {
 	return model.StepResult{State: model.StepCompleted}, nil
 }
 
 func (p *FakeDownloadProvider) EnsureEffect(_ context.Context, req EnsureEffectRequest) (EnsureEffectResult, error) {
+	p.mu.Lock()
 	p.ensureCount++
+	p.mu.Unlock()
 	jobID, revision, _ := p.service.CreateOrGetJobAndEnsureReference(req.IdempotencyKey, req.ArtifactID, string(req.Identity.ReferenceID))
+	p.mu.Lock()
+	p.LastJobID = jobID
+	p.mu.Unlock()
 	return EnsureEffectResult{
 		EffectID:         req.Identity.EffectID,
 		ReferenceID:      req.Identity.ReferenceID,
@@ -55,8 +69,14 @@ func (p *FakeDownloadProvider) EnsureEffect(_ context.Context, req EnsureEffectR
 func (p *FakeDownloadProvider) ObserveEffects(_ context.Context, requests []ObserveEffectRequest) (map[PollRequestID]EffectObservationResult, error) {
 	result := make(map[PollRequestID]EffectObservationResult, len(requests))
 	for _, req := range requests {
+		p.mu.Lock()
 		p.observeCount++
-		state, revision, refs, err := p.service.GetJob(req.ExternalJobID)
+		p.mu.Unlock()
+		jobID := req.ExternalJobID
+		if jobID == "" {
+			jobID = p.LastJobID
+		}
+		state, revision, refs, err := p.service.GetJob(jobID)
 		if err != nil {
 			result[req.PollRequestID] = EffectObservationResult{
 				Error: &ProviderEffectError{Code: "job_not_found", Reason: err.Error(), Retryable: true},
@@ -96,7 +116,9 @@ func (p *FakeDownloadProvider) EnsureReference(_ context.Context, req EnsureRefe
 }
 
 func (p *FakeDownloadProvider) ReleaseEffect(_ context.Context, req ReleaseEffectRequest) (ReleaseEffectResult, error) {
+	p.mu.Lock()
 	p.releaseCount++
+	p.mu.Unlock()
 	disp, failure := p.service.RemoveReference(string(req.Identity.ReferenceID), req.ExternalJobID)
 	failureKind := ReleaseFailureNone
 	if failure != nil {
@@ -124,4 +146,18 @@ func jobDisposition(state FakeDownloadJobState) (EffectDisposition, bool, string
 	default:
 		return DispositionStillActive, false, "unknown", "unknown state"
 	}
+}
+
+// ProviderCounts exposes thread-safe statistics for test assertions.
+type ProviderCounts struct {
+	EnsureCount  int
+	ObserveCount int
+	ReleaseCount int
+}
+
+// Counts returns a snapshot of the provider execution statistics.
+func (p *FakeDownloadProvider) Counts() ProviderCounts {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return ProviderCounts{EnsureCount: p.ensureCount, ObserveCount: p.observeCount, ReleaseCount: p.releaseCount}
 }
