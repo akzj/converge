@@ -83,6 +83,17 @@ type Condition struct {
 	Input    []byte     `json:"input,omitempty"` // condition-specific parameters
 }
 
+// OperationExecutionKind selects Core's generic execution path without
+// interpreting provider-specific Action values.
+type OperationExecutionKind string
+
+const (
+	ExecutionDirect        OperationExecutionKind = "direct"
+	ExecutionEffectEnsure  OperationExecutionKind = "effect_ensure"
+	ExecutionEffectObserve OperationExecutionKind = "effect_observe"
+	ExecutionEffectRelease OperationExecutionKind = "effect_release"
+)
+
 // ---------------------------------------------------------------------------
 // CancelMode
 // ---------------------------------------------------------------------------
@@ -102,21 +113,23 @@ const (
 
 // Operation is the smallest atomic execution unit in Converge.
 type Operation struct {
-	ID          string       `json:"id"` // deprecated: use Key for stable logical identity
-	Key         OperationKey `json:"key,omitempty"`
-	Fingerprint string       `json:"fingerprint,omitempty"`
-	ConflictKey string       `json:"conflict_key,omitempty"`
-	ConfigID    string       `json:"config_id"` // owning configuration name
-	Provider    string       `json:"provider"`  // target provider name
-	Action      string       `json:"action"`    // "provision"|"deprovision"|"reconcile"
-	Input       []byte       `json:"input,omitempty"`
-	Phase       Phase        `json:"phase"`
-	Destructive bool         `json:"destructive"`
-	DependsOn   []string     `json:"depends_on,omitempty"` // operation keys; string retained for source compatibility
-	Conditions  []Condition  `json:"conditions,omitempty"`
-	Timeout     Duration     `json:"timeout,omitempty"`
-	CancelMode  CancelMode   `json:"cancel_mode"`
-	HandlerRef  string       `json:"handler_ref,omitempty"`
+	ID            string                 `json:"id"` // deprecated: use Key for stable logical identity
+	Key           OperationKey           `json:"key,omitempty"`
+	ExecutionKind OperationExecutionKind `json:"execution_kind"`
+	EffectKey     string                 `json:"effect_key,omitempty"`
+	Fingerprint   string                 `json:"fingerprint,omitempty"`
+	ConflictKey   string                 `json:"conflict_key,omitempty"`
+	ConfigID      string                 `json:"config_id"` // owning configuration name
+	Provider      string                 `json:"provider"`  // target provider name
+	Action        string                 `json:"action"`    // "provision"|"deprovision"|"reconcile"
+	Input         []byte                 `json:"input,omitempty"`
+	Phase         Phase                  `json:"phase"`
+	Destructive   bool                   `json:"destructive"`
+	DependsOn     []string               `json:"depends_on,omitempty"` // operation keys; string retained for source compatibility
+	Conditions    []Condition            `json:"conditions,omitempty"`
+	Timeout       Duration               `json:"timeout,omitempty"`
+	CancelMode    CancelMode             `json:"cancel_mode"`
+	HandlerRef    string                 `json:"handler_ref,omitempty"`
 }
 
 // Duration is a JSON-serializable time.Duration.

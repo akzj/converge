@@ -91,3 +91,29 @@ func TestOperationFingerprintRejectsInvalidJSON(t *testing.T) {
 		t.Fatal("expected invalid JSON error")
 	}
 }
+
+func TestOperationFingerprintIncludesEffectRouting(t *testing.T) {
+	base := Operation{Provider: "test", Key: "apply", ExecutionKind: ExecutionDirect, Action: "same"}
+	direct, err := OperationFingerprint(base, "digest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect := base
+	effect.ExecutionKind = ExecutionEffectEnsure
+	effect.EffectKey = "artifact"
+	got, err := OperationFingerprint(effect, "digest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == direct {
+		t.Fatal("effect routing did not change fingerprint")
+	}
+	effect.EffectKey = "another"
+	changed, err := OperationFingerprint(effect, "digest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == got {
+		t.Fatal("effect key did not change fingerprint")
+	}
+}

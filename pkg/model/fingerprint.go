@@ -44,6 +44,8 @@ func OperationFingerprint(op Operation, providerDigest string) (string, error) {
 
 	canonical := fingerprintOperation{
 		Provider:       op.Provider,
+		ExecutionKind:  op.ExecutionKind,
+		EffectKey:      op.EffectKey,
 		ProviderDigest: providerDigest,
 		Action:         op.Action,
 		Input:          input,
@@ -66,6 +68,8 @@ func OperationFingerprint(op Operation, providerDigest string) (string, error) {
 
 type fingerprintOperation struct {
 	Provider       string                 `json:"provider"`
+	ExecutionKind  OperationExecutionKind `json:"execution_kind"`
+	EffectKey      string                 `json:"effect_key"`
 	ProviderDigest string                 `json:"provider_digest"`
 	Action         string                 `json:"action"`
 	Input          json.RawMessage        `json:"input"`
