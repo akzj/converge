@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/akzj/converge/pkg/model"
 )
@@ -127,4 +128,148 @@ func loadEffectSnapshot(t *testing.T, store *failingExecutionStore, id model.Con
 		state.controls[ctrl.ID] = ctrl
 	}
 	return state
+}
+
+func TestReclaimExpiredControl(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	reg := NewPlanRegistry(store)
+	plan, _, err := reg.Install(ctx, 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := TransitionIdentity{
+		EffectIdentity: EffectIdentity{
+			EffectID: "reclaim-effect", ReferenceID: "reclaim-ref",
+			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
+			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
+		},
+		RequestID: "reclaim-ctrl",
+	}
+	spec := ImmutableEnsureSpec{
+		IdempotencyKey: "reclaim", ArtifactID: "sha256:x",
+		SemanticFingerprint: "fp", EnsureSpec: []byte(`{"url":"x"}`),
+	}
+	if d, err := reg.BeginEnsureEffect(ctx, BeginEnsureRequest{Identity: identity, Spec: spec}); err != nil || d != TransitionApplied {
+		t.Fatalf("BeginEnsure: %v %v", d, err)
+	}
+	now := time.Now()
+	if _, err := reg.ClaimDueControl(ctx, plan.ConfigID, identity.RequestID, now, "attempt-1", "poll-1", now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	disposition, err := reg.ReclaimExpiredControl(ctx, plan.ConfigID, identity.RequestID, now)
+	if err != nil || disposition != TransitionApplied {
+		t.Fatalf("ReclaimExpiredControl: %v %v", disposition, err)
+	}
+	loaded, err := store.LoadExecution(ctx, plan.ConfigID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *EffectControl
+	for i := range loaded.EffectControls {
+		if loaded.EffectControls[i].ID == identity.RequestID {
+			found = &loaded.EffectControls[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("control missing after reclaim")
+	}
+	if found.State != EffectControlPending {
+		t.Fatalf("state=%s", found.State)
+	}
+	if found.InFlightAttemptID != "" || found.PollRequestID != "" || !found.LeaseExpiresAt.IsZero() {
+		t.Fatalf("claim identity should clear: %+v", found)
+	}
+	if found.RetryCount != 1 {
+		t.Fatalf("retry=%d", found.RetryCount)
+	}
+}
+
+func TestDeletionReadyWaitsResolutionRequired(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	reg := NewPlanRegistry(store)
+	plan, _, err := reg.Install(ctx, 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := TransitionIdentity{
+		EffectIdentity: EffectIdentity{
+			EffectID: "del-effect", ReferenceID: "del-ref",
+			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
+			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
+		},
+		RequestID: "del-ctrl",
+	}
+	spec := ImmutableEnsureSpec{
+		IdempotencyKey: "del", ArtifactID: "sha256:x",
+		SemanticFingerprint: "fp", EnsureSpec: []byte(`{"url":"x"}`),
+	}
+	if d, err := reg.BeginEnsureEffect(ctx, BeginEnsureRequest{Identity: identity, Spec: spec}); err != nil || d != TransitionApplied {
+		t.Fatalf("BeginEnsure: %v %v", d, err)
+	}
+	if d, err := reg.ApplyEnsureResult(ctx, identity, EnsureEffectResult{
+		EffectID: identity.EffectIdentity.EffectID, ReferenceID: identity.EffectIdentity.ReferenceID,
+		ExternalJobID: "job-1", ExternalRevision: 1, Disposition: EnsureBound,
+	}); err != nil || d != TransitionApplied {
+		t.Fatalf("ApplyEnsure: %v %v", d, err)
+	}
+	if _, err := reg.MarkDeleting(ctx, plan.ConfigID); err != nil {
+		t.Fatal(err)
+	}
+	if reg.DeletionReady(plan.ConfigID) {
+		t.Fatal("pending release / ResolutionRequired should block deletion")
+	}
+}
+
+func TestApplyObservationRejectsWrongPollID(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	reg := NewPlanRegistry(store)
+	plan, _, err := reg.Install(ctx, 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := TransitionIdentity{
+		EffectIdentity: EffectIdentity{
+			EffectID: "poll-effect", ReferenceID: "poll-ref",
+			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
+			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
+		},
+		RequestID: "ensure-ctrl",
+	}
+	spec := ImmutableEnsureSpec{
+		IdempotencyKey: "poll", ArtifactID: "sha256:x",
+		SemanticFingerprint: "fp", EnsureSpec: []byte(`{"url":"x"}`),
+	}
+	if d, err := reg.BeginEnsureEffect(ctx, BeginEnsureRequest{Identity: identity, Spec: spec}); err != nil || d != TransitionApplied {
+		t.Fatalf("BeginEnsure: %v %v", d, err)
+	}
+	if d, err := reg.ApplyEnsureResult(ctx, identity, EnsureEffectResult{
+		EffectID: identity.EffectIdentity.EffectID, ReferenceID: identity.EffectIdentity.ReferenceID,
+		ExternalJobID: "job-1", ExternalRevision: 1, Disposition: EnsureBound,
+	}); err != nil || d != TransitionApplied {
+		t.Fatalf("ApplyEnsure: %v %v", d, err)
+	}
+	observeID := ControlRequestID("observe-" + string(identity.EffectIdentity.EffectID))
+	now := time.Now()
+	if _, err := reg.ClaimDueControl(ctx, plan.ConfigID, observeID, now, "attempt-1", "poll-good", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	observeIdentity := TransitionIdentity{
+		EffectIdentity: identity.EffectIdentity,
+		AttemptID:      "attempt-1",
+		RequestID:      observeID,
+	}
+	disposition, err := reg.ApplyEffectObservation(ctx, observeIdentity, EffectObservation{
+		EffectID: identity.EffectIdentity.EffectID, AttemptID: "attempt-1", PollRequestID: "poll-bad",
+		ExternalJobID: "job-1", ExternalRevision: 2, Disposition: DispositionStillActive, NextCheckAt: now.Add(time.Second),
+	})
+	if err == nil && disposition == TransitionApplied {
+		t.Fatal("expected wrong poll id rejection")
+	}
+	if disposition != TransitionRejected {
+		t.Fatalf("disposition=%v err=%v", disposition, err)
+	}
 }
