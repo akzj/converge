@@ -41,15 +41,6 @@ func TestValidateEffectTransitionMatrix(t *testing.T) {
 	}
 }
 
-func effectStateRequiresResolution(state ExternalEffectState) bool {
-	switch state {
-	case ExternalEffectEnsuring, ExternalEffectActive, ExternalEffectCancelRequested, ExternalEffectCancelling, ExternalEffectUnknown:
-		return true
-	default:
-		return false
-	}
-}
-
 func TestValidateEffectCoreIntentKeepsExternalRevision(t *testing.T) {
 	for _, binding := range []EffectBindingState{EffectBindingUnbound, EffectBindingBound} {
 		oldEffect := validEffect()
