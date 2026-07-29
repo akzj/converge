@@ -67,11 +67,14 @@ type Arbiter interface {
 
 // ExecutionSnapshot is the durable execution state for one configuration.
 type ExecutionSnapshot struct {
-	Revision uint64
-	Deleting bool
-	Plan     *model.Plan
-	Attempts []model.Attempt
-	Outbox   []model.Event
+	Revision         uint64
+	Deleting         bool
+	Plan             *model.Plan
+	Attempts         []model.Attempt
+	Outbox           []model.Event
+	Effects          []ActiveEffect
+	EffectReferences []EffectReference
+	EffectControls   []EffectControl
 }
 
 // ExecutionStore persists plan/attempt transitions used for crash recovery.
