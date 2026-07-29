@@ -109,6 +109,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		case <-ticker.C:
 			r.detectDrift(ctx)
 		}
+		r.processDueControls(ctx)
 		r.executeReady(ctx)
 	}
 }
@@ -439,7 +440,19 @@ func (r *Reconciler) effectIdentity(plan *model.Plan, operation model.Operation,
 }
 
 func (r *Reconciler) executeEffectEnsure(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {
-	effect, _, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
+	effect, ref, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
+	if found && effect.Binding == EffectBindingBound && effect.ExternalJobID != "" {
+		// Same-artifact carry: EnsureReference owns the new reference; never
+		// CreateOrGet a second job under a new idempotency key.
+		if ref.State == EffectReferenceActive {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
+			return
+		}
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{
+			State: model.StepWaiting, Code: "ensure_reference_pending", NextCheckAt: time.Now().Add(time.Second),
+		})
+		return
+	}
 	var effectID EffectID
 	if found {
 		effectID = effect.ID
@@ -542,7 +555,6 @@ func (r *Reconciler) executeEffectObserve(ctx context.Context, plan *model.Plan,
 func (r *Reconciler) executeEffectRelease(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {
 	effect, ref, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
 	if operation.ReleaseTarget == model.ReleaseRetiredReference && operation.TargetReference != "" {
-		// Retired-reference release uses explicit TargetReference as ReferenceID.
 		ref = EffectReference{ID: ReferenceID(operation.TargetReference), EffectKey: operation.EffectKey}
 		if lookedUp, ok := r.registry.LookupReference(plan.ConfigID, ReferenceID(operation.TargetReference)); ok {
 			ref = lookedUp
@@ -562,17 +574,35 @@ func (r *Reconciler) executeEffectRelease(ctx context.Context, plan *model.Plan,
 		RequestID:      ControlRequestID("release-" + string(ref.ID)),
 	}
 	identity.EffectIdentity.ReferenceID = ref.ID
+	if disposition, err := r.registry.BeginReleaseEffect(ctx, BeginReleaseRequest{Identity: identity}); err != nil {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "begin_release_failed", Reason: err.Error(), Retryable: true})
+		return
+	} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "begin_release_rejected", Reason: string(disposition), Retryable: true})
+		return
+	}
+	// Control scheduler owns the Release RPC when a Release control is pending.
+	if r.registry.HasActiveEffectControl(plan.ConfigID, operation.EffectKey, EffectControlRelease) {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{
+			State: model.StepWaiting, Code: "release_scheduled", NextCheckAt: time.Now().Add(time.Second),
+		})
+		return
+	}
 	releaseResult, err := effectProvider.ReleaseEffect(ctx, ReleaseEffectRequest{
-		Identity:         identity.EffectIdentity,
-		ReleaseRequestID: identity.RequestID,
-		ExternalJobID:    effect.ExternalJobID,
-		ExternalRevision: effect.ExternalRevision,
+		Identity: identity.EffectIdentity, ReleaseRequestID: identity.RequestID,
+		ExternalJobID: effect.ExternalJobID, ExternalRevision: effect.ExternalRevision,
 	})
 	if err != nil {
 		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "release_failed", Reason: err.Error(), Retryable: true})
 		return
 	}
-	_ = releaseResult
+	if disposition, err := r.registry.ApplyReleaseResult(ctx, identity, releaseResult); err != nil {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_release_failed", Reason: err.Error(), Retryable: true})
+		return
+	} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_release_rejected", Reason: string(disposition), Retryable: true})
+		return
+	}
 	r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
 }
 

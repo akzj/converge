@@ -65,6 +65,9 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 			return errors.Errorf("duplicate control ID %q", control.ID)
 		}
 		controls[control.ID] = struct{}{}
+		if control.State == EffectControlCompleted {
+			continue
+		}
 		if _, exists := effects[control.EffectID]; !exists {
 			return errors.Errorf("control %q has missing effect %q", control.ID, control.EffectID)
 		}
@@ -103,8 +106,12 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 func validateReferenceEffectCompatibility(effect ActiveEffect, reference EffectReference) error {
 	switch reference.State {
 	case EffectReferenceEnsuring:
-		if effect.Binding != EffectBindingUnbound {
-			return errors.New("ensuring reference requires unbound effect")
+		// Initial ensure is unbound; same-artifact EnsureReference may be bound.
+		if effect.Binding != EffectBindingUnbound && effect.Binding != EffectBindingBound {
+			return errors.New("ensuring reference requires unbound or bound effect")
+		}
+		if effect.Binding == EffectBindingBound && effect.ExternalJobID == "" {
+			return errors.New("bound ensuring reference requires external job")
 		}
 	case EffectReferenceActive:
 		if effect.Binding != EffectBindingBound {

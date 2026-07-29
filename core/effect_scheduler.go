@@ -1,0 +1,236 @@
+package core
+
+import (
+	"context"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/akzj/converge/pkg/model"
+)
+
+const effectControlLease = 30 * time.Second
+
+// processDueControls claims due EffectControls and drives EnsureRetry/Observe/Release RPCs.
+func (r *Reconciler) processDueControls(ctx context.Context) {
+	now := time.Now()
+	r.registry.ReclaimExpiredControls(ctx, now)
+	for _, ref := range r.registry.ListDueControls(now) {
+		if err := r.processOneDueControl(ctx, ref, now); err != nil {
+			zap.L().Warn("converge: process due control",
+				zap.String("config", ref.ConfigID.Name),
+				zap.String("control", string(ref.ControlRequestID)),
+				zap.Error(err))
+		}
+	}
+}
+
+func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef, now time.Time) error {
+	attemptID, err := newAttemptID()
+	if err != nil {
+		return err
+	}
+	pollID := PollRequestID("poll-" + string(attemptID))
+	control, err := r.registry.ClaimDueControl(ctx, ref.ConfigID, ref.ControlRequestID, now, attemptID, pollID, now.Add(effectControlLease))
+	if err != nil {
+		// Not due / already claimed / stale list entry — harmless.
+		return nil
+	}
+	r.mu.RLock()
+	provider := r.providerVersions[control.ProviderType][control.ProviderDigest]
+	if provider == nil {
+		provider = r.providers[control.ProviderType]
+	}
+	r.mu.RUnlock()
+	effectProvider, ok := provider.(EffectProvider)
+	if !ok || effectProvider == nil {
+		_, _ = r.registry.YieldControl(ctx, controlIdentity(*control, attemptID), now.Add(5*time.Second))
+		return nil
+	}
+	effect, reference, found := r.registry.LookupEffectAndReference(ref.ConfigID, control.EffectID, control.ReferenceID)
+	if !found {
+		_, _ = r.registry.YieldControl(ctx, controlIdentity(*control, attemptID), now.Add(5*time.Second))
+		return nil
+	}
+	identity := TransitionIdentity{
+		EffectIdentity: EffectIdentity{
+			EffectID: effect.ID, ReferenceID: reference.ID,
+			ConfigID: reference.ConfigID, PlanID: reference.PlanID, Generation: reference.Generation,
+			EffectKey: reference.EffectKey, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
+		},
+		AttemptID: attemptID,
+		RequestID: control.ID,
+	}
+
+	switch control.Kind {
+	case EffectControlObserve, EffectControlObserveCancellation:
+		return r.runObserveControl(ctx, effectProvider, identity, effect, attemptID, pollID)
+	case EffectControlEnsureRetry:
+		return r.runEnsureRetryControl(ctx, effectProvider, identity, effect)
+	case EffectControlRelease:
+		return r.runReleaseControl(ctx, effectProvider, identity, effect)
+	case EffectControlEnsureReference:
+		return r.runEnsureReferenceControl(ctx, effectProvider, identity, effect)
+	default:
+		_, _ = r.registry.YieldControl(ctx, identity, now.Add(5*time.Second))
+		return nil
+	}
+}
+
+func controlIdentity(control EffectControl, attemptID model.AttemptID) TransitionIdentity {
+	return TransitionIdentity{
+		EffectIdentity: EffectIdentity{
+			EffectID: control.EffectID, ReferenceID: control.ReferenceID,
+			ConfigID: control.ConfigID, ProviderType: control.ProviderType, ProviderDigest: control.ProviderDigest,
+		},
+		AttemptID: attemptID,
+		RequestID: control.ID,
+	}
+}
+
+func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect, attemptID model.AttemptID, pollID PollRequestID) error {
+	observations, err := provider.ObserveEffects(ctx, []ObserveEffectRequest{{
+		Identity: identity.EffectIdentity, AttemptID: attemptID, PollRequestID: pollID,
+		ExternalJobID: effect.ExternalJobID, ExternalRevision: effect.ExternalRevision,
+	}})
+	if err != nil {
+		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		return err
+	}
+	obs, ok := observations[pollID]
+	if !ok || obs.Observation == nil {
+		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		return nil
+	}
+	switch obs.Observation.Disposition {
+	case DispositionStillActive:
+		next := obs.Observation.NextCheckAt
+		if next.IsZero() {
+			next = time.Now().Add(5 * time.Second)
+		}
+		obs.Observation.NextCheckAt = next
+		_, err = r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
+		return err
+	case DispositionCompleted, DispositionCancelled:
+		disposition, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
+		if err != nil {
+			return err
+		}
+		if disposition == TransitionApplied || disposition == TransitionDuplicate {
+			r.publishControlNodeCompletion(ctx, identity, model.StepCompleted)
+		}
+		return nil
+	default:
+		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		return nil
+	}
+}
+
+func (r *Reconciler) runEnsureRetryControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect) error {
+	result, err := provider.EnsureEffect(ctx, EnsureEffectRequest{
+		Identity: identity.EffectIdentity, IdempotencyKey: effect.IdempotencyKey,
+		ArtifactID: effect.ArtifactID, SemanticFingerprint: effect.SemanticFingerprint,
+		EnsureSpec: append([]byte(nil), effect.EnsureSpec...),
+	})
+	if err != nil {
+		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		return err
+	}
+	if result.Disposition != EnsureBound {
+		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		return nil
+	}
+	_, err = r.registry.ApplyEnsureResult(ctx, identity, result)
+	return err
+}
+
+func (r *Reconciler) runReleaseControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect) error {
+	result, err := provider.ReleaseEffect(ctx, ReleaseEffectRequest{
+		Identity: identity.EffectIdentity, ReleaseRequestID: identity.RequestID,
+		ExternalJobID: effect.ExternalJobID, ExternalRevision: effect.ExternalRevision,
+	})
+	if err != nil {
+		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		return err
+	}
+	disposition, err := r.registry.ApplyReleaseResult(ctx, identity, result)
+	if err != nil {
+		return err
+	}
+	if disposition == TransitionApplied || disposition == TransitionDuplicate {
+		r.publishControlNodeCompletion(ctx, identity, model.StepCompleted)
+	}
+	return nil
+}
+
+func (r *Reconciler) runEnsureReferenceControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect) error {
+	result, err := provider.EnsureReference(ctx, EnsureReferenceRequest{
+		Identity: identity.EffectIdentity, RequestID: identity.RequestID,
+		ExternalJobID: effect.ExternalJobID,
+	})
+	if err != nil {
+		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
+		return err
+	}
+	disposition, err := r.registry.ApplyEnsureReferenceResult(ctx, identity, result)
+	if err != nil {
+		return err
+	}
+	if disposition == TransitionApplied || disposition == TransitionDuplicate {
+		// Same-artifact carry skips DAG EnsureEffect; complete the ensure node
+		// so observe dependencies can proceed.
+		if plan, op, ok := r.registry.FindEffectOperation(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectKey, model.ExecutionEffectEnsure); ok {
+			r.enqueueControlCompletion(ctx, identity, plan, op, model.StepCompleted)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) publishControlNodeCompletion(ctx context.Context, identity TransitionIdentity, state model.StepState) {
+	kind := model.ExecutionEffectObserve
+	if control, _, ok := r.registry.LookupEffectAndReference(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectID, identity.EffectIdentity.ReferenceID); ok {
+		_ = control
+	}
+	// Prefer release node when releasing; otherwise observe.
+	if plan, op, ok := r.registry.FindEffectOperation(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectKey, model.ExecutionEffectRelease); ok {
+		ref, okRef := r.registry.LookupReference(identity.EffectIdentity.ConfigID, identity.EffectIdentity.ReferenceID)
+		if okRef && (ref.State == EffectReferenceReleased || ref.State == EffectReferenceReleaseRequested) {
+			r.enqueueControlCompletion(ctx, identity, plan, op, state)
+			return
+		}
+		_ = plan
+	}
+	plan, op, ok := r.registry.FindEffectOperation(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectKey, kind)
+	if !ok {
+		return
+	}
+	r.enqueueControlCompletion(ctx, identity, plan, op, state)
+}
+
+func (r *Reconciler) enqueueControlCompletion(ctx context.Context, identity TransitionIdentity, plan *model.Plan, op model.Operation, state model.StepState) {
+	event := model.Event{
+		EventID: string(identity.AttemptID) + "/control-result",
+		PlanID:  plan.ID, Generation: plan.Generation, NodeKey: op.Key,
+		AttemptID: identity.AttemptID, ConfigID: plan.ConfigID.Name,
+		State: state, Result: model.StepResult{State: state},
+	}
+	if err := r.registry.CompleteEffectOperation(ctx, identity, op.Key, state); err != nil {
+		zap.L().Warn("converge: complete effect operation from control", zap.Error(err))
+		return
+	}
+	if err := r.registry.EnqueueOutbox(ctx, event); err != nil {
+		zap.L().Warn("converge: enqueue control completion", zap.Error(err))
+		return
+	}
+	r.wakeOutbox()
+	snapshot := r.registry.Snapshot(plan.ConfigID)
+	if snapshot.Plan != nil && planCompleted(snapshot.Plan) {
+		r.mu.RLock()
+		provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]
+		r.mu.RUnlock()
+		if provider != nil {
+			r.verifyAndRecord(ctx, snapshot.Plan, provider)
+		}
+	}
+	r.executeReady(ctx)
+}
