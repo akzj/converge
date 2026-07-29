@@ -325,47 +325,47 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 		}
 	}
 
-	// Same-artifact carry: find existing references for the same EffectKey and
-	// fingerprint; create a new EffectReference for the new plan generation.
+	// Same-artifact carry: reuse Bound effect via EnsureReference. Changed
+	// artifact: release the old reference; DAG ensure creates effect B.
 	for _, info := range newEnsures {
 		newRefID := ReferenceID(fmt.Sprintf("%s/%s/%d/%s", installed.ConfigID.Name, installed.ID, installed.Generation, info.effectKey))
-		// Find any matching existing reference for same EffectKey with compatible fingerprint.
 		var oldRef *EffectReference
 		for id := range state.references {
 			ref := state.references[id]
-			if ref.EffectKey == info.effectKey {
-				oldRef = &ref
-				break
-			}
-		}
-		if oldRef == nil {
-			if _, exists := state.references[newRefID]; exists {
+			if ref.EffectKey != info.effectKey {
 				continue
 			}
-			newEffectID := EffectID("eff-" + installed.ConfigID.Name + "-" + info.effectKey + "-" + string(installed.ID))
-			if _, exists := state.effects[newEffectID]; !exists {
-				state.effects[newEffectID] = ActiveEffect{
-					ID: newEffectID, Binding: EffectBindingUnbound,
-					ArtifactID:          info.artifactID,
-					IdempotencyKey:      "idem-" + string(newEffectID),
-					SemanticFingerprint: info.fingerprint,
-					ProviderType:        info.providerType, ProviderDigest: info.providerDigest,
-					ConflictKey: effectSlotConflictKey(installed.ConfigID, info.effectKey),
-					State:       ExternalEffectEnsuring, ResolutionRequired: true,
-				}
+			if ref.State == EffectReferenceReleased || ref.State == EffectReferenceReleaseRequested {
+				continue
 			}
-			newRef := EffectReference{
-				ID: newRefID, EffectID: newEffectID,
-				ConfigID: installed.ConfigID, PlanID: installed.ID,
-				Generation: installed.Generation, EffectKey: info.effectKey,
-				State: EffectReferenceEnsuring,
-			}
-			state.references[newRef.ID] = newRef
+			oldRef = &ref
+			break
+		}
+		if oldRef == nil {
 			continue
 		}
 		oldEffect := state.effects[oldRef.EffectID]
-		if oldEffect.SemanticFingerprint != info.fingerprint {
-			continue // artifact changed, don't carry
+		sameArtifact := oldEffect.SemanticFingerprint == info.fingerprint && oldEffect.ArtifactID == info.artifactID
+		if !sameArtifact {
+			if oldRef.State == EffectReferenceActive || oldRef.State == EffectReferenceEnsuring {
+				old := *oldRef
+				old.State = EffectReferenceReleaseRequested
+				state.references[old.ID] = old
+				retireIncompatibleControlsLocked(state, old.ID)
+				releaseControlID := ControlRequestID("release-" + string(old.ID))
+				if _, exists := state.controls[releaseControlID]; !exists {
+					state.controls[releaseControlID] = EffectControl{
+						ID: releaseControlID, ConfigID: installed.ConfigID,
+						ProviderType: oldEffect.ProviderType, ProviderDigest: oldEffect.ProviderDigest,
+						Kind: EffectControlRelease, State: EffectControlPending,
+						EffectID: old.EffectID, ReferenceID: old.ID, NextCheckAt: time.Now(),
+					}
+				}
+			}
+			continue
+		}
+		if oldEffect.Binding != EffectBindingBound || oldEffect.ExternalJobID == "" {
+			continue
 		}
 		if _, exists := state.references[newRefID]; exists {
 			continue
@@ -374,9 +374,18 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 			ID: newRefID, EffectID: oldRef.EffectID,
 			ConfigID: installed.ConfigID, PlanID: installed.ID,
 			Generation: installed.Generation, EffectKey: info.effectKey,
-			State: EffectReferenceActive,
+			State: EffectReferenceEnsuring,
 		}
 		state.references[newRef.ID] = newRef
+		ensureRefControlID := ControlRequestID("ensure-ref-" + string(newRef.ID))
+		if _, exists := state.controls[ensureRefControlID]; !exists {
+			state.controls[ensureRefControlID] = EffectControl{
+				ID: ensureRefControlID, ConfigID: installed.ConfigID,
+				ProviderType: oldEffect.ProviderType, ProviderDigest: oldEffect.ProviderDigest,
+				Kind: EffectControlEnsureReference, State: EffectControlPending,
+				EffectID: oldRef.EffectID, ReferenceID: newRef.ID, NextCheckAt: time.Now(),
+			}
+		}
 	}
 
 	// For dropped ensure nodes with existing references: mark for release.
@@ -394,6 +403,7 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 			if ref, exists := state.references[expectedRefID]; exists {
 				ref.State = EffectReferenceReleaseRequested
 				state.references[ref.ID] = ref
+				retireIncompatibleControlsLocked(state, ref.ID)
 				releaseControlID := ControlRequestID("release-" + string(ref.ID))
 				if _, exists := state.controls[releaseControlID]; !exists {
 					state.controls[releaseControlID] = EffectControl{
@@ -552,12 +562,37 @@ func (r *PlanRegistry) ReadyOperations(configID model.ConfigID) (*model.Plan, []
 		if !dependenciesDone {
 			continue
 		}
+		// Control scheduler owns these once a durable control is pending.
+		if node.Operation.ExecutionKind == model.ExecutionEffectEnsure &&
+			r.hasActiveControlLocked(state, node.Operation.EffectKey, EffectControlEnsureReference) {
+			continue
+		}
+		if node.Operation.ExecutionKind == model.ExecutionEffectObserve &&
+			r.hasActiveControlLocked(state, node.Operation.EffectKey, EffectControlObserve) {
+			continue
+		}
+		if node.Operation.ExecutionKind == model.ExecutionEffectRelease &&
+			r.hasActiveControlLocked(state, node.Operation.EffectKey, EffectControlRelease) {
+			continue
+		}
 		if r.operationBlockedByEffectsLocked(state, node.Operation) {
 			continue
 		}
 		ready = append(ready, node.Operation)
 	}
 	return state.active.Clone(), ready
+}
+
+func (r *PlanRegistry) hasActiveControlLocked(state *configExecution, effectKey string, kind EffectControlKind) bool {
+	for _, control := range state.controls {
+		if control.Kind != kind || control.State == EffectControlCompleted {
+			continue
+		}
+		if ref := state.references[control.ReferenceID]; ref.EffectKey == effectKey {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *PlanRegistry) operationBlockedByEffectsLocked(state *configExecution, operation model.Operation) bool {

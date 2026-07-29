@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strconv"
 	"sync"
 
 	"github.com/akzj/converge/pkg/model"
@@ -35,10 +36,11 @@ func (p *FakeDownloadProvider) Verify(_ context.Context, _ model.ResourceID, _ m
 	return model.ObservedState{Present: true}, nil
 }
 func (p *FakeDownloadProvider) Replan(_ context.Context, request ReplanRequest) (ReplanResult, error) {
+	input := []byte(`{"artifact":` + strconv.Quote(request.Desired.Digest) + `}`)
 	return ReplanResult{Operations: []model.Operation{
-		{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"},
-		{Key: "observe", ExecutionKind: model.ExecutionEffectObserve, EffectKey: "download", DependsOn: []string{"ensure"}},
-		{Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download", ReleaseTarget: model.ReleaseCurrentPlan, DependsOn: []string{"observe"}},
+		{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download", Input: input},
+		{Key: "observe", ExecutionKind: model.ExecutionEffectObserve, EffectKey: "download", Input: input, DependsOn: []string{"ensure"}},
+		{Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download", Input: input, ReleaseTarget: model.ReleaseCurrentPlan, DependsOn: []string{"observe"}},
 		{Key: "activate", ExecutionKind: model.ExecutionDirect, DependsOn: []string{"verify"}},
 		{Key: "verify", ExecutionKind: model.ExecutionDirect, DependsOn: []string{"release"}},
 		{Key: "cleanup", ExecutionKind: model.ExecutionDirect, DependsOn: []string{"verify"}},
@@ -84,7 +86,13 @@ func (p *FakeDownloadProvider) ObserveEffects(_ context.Context, requests []Obse
 			continue
 		}
 		disposition, retryable, code, reason := jobDisposition(state)
-		if len(refs) == 0 {
+		// After last-reference removal the job may have zero refs while still
+		// cancelling/cancelled; cancellation observation must see that state.
+		if len(refs) == 0 &&
+			disposition != DispositionCancelled &&
+			disposition != DispositionCompleted &&
+			disposition != DispositionFailed &&
+			state != FakeJobCancelling {
 			result[req.PollRequestID] = EffectObservationResult{
 				Observation: &EffectObservation{
 					EffectID: req.Identity.EffectID, AttemptID: req.AttemptID, PollRequestID: req.PollRequestID,
@@ -93,6 +101,9 @@ func (p *FakeDownloadProvider) ObserveEffects(_ context.Context, requests []Obse
 				},
 			}
 			continue
+		}
+		if state == FakeJobCancelling && disposition == DispositionStillActive {
+			// Keep observing until terminal cancel/complete.
 		}
 		result[req.PollRequestID] = EffectObservationResult{
 			Observation: &EffectObservation{
