@@ -127,6 +127,15 @@ const (
 
 type EnsureFailureKind string
 
+type TransitionDisposition string
+
+const (
+	TransitionApplied   TransitionDisposition = "applied"
+	TransitionDuplicate TransitionDisposition = "duplicate"
+	TransitionStale     TransitionDisposition = "stale"
+	TransitionRejected  TransitionDisposition = "rejected"
+)
+
 const (
 	EnsureFailureNone                     EnsureFailureKind = "none"
 	EnsureFailureTransientKnownNotApplied EnsureFailureKind = "transient_known_not_applied"
