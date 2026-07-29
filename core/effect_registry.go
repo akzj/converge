@@ -51,9 +51,9 @@ func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureReq
 		ArtifactID: req.Spec.ArtifactID, IdempotencyKey: req.Spec.IdempotencyKey,
 		SemanticFingerprint: req.Spec.SemanticFingerprint,
 		EnsureSpec:          append([]byte(nil), req.Spec.EnsureSpec...),
-		ProviderType:        req.Identity.EffectIdentity.ProviderDigest,
+		ProviderType:        req.Identity.EffectIdentity.ProviderType,
 		ProviderDigest:      req.Identity.EffectIdentity.ProviderDigest,
-		ConflictKey:         "effect/" + string(req.Identity.EffectIdentity.EffectID),
+		ConflictKey:         effectSlotConflictKey(req.Identity.EffectIdentity.ConfigID, req.Identity.EffectIdentity.EffectKey),
 		State:               ExternalEffectEnsuring,
 		ResolutionRequired:  true,
 	}
@@ -200,10 +200,10 @@ func (r *PlanRegistry) ApplyEffectObservation(ctx context.Context, identity Tran
 		effect.State = ExternalEffectCompleted
 		effect.ResolutionRequired = false
 		effect.ExternalRevision = observation.ExternalRevision
-		reference.State = EffectReferenceReleaseRequested
+		// Observe completion does not request release; the plan's release
+		// node (or supersession) owns ReferenceReleaseRequested.
 		state.controls[control.ID] = control
 		state.effects[effect.ID] = effect
-		state.references[reference.ID] = reference
 
 	default:
 		return TransitionRejected, errors.Errorf("unhandled observation disposition %q", observation.Disposition)

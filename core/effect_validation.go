@@ -228,13 +228,21 @@ func OperationBlockedByEffect(operation model.Operation, plan *model.Plan, effec
 	if !effectBlocksConflict(effect) || operation.ConflictKey != effect.ConflictKey {
 		return false
 	}
-	exactCurrentReference := plan != nil && reference.State == EffectReferenceActive &&
-		reference.ConfigID == plan.ConfigID && reference.PlanID == plan.ID && reference.Generation == plan.Generation
+	exactCurrentPlan := plan != nil &&
+		reference.ConfigID == plan.ConfigID && reference.PlanID == plan.ID && reference.Generation == plan.Generation &&
+		operation.EffectKey == reference.EffectKey && reference.EffectID == effect.ID
+	exactEnsureControl := exactCurrentPlan && operation.ExecutionKind == model.ExecutionEffectEnsure &&
+		(reference.State == EffectReferenceEnsuring || reference.State == EffectReferenceActive)
+	exactObserveControl := exactCurrentPlan && operation.ExecutionKind == model.ExecutionEffectObserve &&
+		reference.State == EffectReferenceActive
+	exactCurrentRelease := exactCurrentPlan && operation.ExecutionKind == model.ExecutionEffectRelease &&
+		operation.ReleaseTarget != model.ReleaseRetiredReference &&
+		(reference.State == EffectReferenceActive || reference.State == EffectReferenceReleaseRequested)
 	exactRetiredRelease := plan != nil && operation.ExecutionKind == model.ExecutionEffectRelease &&
 		operation.ReleaseTarget == model.ReleaseRetiredReference &&
 		reference.State == EffectReferenceReleaseRequested && reference.ConfigID == plan.ConfigID &&
-		operation.TargetReference == string(reference.ID)
-	isControl := (exactCurrentReference || exactRetiredRelease) && operation.EffectKey == reference.EffectKey && reference.EffectID == effect.ID &&
-		(operation.ExecutionKind == model.ExecutionEffectEnsure || operation.ExecutionKind == model.ExecutionEffectObserve || operation.ExecutionKind == model.ExecutionEffectRelease)
+		operation.TargetReference == string(reference.ID) &&
+		operation.EffectKey == reference.EffectKey && reference.EffectID == effect.ID
+	isControl := exactEnsureControl || exactObserveControl || exactCurrentRelease || exactRetiredRelease
 	return !isControl
 }

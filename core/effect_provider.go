@@ -114,6 +114,7 @@ type EffectIdentity struct {
 	Generation     model.Generation
 	OperationKey   model.OperationKey
 	EffectKey      string
+	ProviderType   string
 	ProviderDigest string
 }
 

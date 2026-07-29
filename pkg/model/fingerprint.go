@@ -47,6 +47,7 @@ func OperationFingerprint(op Operation, providerDigest string) (string, error) {
 		ExecutionKind:   op.ExecutionKind,
 		EffectKey:       op.EffectKey,
 		TargetReference: op.TargetReference,
+		ReleaseTarget:   op.ReleaseTarget,
 		ProviderDigest:  providerDigest,
 		Action:          op.Action,
 		Input:           input,

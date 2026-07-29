@@ -238,20 +238,20 @@ func (r *PlanRegistry) Install(ctx context.Context, expected model.Generation, c
 		return nil, PlanChange{}, err
 	}
 	if state.active != nil {
-		for _, key := range change.Carry {
-			// Waiting attempts have returned control to Core and can be safely
-			// retired when a new plan replaces their node.
-			for _, key := range change.Drop {
-				oldNode := state.active.Nodes[key]
-				if oldNode == nil || oldNode.Status != model.NodeWaiting || oldNode.AttemptID == "" {
-					continue
-				}
-				if attempt := state.attempts[oldNode.AttemptID]; attempt != nil {
-					attempt.Status = model.AttemptCancelled
-					state.retired[attempt.ID] = attempt
-					delete(state.attempts, attempt.ID)
-				}
+		// Waiting attempts have returned control to Core and can be safely
+		// retired when a new plan replaces their node.
+		for _, key := range change.Drop {
+			oldNode := state.active.Nodes[key]
+			if oldNode == nil || oldNode.Status != model.NodeWaiting || oldNode.AttemptID == "" {
+				continue
 			}
+			if attempt := state.attempts[oldNode.AttemptID]; attempt != nil {
+				attempt.Status = model.AttemptCancelled
+				state.retired[attempt.ID] = attempt
+				delete(state.attempts, attempt.ID)
+			}
+		}
+		for _, key := range change.Carry {
 			oldNode, newNode := state.active.Nodes[key], installed.Nodes[key]
 			if oldNode.Status == model.NodeRunning {
 				attempt := state.attempts[oldNode.AttemptID]
@@ -350,7 +350,7 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 					IdempotencyKey:      "idem-" + string(newEffectID),
 					SemanticFingerprint: info.fingerprint,
 					ProviderType:        info.providerType, ProviderDigest: info.providerDigest,
-					ConflictKey: "effect/" + string(newEffectID),
+					ConflictKey: effectSlotConflictKey(installed.ConfigID, info.effectKey),
 					State:       ExternalEffectEnsuring, ResolutionRequired: true,
 				}
 			}
@@ -521,7 +521,8 @@ func isTerminalAttempt(status model.AttemptStatus) bool {
 	return status == model.AttemptCompleted || status == model.AttemptFailed || status == model.AttemptCancelled
 }
 
-// ReadyOperations returns dependency-ready nodes not blocked by retired effects.
+// ReadyOperations returns dependency-ready nodes not blocked by retired
+// attempts or unresolved external effects.
 func (r *PlanRegistry) ReadyOperations(configID model.ConfigID) (*model.Plan, []model.Operation) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -548,11 +549,95 @@ func (r *PlanRegistry) ReadyOperations(configID model.ConfigID) (*model.Plan, []
 				break
 			}
 		}
-		if dependenciesDone {
-			ready = append(ready, node.Operation)
+		if !dependenciesDone {
+			continue
 		}
+		if r.operationBlockedByEffectsLocked(state, node.Operation) {
+			continue
+		}
+		ready = append(ready, node.Operation)
 	}
 	return state.active.Clone(), ready
+}
+
+func (r *PlanRegistry) operationBlockedByEffectsLocked(state *configExecution, operation model.Operation) bool {
+	plan := state.active
+	for _, effect := range state.effects {
+		ref, ok := state.references[referenceForEffectLocked(state, effect.ID, plan)]
+		if !ok {
+			// Fall back: any reference pointing at this effect.
+			for _, candidate := range state.references {
+				if candidate.EffectID == effect.ID {
+					ref = candidate
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok {
+			continue
+		}
+		if OperationBlockedByEffect(operation, plan, effect, ref) {
+			return true
+		}
+	}
+	return false
+}
+
+func referenceForEffectLocked(state *configExecution, effectID EffectID, plan *model.Plan) ReferenceID {
+	if plan == nil {
+		return ""
+	}
+	for id, ref := range state.references {
+		if ref.EffectID == effectID && ref.PlanID == plan.ID && ref.Generation == plan.Generation {
+			return id
+		}
+	}
+	return ""
+}
+
+// LookupEffectBinding returns the durable effect/reference for a plan effect slot.
+func (r *PlanRegistry) LookupEffectBinding(configID model.ConfigID, planID model.PlanID, generation model.Generation, effectKey string) (ActiveEffect, EffectReference, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state := r.configs[configID.Name]
+	if state == nil {
+		return ActiveEffect{}, EffectReference{}, false
+	}
+	refID := newReferenceID(configID, planID, generation, effectKey)
+	ref, ok := state.references[refID]
+	if !ok {
+		return ActiveEffect{}, EffectReference{}, false
+	}
+	effect, ok := state.effects[ref.EffectID]
+	if !ok {
+		return ActiveEffect{}, EffectReference{}, false
+	}
+	return effect, ref, true
+}
+
+// LookupReference returns one durable effect reference by ID.
+func (r *PlanRegistry) LookupReference(configID model.ConfigID, referenceID ReferenceID) (EffectReference, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state := r.configs[configID.Name]
+	if state == nil {
+		return EffectReference{}, false
+	}
+	ref, ok := state.references[referenceID]
+	return ref, ok
+}
+
+// LookupEffect returns one durable effect by ID.
+func (r *PlanRegistry) LookupEffect(configID model.ConfigID, effectID EffectID) (ActiveEffect, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state := r.configs[configID.Name]
+	if state == nil {
+		return ActiveEffect{}, false
+	}
+	effect, ok := state.effects[effectID]
+	return effect, ok
 }
 
 // EnqueueOutbox persists an event before any best-effort publication.

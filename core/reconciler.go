@@ -397,10 +397,13 @@ func (r *Reconciler) executeAttempt(ctx, opCtx context.Context, cancel context.C
 func (r *Reconciler) executeEffectAttempt(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt) {
 	defer func() { <-r.execSem }()
 	r.mu.RLock()
-	provider := r.providers[operation.Provider]
+	provider := r.providerVersions[operation.Provider][plan.ProviderDigest]
+	if provider == nil {
+		provider = r.providers[operation.Provider]
+	}
 	r.mu.RUnlock()
 	if provider == nil {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "effect_provider_unavailable", Reason: "provider implementation not found"})
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "effect_provider_unavailable", Reason: "provider implementation matching plan digest is unavailable", Retryable: true})
 		return
 	}
 	effectProvider, ok := provider.(EffectProvider)
@@ -408,88 +411,169 @@ func (r *Reconciler) executeEffectAttempt(ctx context.Context, plan *model.Plan,
 		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "effect_provider_unsupported", Reason: "provider does not implement EffectProvider"})
 		return
 	}
-	effectID, _ := newEffectID()
-	refID := newReferenceID(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
-	identity := TransitionIdentity{
-		EffectIdentity: EffectIdentity{
-			EffectID:    effectID,
-			ReferenceID: refID,
-			ConfigID:    plan.ConfigID, PlanID: plan.ID,
-			Generation: plan.Generation, OperationKey: operation.Key,
-			EffectKey: operation.EffectKey, ProviderDigest: plan.ProviderDigest,
-		},
-		AttemptID: attempt.ID,
-		RequestID: ControlRequestID("ctrl-" + string(attempt.ID)),
-	}
 
 	switch operation.ExecutionKind {
 	case model.ExecutionEffectEnsure:
-		ensureReq := EnsureEffectRequest{
-			Identity:            identity.EffectIdentity,
-			IdempotencyKey:      "ensure-" + string(plan.ID) + "-" + operation.EffectKey,
-			ArtifactID:          plan.Desired.Digest,
-			SemanticFingerprint: plan.ProviderDigest,
-			EnsureSpec:          plan.Desired.Spec,
-		}
-		ensureResult, err := effectProvider.EnsureEffect(ctx, ensureReq)
-		if err != nil {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_failed", Reason: err.Error(), Retryable: true})
-			return
-		}
-		if ensureResult.Disposition != EnsureBound {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_not_bound", Reason: string(ensureResult.Disposition), Retryable: true})
-			return
-		}
-		// The ensure node completes immediately; the downstream observe node
-		// becomes ready through the normal DAG.
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
-
+		r.executeEffectEnsure(ctx, plan, operation, attempt, effectProvider)
 	case model.ExecutionEffectObserve:
-		pollID := PollRequestID("poll-" + string(attempt.ID))
-		observeReq := []ObserveEffectRequest{{
-			Identity:         identity.EffectIdentity,
-			AttemptID:        attempt.ID,
-			PollRequestID:    pollID,
-			ExternalJobID:    "",
-			ExternalRevision: 1,
-		}}
-		observations, err := effectProvider.ObserveEffects(ctx, observeReq)
-		if err != nil {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_failed", Reason: err.Error(), Retryable: true})
-			return
-		}
-		obs, exists := observations[pollID]
-		if !exists || obs.Observation == nil {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_missing", Reason: "no observation for poll request", Retryable: true})
-			return
-		}
-		if obs.Observation.Disposition == DispositionCompleted {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
-		} else if obs.Observation.Disposition == DispositionStillActive {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{
-				State:       model.StepWaiting,
-				Code:        "in_progress",
-				NextCheckAt: time.Now().Add(5 * time.Second),
-			})
-		} else {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_error", Reason: string(obs.Observation.Disposition), Retryable: obs.Observation.Retryable})
-		}
-
+		r.executeEffectObserve(ctx, plan, operation, attempt, effectProvider)
 	case model.ExecutionEffectRelease:
-		releaseReq := ReleaseEffectRequest{
-			Identity:         identity.EffectIdentity,
-			ReleaseRequestID: ControlRequestID("release-" + string(attempt.ID)),
-			ExternalJobID:    "",
-			ExternalRevision: 1,
-		}
-		releaseResult, err := effectProvider.ReleaseEffect(ctx, releaseReq)
+		r.executeEffectRelease(ctx, plan, operation, attempt, effectProvider)
+	default:
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "unknown_effect_kind", Reason: string(operation.ExecutionKind)})
+	}
+}
+
+func (r *Reconciler) effectIdentity(plan *model.Plan, operation model.Operation, effectID EffectID) EffectIdentity {
+	return EffectIdentity{
+		EffectID:       effectID,
+		ReferenceID:    newReferenceID(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey),
+		ConfigID:       plan.ConfigID,
+		PlanID:         plan.ID,
+		Generation:     plan.Generation,
+		OperationKey:   operation.Key,
+		EffectKey:      operation.EffectKey,
+		ProviderType:   plan.ProviderType,
+		ProviderDigest: plan.ProviderDigest,
+	}
+}
+
+func (r *Reconciler) executeEffectEnsure(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {
+	effect, _, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
+	var effectID EffectID
+	if found {
+		effectID = effect.ID
+	} else {
+		generated, err := newEffectID()
 		if err != nil {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "release_failed", Reason: err.Error(), Retryable: true})
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "effect_id_error", Reason: err.Error(), Retryable: true})
 			return
 		}
-		_ = releaseResult
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
+		effectID = generated
 	}
+	identity := TransitionIdentity{
+		EffectIdentity: r.effectIdentity(plan, operation, effectID),
+		AttemptID:      attempt.ID,
+		RequestID:      ControlRequestID("ensure-" + string(effectID)),
+	}
+	spec := ImmutableEnsureSpec{
+		IdempotencyKey:      "ensure-" + string(plan.ID) + "-" + operation.EffectKey,
+		ArtifactID:          plan.Desired.Digest,
+		SemanticFingerprint: operation.Fingerprint,
+		EnsureSpec:          append([]byte(nil), plan.Desired.Spec...),
+	}
+	if !found {
+		if disposition, err := r.registry.BeginEnsureEffect(ctx, BeginEnsureRequest{Identity: identity, Spec: spec}); err != nil {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "begin_ensure_failed", Reason: err.Error(), Retryable: true})
+			return
+		} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "begin_ensure_rejected", Reason: string(disposition), Retryable: true})
+			return
+		}
+	}
+
+	ensureResult, err := effectProvider.EnsureEffect(ctx, EnsureEffectRequest{
+		Identity:            identity.EffectIdentity,
+		IdempotencyKey:      spec.IdempotencyKey,
+		ArtifactID:          spec.ArtifactID,
+		SemanticFingerprint: spec.SemanticFingerprint,
+		EnsureSpec:          spec.EnsureSpec,
+	})
+	if err != nil {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_failed", Reason: err.Error(), Retryable: true})
+		return
+	}
+	if ensureResult.Disposition != EnsureBound {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_not_bound", Reason: string(ensureResult.Disposition), Retryable: true})
+		return
+	}
+	if disposition, err := r.registry.ApplyEnsureResult(ctx, identity, ensureResult); err != nil {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_ensure_failed", Reason: err.Error(), Retryable: true})
+		return
+	} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_ensure_rejected", Reason: string(disposition), Retryable: true})
+		return
+	}
+	r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
+}
+
+func (r *Reconciler) executeEffectObserve(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {
+	effect, _, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
+	if !found || effect.ExternalJobID == "" {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_unbound", Reason: "no bound effect for observe", Retryable: true})
+		return
+	}
+	identity := TransitionIdentity{
+		EffectIdentity: r.effectIdentity(plan, operation, effect.ID),
+		AttemptID:      attempt.ID,
+		RequestID:      ControlRequestID("observe-" + string(effect.ID)),
+	}
+	pollID := PollRequestID("poll-" + string(attempt.ID))
+	observations, err := effectProvider.ObserveEffects(ctx, []ObserveEffectRequest{{
+		Identity:         identity.EffectIdentity,
+		AttemptID:        attempt.ID,
+		PollRequestID:    pollID,
+		ExternalJobID:    effect.ExternalJobID,
+		ExternalRevision: effect.ExternalRevision,
+	}})
+	if err != nil {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_failed", Reason: err.Error(), Retryable: true})
+		return
+	}
+	obs, exists := observations[pollID]
+	if !exists || obs.Observation == nil {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_missing", Reason: "no observation for poll request", Retryable: true})
+		return
+	}
+	switch obs.Observation.Disposition {
+	case DispositionCompleted:
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
+	case DispositionStillActive:
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{
+			State:       model.StepWaiting,
+			Code:        "in_progress",
+			NextCheckAt: time.Now().Add(5 * time.Second),
+		})
+	default:
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_error", Reason: string(obs.Observation.Disposition), Retryable: obs.Observation.Retryable})
+	}
+}
+
+func (r *Reconciler) executeEffectRelease(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {
+	effect, ref, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
+	if operation.ReleaseTarget == model.ReleaseRetiredReference && operation.TargetReference != "" {
+		// Retired-reference release uses explicit TargetReference as ReferenceID.
+		ref = EffectReference{ID: ReferenceID(operation.TargetReference), EffectKey: operation.EffectKey}
+		if lookedUp, ok := r.registry.LookupReference(plan.ConfigID, ReferenceID(operation.TargetReference)); ok {
+			ref = lookedUp
+			if eff, ok := r.registry.LookupEffect(plan.ConfigID, ref.EffectID); ok {
+				effect = eff
+				found = true
+			}
+		}
+	}
+	if !found {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "release_missing", Reason: "no effect binding for release", Retryable: true})
+		return
+	}
+	identity := TransitionIdentity{
+		EffectIdentity: r.effectIdentity(plan, operation, effect.ID),
+		AttemptID:      attempt.ID,
+		RequestID:      ControlRequestID("release-" + string(ref.ID)),
+	}
+	identity.EffectIdentity.ReferenceID = ref.ID
+	releaseResult, err := effectProvider.ReleaseEffect(ctx, ReleaseEffectRequest{
+		Identity:         identity.EffectIdentity,
+		ReleaseRequestID: identity.RequestID,
+		ExternalJobID:    effect.ExternalJobID,
+		ExternalRevision: effect.ExternalRevision,
+	})
+	if err != nil {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "release_failed", Reason: err.Error(), Retryable: true})
+		return
+	}
+	_ = releaseResult
+	r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
 }
 
 func (r *Reconciler) publishResult(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, result model.StepResult) {

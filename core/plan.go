@@ -39,7 +39,11 @@ func BuildCandidate(config model.ConfigID, desired model.DesiredState, providerT
 		}
 		op.Provider = providerType
 		if op.ConflictKey == "" {
-			op.ConflictKey = "config/" + config.Name
+			if op.EffectKey != "" {
+				op.ConflictKey = effectSlotConflictKey(config, op.EffectKey)
+			} else {
+				op.ConflictKey = "config/" + config.Name
+			}
 		}
 		if op.Key == "" {
 			return nil, errors.Errorf("operation %q has no stable key", op.ID)
@@ -299,4 +303,8 @@ func contains(keys []model.OperationKey, target model.OperationKey) bool {
 		}
 	}
 	return false
+}
+
+func effectSlotConflictKey(config model.ConfigID, effectKey string) string {
+	return "effect-slot/" + config.Name + "/" + effectKey
 }

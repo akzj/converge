@@ -21,7 +21,7 @@ func TestEffectBeginEnsurePersistFailureRecoversRevision(t *testing.T) {
 		EffectIdentity: EffectIdentity{
 			EffectID: "test-effect", ReferenceID: "test-ref",
 			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
-			EffectKey: "download", ProviderDigest: "digest",
+			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
 		},
 		RequestID: "test-ctrl",
 	}
@@ -62,7 +62,7 @@ func TestApplyEnsureResultPersistFailureRecoversRevision(t *testing.T) {
 		EffectIdentity: EffectIdentity{
 			EffectID: "test-effect-2", ReferenceID: "test-ref-2",
 			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
-			EffectKey: "download", ProviderDigest: "digest",
+			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
 		},
 		RequestID: "ctrl-ensure",
 	}

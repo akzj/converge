@@ -3,7 +3,11 @@ module github.com/akzj/converge
 go 1.26.1
 
 require (
-	github.com/cockroachdb/errors v1.14.0 // indirect
+	github.com/cockroachdb/errors v1.14.0
+	go.uber.org/zap v1.28.0
+)
+
+require (
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
 	github.com/cockroachdb/redact v1.1.5 // indirect
 	github.com/getsentry/sentry-go v0.46.0 // indirect
@@ -13,7 +17,6 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
 )

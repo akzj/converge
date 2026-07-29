@@ -47,6 +47,29 @@ func TestEffectEnsureThenObserveThenCompletedE2E(t *testing.T) {
 	}
 	t.Logf("ensure called %d times", provider.ensureCount)
 
+	// Durable binding must exist after ensure.
+	deadline = time.Now().Add(2 * time.Second)
+	var bound bool
+	for time.Now().Before(deadline) {
+		plans := r.registry.ExecutionPlans()
+		for _, plan := range plans {
+			if plan.ConfigID.Name != desired.ConfigID.Name {
+				continue
+			}
+			if effect, _, ok := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, "download"); ok && effect.ExternalJobID != "" && effect.Binding == EffectBindingBound {
+				bound = true
+				break
+			}
+		}
+		if bound {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !bound {
+		t.Fatal("ensure did not persist a bound ActiveEffect")
+	}
+
 	// Wait for the observe operation to start and return Waiting.
 	for time.Now().Before(deadline) {
 		if provider.Counts().ObserveCount > 0 {
