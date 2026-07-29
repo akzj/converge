@@ -37,8 +37,8 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 		if reference.EffectKey == "" {
 			return errors.Errorf("reference %q has empty effect key", reference.ID)
 		}
-		if snapshot.Plan != nil && (reference.ConfigID != snapshot.Plan.ConfigID || reference.PlanID != snapshot.Plan.ID || reference.Generation != snapshot.Plan.Generation) {
-			return errors.Errorf("reference %q does not belong to snapshot plan", reference.ID)
+		if snapshot.Plan != nil && reference.ConfigID != snapshot.Plan.ConfigID {
+			return errors.Errorf("reference %q does not belong to execution config", reference.ID)
 		}
 		if !validReferenceState(reference.State) {
 			return errors.Errorf("reference %q has unknown state %q", reference.ID, reference.State)
@@ -74,6 +74,9 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 		if !validControlKind(control.Kind) || !validControlState(control.State) {
 			return errors.Errorf("control %q has unknown kind/state", control.ID)
 		}
+		if err := validateEffectEntityCompatibility(effect, reference, control); err != nil {
+			return errors.Wrapf(err, "control %q", control.ID)
+		}
 		if control.State == EffectControlInFlight {
 			if control.InFlightAttemptID == "" || control.PollRequestID == "" || control.LeaseExpiresAt.IsZero() {
 				return errors.Errorf("in-flight control %q has incomplete claim identity", control.ID)
@@ -99,6 +102,39 @@ func validReferenceState(state EffectReferenceState) bool {
 	default:
 		return false
 	}
+}
+
+func validateEffectEntityCompatibility(effect ActiveEffect, reference EffectReference, control EffectControl) error {
+	if reference.State == EffectReferenceActive && effect.Binding != EffectBindingBound {
+		return errors.New("active reference requires bound effect")
+	}
+	switch control.Kind {
+	case EffectControlEnsureRetry:
+		if effect.Binding != EffectBindingUnbound || (effect.State != ExternalEffectEnsuring && effect.State != ExternalEffectUnknown && effect.State != ExternalEffectCancelRequested) {
+			return errors.New("ensure retry requires unbound ensuring/unknown/cancel-requested effect")
+		}
+	case EffectControlEnsureReference:
+		if effect.Binding != EffectBindingBound || reference.State != EffectReferenceEnsuring {
+			return errors.New("ensure-reference requires bound effect and ensuring reference")
+		}
+	case EffectControlObserve:
+		if effect.Binding != EffectBindingBound || reference.State != EffectReferenceActive ||
+			(effect.State != ExternalEffectActive && effect.State != ExternalEffectUnknown) {
+			return errors.New("observe requires active reference and bound active/unknown effect")
+		}
+	case EffectControlRelease:
+		if effect.Binding != EffectBindingBound || reference.State != EffectReferenceReleaseRequested {
+			return errors.New("release requires bound effect and release-requested reference")
+		}
+	case EffectControlObserveCancellation:
+		if effect.Binding != EffectBindingBound ||
+			(effect.State != ExternalEffectCancelRequested && effect.State != ExternalEffectCancelling && effect.State != ExternalEffectUnknown) {
+			return errors.New("cancellation observation requires bound cancelling/unknown effect")
+		}
+	default:
+		return errors.Errorf("unknown control kind %q", control.Kind)
+	}
+	return nil
 }
 
 func validControlKind(kind EffectControlKind) bool {

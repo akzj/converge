@@ -22,71 +22,54 @@ func TestValidateActiveEffectBindingMatrix(t *testing.T) {
 		{name: "bound missing job", effect: func() ActiveEffect { e := validEffect(); e.ExternalJobID = ""; return e }()},
 		{name: "unbound ensuring", effect: func() ActiveEffect {
 			e := validEffect()
-			e.Binding = EffectBindingUnbound
-			e.ExternalJobID = ""
-			e.ExternalRevision = 0
-			e.State = ExternalEffectEnsuring
+			e.Binding, e.State, e.ExternalJobID, e.ExternalRevision = EffectBindingUnbound, ExternalEffectEnsuring, "", 0
 			return e
 		}(), valid: true},
 		{name: "unbound unknown", effect: func() ActiveEffect {
 			e := validEffect()
-			e.Binding = EffectBindingUnbound
-			e.ExternalJobID = ""
-			e.ExternalRevision = 0
-			e.State = ExternalEffectUnknown
+			e.Binding, e.State, e.ExternalJobID, e.ExternalRevision = EffectBindingUnbound, ExternalEffectUnknown, "", 0
 			return e
 		}(), valid: true},
 		{name: "unbound authoritative rejection", effect: func() ActiveEffect {
 			e := validEffect()
-			e.Binding = EffectBindingUnbound
-			e.ExternalJobID = ""
-			e.ExternalRevision = 0
-			e.State = ExternalEffectFailed
-			e.ResolutionRequired = false
+			e.Binding, e.State, e.ExternalJobID, e.ExternalRevision, e.ResolutionRequired = EffectBindingUnbound, ExternalEffectFailed, "", 0, false
 			return e
 		}(), valid: true},
 		{name: "unbound unresolved failure", effect: func() ActiveEffect {
 			e := validEffect()
-			e.Binding = EffectBindingUnbound
-			e.ExternalJobID = ""
-			e.ExternalRevision = 0
-			e.State = ExternalEffectFailed
+			e.Binding, e.State, e.ExternalJobID, e.ExternalRevision = EffectBindingUnbound, ExternalEffectFailed, "", 0
 			return e
 		}()},
-		{name: "terminal requires resolution mismatch", effect: func() ActiveEffect { e := validEffect(); e.State = ExternalEffectCompleted; return e }()},
+		{name: "terminal requires resolution", effect: func() ActiveEffect { e := validEffect(); e.State = ExternalEffectCompleted; return e }()},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := ValidateActiveEffect(test.effect)
-			if (err == nil) != test.valid {
-				t.Fatalf("valid=%v error=%v", test.valid, err)
+			if (ValidateActiveEffect(test.effect) == nil) != test.valid {
+				t.Fatalf("valid=%v", test.valid)
 			}
 		})
 	}
 }
 
-func TestValidateEffectSnapshotIdentityAndReferences(t *testing.T) {
+func validEffectSnapshot() ExecutionSnapshot {
 	effect := validEffect()
-	reference := EffectReference{ID: "ref", EffectID: effect.ID, ConfigID: model.ConfigID{Name: "config"}, PlanID: "plan", Generation: 1, EffectKey: "artifact", State: EffectReferenceActive}
+	plan := &model.Plan{ID: "plan", ConfigID: model.ConfigID{Name: "config"}, Generation: 2}
+	reference := EffectReference{ID: "ref", EffectID: effect.ID, ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation, EffectKey: "artifact", State: EffectReferenceActive}
 	control := EffectControl{ID: "control", ConfigID: reference.ConfigID, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve, State: EffectControlInFlight, EffectID: effect.ID, ReferenceID: reference.ID, InFlightAttemptID: "attempt", PollRequestID: "poll", LeaseExpiresAt: time.Now().Add(time.Minute)}
-	valid := ExecutionSnapshot{Plan: &model.Plan{ID: reference.PlanID, ConfigID: reference.ConfigID, Generation: reference.Generation}, Effects: []ActiveEffect{effect}, EffectReferences: []EffectReference{reference}, EffectControls: []EffectControl{control}}
+	return ExecutionSnapshot{Plan: plan, Effects: []ActiveEffect{effect}, EffectReferences: []EffectReference{reference}, EffectControls: []EffectControl{control}}
+}
+
+func TestValidateEffectSnapshotIdentityAndReferences(t *testing.T) {
+	valid := validEffectSnapshot()
 	if err := ValidateEffectSnapshot(valid); err != nil {
 		t.Fatal(err)
 	}
-
 	tests := []struct {
 		name   string
 		mutate func(*ExecutionSnapshot)
 	}{
-		{name: "duplicate effect", mutate: func(s *ExecutionSnapshot) { s.Effects = append(s.Effects, effect) }},
+		{name: "duplicate effect", mutate: func(s *ExecutionSnapshot) { s.Effects = append(s.Effects, s.Effects[0]) }},
 		{name: "missing effect reference", mutate: func(s *ExecutionSnapshot) { s.EffectReferences[0].EffectID = "missing" }},
-		{name: "missing control reference", mutate: func(s *ExecutionSnapshot) { s.EffectControls[0].ReferenceID = "missing" }},
-		{name: "incomplete claim", mutate: func(s *ExecutionSnapshot) { s.EffectControls[0].PollRequestID = "" }},
-		{name: "duplicate poll", mutate: func(s *ExecutionSnapshot) {
-			duplicate := s.EffectControls[0]
-			duplicate.ID = "second"
-			s.EffectControls = append(s.EffectControls, duplicate)
-		}},
 		{name: "reference wrong config", mutate: func(s *ExecutionSnapshot) { s.EffectReferences[0].ConfigID.Name = "wrong" }},
 		{name: "reference unknown state", mutate: func(s *ExecutionSnapshot) { s.EffectReferences[0].State = "invalid" }},
 		{name: "duplicate logical slot", mutate: func(s *ExecutionSnapshot) {
@@ -94,16 +77,23 @@ func TestValidateEffectSnapshotIdentityAndReferences(t *testing.T) {
 			duplicate.ID = "other"
 			s.EffectReferences = append(s.EffectReferences, duplicate)
 		}},
+		{name: "missing control reference", mutate: func(s *ExecutionSnapshot) { s.EffectControls[0].ReferenceID = "missing" }},
 		{name: "control wrong provider", mutate: func(s *ExecutionSnapshot) { s.EffectControls[0].ProviderDigest = "wrong" }},
 		{name: "control effect mismatch", mutate: func(s *ExecutionSnapshot) {
-			other := effect
-			other.ID = "other-effect"
+			other := s.Effects[0]
+			other.ID = "other"
 			s.Effects = append(s.Effects, other)
 			s.EffectControls[0].EffectID = other.ID
 		}},
 		{name: "control unknown kind", mutate: func(s *ExecutionSnapshot) { s.EffectControls[0].Kind = "invalid" }},
 		{name: "control unknown state", mutate: func(s *ExecutionSnapshot) { s.EffectControls[0].State = "invalid" }},
+		{name: "incomplete claim", mutate: func(s *ExecutionSnapshot) { s.EffectControls[0].PollRequestID = "" }},
 		{name: "pending retains claim", mutate: func(s *ExecutionSnapshot) { s.EffectControls[0].State = EffectControlPending }},
+		{name: "duplicate poll", mutate: func(s *ExecutionSnapshot) {
+			duplicate := s.EffectControls[0]
+			duplicate.ID = "second"
+			s.EffectControls = append(s.EffectControls, duplicate)
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -111,6 +101,45 @@ func TestValidateEffectSnapshotIdentityAndReferences(t *testing.T) {
 			test.mutate(&snapshot)
 			if err := ValidateEffectSnapshot(snapshot); err == nil {
 				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestEffectEntityCompatibilityMatrix(t *testing.T) {
+	baseEffect := validEffect()
+	baseReference := EffectReference{ID: "ref", EffectID: baseEffect.ID, ConfigID: model.ConfigID{Name: "config"}, EffectKey: "download", State: EffectReferenceActive}
+	tests := []struct {
+		name           string
+		kind           EffectControlKind
+		binding        EffectBindingState
+		effectState    ExternalEffectState
+		referenceState EffectReferenceState
+		valid          bool
+	}{
+		{"observe active", EffectControlObserve, EffectBindingBound, ExternalEffectActive, EffectReferenceActive, true},
+		{"observe ensuring ref", EffectControlObserve, EffectBindingBound, ExternalEffectActive, EffectReferenceEnsuring, false},
+		{"observe unbound", EffectControlObserve, EffectBindingUnbound, ExternalEffectUnknown, EffectReferenceActive, false},
+		{"ensure retry unbound", EffectControlEnsureRetry, EffectBindingUnbound, ExternalEffectUnknown, EffectReferenceEnsuring, true},
+		{"ensure retry bound", EffectControlEnsureRetry, EffectBindingBound, ExternalEffectActive, EffectReferenceActive, false},
+		{"ensure reference", EffectControlEnsureReference, EffectBindingBound, ExternalEffectActive, EffectReferenceEnsuring, true},
+		{"ensure reference active", EffectControlEnsureReference, EffectBindingBound, ExternalEffectActive, EffectReferenceActive, false},
+		{"release requested", EffectControlRelease, EffectBindingBound, ExternalEffectActive, EffectReferenceReleaseRequested, true},
+		{"release active", EffectControlRelease, EffectBindingBound, ExternalEffectActive, EffectReferenceActive, false},
+		{"observe cancelling", EffectControlObserveCancellation, EffectBindingBound, ExternalEffectCancelling, EffectReferenceReleaseRequested, true},
+		{"observe cancellation active", EffectControlObserveCancellation, EffectBindingBound, ExternalEffectActive, EffectReferenceReleaseRequested, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			effect := baseEffect
+			effect.Binding, effect.State = test.binding, test.effectState
+			if test.binding == EffectBindingUnbound {
+				effect.ExternalJobID, effect.ExternalRevision = "", 0
+			}
+			reference := baseReference
+			reference.State = test.referenceState
+			if (validateEffectEntityCompatibility(effect, reference, EffectControl{Kind: test.kind}) == nil) != test.valid {
+				t.Fatalf("valid=%v", test.valid)
 			}
 		})
 	}
@@ -148,7 +177,7 @@ func TestEffectBarrierRejectsNonExactReferences(t *testing.T) {
 		name   string
 		mutate func(*EffectReference)
 	}{
-		{name: "ensuring reference", mutate: func(r *EffectReference) { r.State = EffectReferenceEnsuring }},
+		{name: "ensuring", mutate: func(r *EffectReference) { r.State = EffectReferenceEnsuring }},
 		{name: "old generation", mutate: func(r *EffectReference) { r.Generation-- }},
 		{name: "wrong plan", mutate: func(r *EffectReference) { r.PlanID = "old" }},
 		{name: "wrong config", mutate: func(r *EffectReference) { r.ConfigID.Name = "other" }},
