@@ -27,7 +27,7 @@ func TestExecutorUsesProviderVersionBoundToPlanDigest(t *testing.T) {
 	newProvider := &versionProvider{lifecycleProvider: lifecycleProvider{name: "versioned"}, digest: "new", executed: executed}
 	r.RegisterProvider(ctx, oldProvider)
 	desired := model.DesiredState{ConfigID: model.ConfigID{Name: "config"}, ProviderType: "versioned", Version: 1, Digest: "desired"}
-	candidate, err := BuildCandidate(desired.ConfigID, desired, oldProvider.Type(), oldProvider.Digest(), []model.Operation{{Key: "apply", Provider: oldProvider.Type()}})
+	candidate, err := BuildCandidate(desired.ConfigID, desired, oldProvider.Type(), oldProvider.Digest(), []model.Operation{{Key: "apply", ExecutionKind: model.ExecutionDirect, Provider: oldProvider.Type()}})
 	if err != nil {
 		t.Fatal(err)
 	}

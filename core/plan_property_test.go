@@ -33,7 +33,7 @@ func randomDAG(rng *rand.Rand, size int, action string) []model.Operation {
 	ops := make([]model.Operation, size)
 	for i := range ops {
 		key := model.OperationKey(fmt.Sprintf("op-%02d", i))
-		ops[i] = model.Operation{Key: key, Action: action, Input: []byte(fmt.Sprintf(`{"value":%d}`, i))}
+		ops[i] = model.Operation{Key: key, ExecutionKind: model.ExecutionDirect, Action: action, Input: []byte(fmt.Sprintf(`{"value":%d}`, i))}
 		if i > 0 && rng.IntN(2) == 1 {
 			ops[i].DependsOn = []string{string(ops[rng.IntN(i)].Key)}
 		}
@@ -54,7 +54,7 @@ func mutateDAG(rng *rand.Rand, old []model.Operation) []model.Operation {
 		result = append(result, op)
 	}
 	for i := 0; i < rng.IntN(4); i++ {
-		result = append(result, model.Operation{Key: model.OperationKey(fmt.Sprintf("new-%02d", i)), Action: "new"})
+		result = append(result, model.Operation{Key: model.OperationKey(fmt.Sprintf("new-%02d", i)), ExecutionKind: model.ExecutionDirect, Action: "new"})
 	}
 	present := make(map[string]bool, len(result))
 	for _, op := range result {

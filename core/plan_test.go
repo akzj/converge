@@ -9,6 +9,11 @@ import (
 
 func testPlan(t *testing.T, digest string, operations ...model.Operation) *model.Plan {
 	t.Helper()
+	for i := range operations {
+		if operations[i].ExecutionKind == "" {
+			operations[i].ExecutionKind = model.ExecutionDirect
+		}
+	}
 	plan, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{Version: 1, Digest: "desired"}, "test", digest, operations)
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +149,7 @@ func TestClassifyPlanChangeCarryStateEligibility(t *testing.T) {
 }
 
 func TestBuildCandidateNormalizesProviderAndConflictKey(t *testing.T) {
-	plan, err := BuildCandidate(model.ConfigID{Name: "example"}, model.DesiredState{}, "provider-a", "digest", []model.Operation{{Key: "apply"}})
+	plan, err := BuildCandidate(model.ConfigID{Name: "example"}, model.DesiredState{}, "provider-a", "digest", []model.Operation{{Key: "apply", ExecutionKind: model.ExecutionDirect}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,5 +203,22 @@ func TestBuildCandidateValidatesEffectOperationTopology(t *testing.T) {
 	}
 	if _, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{}, "test", "digest", valid); err != nil {
 		t.Fatalf("valid effect topology rejected: %v", err)
+	}
+}
+
+func TestBuildCandidateRejectsInvalidEffectReleaseTopology(t *testing.T) {
+	tests := []struct {
+		name string
+		ops  []model.Operation
+	}{
+		{name: "release without ensure", ops: []model.Operation{{Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download"}}},
+		{name: "release unrelated to ensure", ops: []model.Operation{{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"}, {Key: "release", ExecutionKind: model.ExecutionEffectRelease, EffectKey: "download"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{}, "test", "digest", test.ops); err == nil {
+				t.Fatal("expected release topology error")
+			}
+		})
 	}
 }

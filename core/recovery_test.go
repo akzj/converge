@@ -12,7 +12,7 @@ func TestRecoveryRebuildsInProgressConfigFromExecutionDesired(t *testing.T) {
 	executionStore := NewMemoryExecutionStore()
 	registry := NewPlanRegistry(executionStore)
 	desired := model.DesiredState{ConfigID: model.ConfigID{Name: "first-convergence"}, ProviderType: "recovery", Version: 2, Digest: "v2", Spec: []byte(`{"critical":true}`), DependsOn: []string{"upstream"}}
-	candidate, err := BuildCandidate(desired.ConfigID, desired, "recovery", "digest-recovery", []model.Operation{{Key: "apply"}})
+	candidate, err := BuildCandidate(desired.ConfigID, desired, "recovery", "digest-recovery", []model.Operation{{Key: "apply", ExecutionKind: model.ExecutionDirect}})
 	if err != nil {
 		t.Fatal(err)
 	}

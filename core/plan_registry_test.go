@@ -10,7 +10,7 @@ import (
 
 func TestPlanRegistryGenerationCASPreservesActivePlan(t *testing.T) {
 	r := NewPlanRegistry()
-	first := testPlan(t, "digest", model.Operation{Key: "apply", Action: "one"})
+	first := testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "one"})
 	installed, _, err := r.Install(context.Background(), 0, first)
 	if err != nil {
 		t.Fatal(err)
@@ -19,7 +19,7 @@ func TestPlanRegistryGenerationCASPreservesActivePlan(t *testing.T) {
 		t.Fatalf("invalid installed identity: %#v", installed)
 	}
 
-	stale := testPlan(t, "digest", model.Operation{Key: "apply", Action: "two"})
+	stale := testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "two"})
 	if _, _, err := r.Install(context.Background(), 0, stale); !errors.Is(err, ErrGenerationChanged) {
 		t.Fatalf("got %v, want generation error", err)
 	}
@@ -31,7 +31,7 @@ func TestPlanRegistryGenerationCASPreservesActivePlan(t *testing.T) {
 
 func TestPlanRegistryCarriesMatchingRunningAttempt(t *testing.T) {
 	r := NewPlanRegistry()
-	first, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", Action: "same"}))
+	first, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "same"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestPlanRegistryCarriesMatchingRunningAttempt(t *testing.T) {
 	state.attempts["attempt-1"] = &model.Attempt{ID: "attempt-1", PlanID: first.ID, Generation: 1, ConfigID: first.ConfigID, NodeKey: "apply", Fingerprint: node.Operation.Fingerprint, Status: model.AttemptRunning}
 	r.mu.Unlock()
 
-	installed, change, err := r.Install(context.Background(), 1, testPlan(t, "digest", model.Operation{Key: "apply", Action: "same"}, model.Operation{Key: "new", Action: "add"}))
+	installed, change, err := r.Install(context.Background(), 1, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "same"}, model.Operation{Key: "new", Action: "add"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,14 +62,14 @@ func TestPlanRegistryCarriesMatchingRunningAttempt(t *testing.T) {
 
 func TestPlanRegistryRejectsRunningCarryWithoutTrackedAttempt(t *testing.T) {
 	r := NewPlanRegistry()
-	if _, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", Action: "same"})); err != nil {
+	if _, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "same"})); err != nil {
 		t.Fatal(err)
 	}
 	r.mu.Lock()
 	r.configs["config"].active.Nodes["apply"].Status = model.NodeRunning
 	r.configs["config"].active.Nodes["apply"].AttemptID = "missing"
 	r.mu.Unlock()
-	if _, _, err := r.Install(context.Background(), 1, testPlan(t, "digest", model.Operation{Key: "apply", Action: "same"})); err == nil {
+	if _, _, err := r.Install(context.Background(), 1, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "same"})); err == nil {
 		t.Fatal("expected missing attempt error")
 	}
 	if got := r.Snapshot(model.ConfigID{Name: "config"}).Plan.Generation; got != 1 {
@@ -79,7 +79,7 @@ func TestPlanRegistryRejectsRunningCarryWithoutTrackedAttempt(t *testing.T) {
 
 func TestPlanRegistrySnapshotIsDeepCopy(t *testing.T) {
 	r := NewPlanRegistry()
-	if _, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", Action: "same", Input: []byte(`{"a":1}`)})); err != nil {
+	if _, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "same", Input: []byte(`{"a":1}`)})); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := r.Snapshot(model.ConfigID{Name: "config"})
@@ -91,7 +91,7 @@ func TestPlanRegistrySnapshotIsDeepCopy(t *testing.T) {
 
 func TestPlanRegistryAttemptStartsAtMostOnce(t *testing.T) {
 	r := NewPlanRegistry()
-	installed, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestPlanRegistryAttemptStartsAtMostOnce(t *testing.T) {
 
 func TestPlanRegistryEventIdentityAndIdempotency(t *testing.T) {
 	r := NewPlanRegistry()
-	installed, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestPlanRegistryEventIdentityAndIdempotency(t *testing.T) {
 
 func TestPlanRegistryRejectsNonMonotonicDesiredRevision(t *testing.T) {
 	r := NewPlanRegistry()
-	first, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{Version: 2, Digest: "v2"}, "test", "digest", []model.Operation{{Key: "apply"}})
+	first, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{Version: 2, Digest: "v2"}, "test", "digest", []model.Operation{{Key: "apply", ExecutionKind: model.ExecutionDirect}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestPlanRegistryRejectsNonMonotonicDesiredRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, desired := range []model.DesiredState{{Version: 1, Digest: "v1"}, {Version: 2, Digest: "different"}} {
-		candidate, err := BuildCandidate(model.ConfigID{Name: "config"}, desired, "test", "digest", []model.Operation{{Key: "apply"}})
+		candidate, err := BuildCandidate(model.ConfigID{Name: "config"}, desired, "test", "digest", []model.Operation{{Key: "apply", ExecutionKind: model.ExecutionDirect}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -151,7 +151,7 @@ func TestPlanRegistryRejectsNonMonotonicDesiredRevision(t *testing.T) {
 
 func TestPlanRegistryUnknownOldEventCannotMutateActive(t *testing.T) {
 	r := NewPlanRegistry()
-	installed, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := r.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestPlanRegistryPersistsAndRestoresRunningAsUnknown(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryExecutionStore()
 	first := NewPlanRegistry(store)
-	installed, _, err := first.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", ConflictKey: "resource/x"}))
+	installed, _, err := first.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect, ConflictKey: "resource/x"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestPlanRegistryDeleteRemovesMemoryAndDurableState(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryExecutionStore()
 	registry := NewPlanRegistry(store)
-	installed, _, err := registry.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := registry.Install(context.Background(), 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestPlanRegistryDeleteRemovesMemoryAndDurableState(t *testing.T) {
 func TestAttemptIdentityRejectsReuseAndWrongGeneration(t *testing.T) {
 	ctx := context.Background()
 	registry := NewPlanRegistry()
-	installed, _, err := registry.Install(ctx, 0, testPlan(t, "digest", model.Operation{Key: "apply"}))
+	installed, _, err := registry.Install(ctx, 0, testPlan(t, "digest", model.Operation{Key: "apply", ExecutionKind: model.ExecutionDirect}))
 	if err != nil {
 		t.Fatal(err)
 	}

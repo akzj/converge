@@ -31,7 +31,7 @@ func TestDetectDriftTriggersPlanLatestForConvergedConfigs(t *testing.T) {
 		Digest:       "sha256:drift-v1",
 	}
 	candidate, err := BuildCandidate(desired.ConfigID, desired, "drift", "sha256:mock-drift",
-		[]model.Operation{{Key: "apply", Action: "provision"}})
+		[]model.Operation{{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "provision"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,10 +53,10 @@ func TestDetectDriftTriggersPlanLatestForConvergedConfigs(t *testing.T) {
 	// Set up the managed config as converged.
 	r.mu.Lock()
 	r.configs["drift-config"] = &model.ManagedConfig{
-		ID:                desired.ConfigID,
-		Desired:           desired,
-		Status:            model.ConfigConverged,
-		DependsOnConfigs:  []string{},
+		ID:               desired.ConfigID,
+		Desired:          desired,
+		Status:           model.ConfigConverged,
+		DependsOnConfigs: []string{},
 	}
 	r.mu.Unlock()
 
@@ -102,7 +102,7 @@ func TestDetectDriftSkipsNonConvergedConfigs(t *testing.T) {
 		Digest:       "sha256:skip-v1",
 	}
 	candidate, err := BuildCandidate(desired.ConfigID, desired, "skip", "sha256:mock-skip",
-		[]model.Operation{{Key: "apply", Action: "provision"}})
+		[]model.Operation{{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "provision"}})
 	if err != nil {
 		t.Fatal(err)
 	}

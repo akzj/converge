@@ -28,12 +28,12 @@ func (m *mockProvider) Replan(_ context.Context, request ReplanRequest) (ReplanR
 	if !observed.Present {
 		return ReplanResult{Operations: []model.Operation{
 			{
-				ID: "provision-" + m.typeName, Key: model.OperationKey("provision-" + m.typeName), Action: "provision",
+				ID: "provision-" + m.typeName, Key: model.OperationKey("provision-" + m.typeName), ExecutionKind: model.ExecutionDirect, Action: "provision",
 				Phase: model.PhaseCommit, Destructive: false,
 				CancelMode: model.CancelModeSafe,
 			},
 			{
-				ID: "verify-" + m.typeName, Key: model.OperationKey("verify-" + m.typeName), Action: "reconcile",
+				ID: "verify-" + m.typeName, Key: model.OperationKey("verify-" + m.typeName), ExecutionKind: model.ExecutionDirect, Action: "reconcile",
 				Phase: model.PhaseVerify, Destructive: false,
 				DependsOn: []string{"provision-" + m.typeName},
 			},

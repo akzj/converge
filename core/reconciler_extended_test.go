@@ -24,7 +24,7 @@ func (m *timeoutProvider) Replan(_ context.Context, request ReplanRequest) (Repl
 	if !observed.Present {
 		return ReplanResult{Operations: []model.Operation{
 			{
-				ID: "provision", Key: model.OperationKey("provision"), Action: "provision",
+				ID: "provision", Key: model.OperationKey("provision"), ExecutionKind: model.ExecutionDirect, Action: "provision",
 				Phase: model.PhaseCommit, Destructive: false,
 				CancelMode: model.CancelModeSafe,
 				Timeout:    1, // 1ms timeout — will trigger DeadlineExceeded quickly
@@ -54,7 +54,7 @@ func (m *conditionProvider) Replan(_ context.Context, request ReplanRequest) (Re
 	if !observed.Present {
 		return ReplanResult{Operations: []model.Operation{
 			{
-				ID: "provision", Key: model.OperationKey("provision"), Action: "provision",
+				ID: "provision", Key: model.OperationKey("provision"), ExecutionKind: model.ExecutionDirect, Action: "provision",
 				Phase: model.PhaseCommit, Destructive: false,
 				CancelMode: model.CancelModeSafe,
 				Conditions: []model.Condition{{Name: "test", Input: []byte(`{}`)}},
@@ -81,7 +81,7 @@ func (m *arbiterProvider) Replan(_ context.Context, request ReplanRequest) (Repl
 	if !observed.Present {
 		return ReplanResult{Operations: []model.Operation{
 			{
-				ID: "destructive", Key: model.OperationKey("destructive"), Action: "destroy",
+				ID: "destructive", Key: model.OperationKey("destructive"), ExecutionKind: model.ExecutionDirect, Action: "destroy",
 				Phase: model.PhaseCommit, Destructive: true,
 				CancelMode: model.CancelModeSafe,
 			},
@@ -326,7 +326,7 @@ func TestHandleEventAllTypes(t *testing.T) {
 	// doesn't create a different plan during Run.
 	fixed := &fixedProvider{ops: []model.Operation{
 		{
-			ID: "apply", Key: model.OperationKey("apply"), Action: "provision",
+			ID: "apply", Key: model.OperationKey("apply"), ExecutionKind: model.ExecutionDirect, Action: "provision",
 			Phase: model.PhaseCommit, Destructive: false,
 			CancelMode: model.CancelModeSafe,
 		},

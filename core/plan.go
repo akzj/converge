@@ -91,7 +91,7 @@ func validateEffectOperationTopology(plan *model.Plan) error {
 	for key, node := range plan.Nodes {
 		op := node.Operation
 		switch op.ExecutionKind {
-		case "", model.ExecutionDirect:
+		case model.ExecutionDirect:
 			if op.EffectKey != "" {
 				return errors.Errorf("direct operation %q has effect key", key)
 			}
@@ -113,15 +113,23 @@ func validateEffectOperationTopology(plan *model.Plan) error {
 	}
 	for key, node := range plan.Nodes {
 		op := node.Operation
-		if op.ExecutionKind != model.ExecutionEffectObserve {
-			continue
-		}
-		ensure, exists := ensures[op.EffectKey]
-		if !exists {
-			return errors.Errorf("effect observe %q has no ensure for effect key %q", key, op.EffectKey)
-		}
-		if !containsString(op.DependsOn, string(ensure)) {
-			return errors.Errorf("effect observe %q does not depend on ensure %q", key, ensure)
+		switch op.ExecutionKind {
+		case model.ExecutionEffectObserve:
+			ensure, exists := ensures[op.EffectKey]
+			if !exists {
+				return errors.Errorf("effect observe %q has no ensure for effect key %q", key, op.EffectKey)
+			}
+			if !containsString(op.DependsOn, string(ensure)) {
+				return errors.Errorf("effect observe %q does not depend on ensure %q", key, ensure)
+			}
+		case model.ExecutionEffectRelease:
+			ensure, exists := ensures[op.EffectKey]
+			if !exists {
+				return errors.Errorf("effect release %q has no ensure for effect key %q", key, op.EffectKey)
+			}
+			if !dependsTransitivelyOn(plan, key, ensure, make(map[model.OperationKey]bool)) {
+				return errors.Errorf("effect release %q is not downstream of ensure %q", key, ensure)
+			}
 		}
 	}
 	return nil
@@ -137,6 +145,24 @@ func containsString(values []string, target string) bool {
 }
 
 // ClassifyPlanChange decides lifecycle actions without mutating either plan.
+func dependsTransitivelyOn(plan *model.Plan, nodeKey, target model.OperationKey, seen map[model.OperationKey]bool) bool {
+	if seen[nodeKey] {
+		return false
+	}
+	seen[nodeKey] = true
+	node := plan.Nodes[nodeKey]
+	if node == nil {
+		return false
+	}
+	for _, dependency := range node.Operation.DependsOn {
+		dependencyKey := model.OperationKey(dependency)
+		if dependencyKey == target || dependsTransitivelyOn(plan, dependencyKey, target, seen) {
+			return true
+		}
+	}
+	return false
+}
+
 func ClassifyPlanChange(oldPlan, candidate *model.Plan) (PlanChange, error) {
 	var change PlanChange
 	if candidate == nil {

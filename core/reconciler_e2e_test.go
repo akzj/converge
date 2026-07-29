@@ -23,7 +23,7 @@ func (p *lifecycleProvider) Inspect(context.Context, model.ResourceID) (model.Ob
 	return model.ObservedState{Present: false}, nil
 }
 func (p *lifecycleProvider) Replan(context.Context, ReplanRequest) (ReplanResult, error) {
-	return ReplanResult{Operations: []model.Operation{{Key: "apply", Action: "apply", Conditions: []model.Condition{{Name: "ready"}}}}}, nil
+	return ReplanResult{Operations: []model.Operation{{Key: "apply", ExecutionKind: model.ExecutionDirect, Action: "apply", Conditions: []model.Condition{{Name: "ready"}}}}}, nil
 }
 func (p *lifecycleProvider) EvaluateCondition(context.Context, model.Condition) (bool, error) {
 	call := p.conditionCalls.Add(1)
