@@ -408,10 +408,12 @@ func (r *Reconciler) executeEffectAttempt(ctx context.Context, plan *model.Plan,
 		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "effect_provider_unsupported", Reason: "provider does not implement EffectProvider"})
 		return
 	}
+	effectID, _ := newEffectID()
+	refID := newReferenceID(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
 	identity := TransitionIdentity{
 		EffectIdentity: EffectIdentity{
-			EffectID:    EffectID("effective-" + string(plan.ID) + "-" + string(operation.Key)),
-			ReferenceID: ReferenceID("ref-" + string(plan.ID) + "-" + string(operation.Key)),
+			EffectID:    effectID,
+			ReferenceID: refID,
 			ConfigID:    plan.ConfigID, PlanID: plan.ID,
 			Generation: plan.Generation, OperationKey: operation.Key,
 			EffectKey: operation.EffectKey, ProviderDigest: plan.ProviderDigest,
