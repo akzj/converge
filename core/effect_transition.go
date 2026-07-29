@@ -2,9 +2,16 @@ package core
 
 import "github.com/cockroachdb/errors"
 
+type EffectTransitionOrigin string
+
+const (
+	EffectTransitionCoreIntent          EffectTransitionOrigin = "core_intent"
+	EffectTransitionExternalObservation EffectTransitionOrigin = "external_observation"
+)
+
 // ValidateEffectTransition rejects state regression, identity mutation, binding
-// replacement, and stale/contradictory external revisions.
-func ValidateEffectTransition(oldEffect, next ActiveEffect) error {
+// replacement, and stale/contradictory external observations.
+func ValidateEffectTransition(oldEffect, next ActiveEffect, origin EffectTransitionOrigin) error {
 	if oldEffect.ID != next.ID || oldEffect.ArtifactID != next.ArtifactID ||
 		oldEffect.IdempotencyKey != next.IdempotencyKey || oldEffect.SemanticFingerprint != next.SemanticFingerprint ||
 		oldEffect.ProviderType != next.ProviderType || oldEffect.ProviderDigest != next.ProviderDigest || oldEffect.ConflictKey != next.ConflictKey {
@@ -18,8 +25,20 @@ func ValidateEffectTransition(oldEffect, next ActiveEffect) error {
 	if next.ExternalRevision < oldEffect.ExternalRevision {
 		return errors.New("external revision regressed")
 	}
-	if next.ExternalRevision == oldEffect.ExternalRevision && oldEffect.State != next.State {
-		return errors.New("effect state changed at equal external revision")
+	switch origin {
+	case EffectTransitionExternalObservation:
+		if next.ExternalRevision == oldEffect.ExternalRevision && oldEffect.State != next.State {
+			return errors.New("effect state changed at equal external revision")
+		}
+	case EffectTransitionCoreIntent:
+		if next.ExternalRevision != oldEffect.ExternalRevision {
+			return errors.New("core intent cannot change external revision")
+		}
+		if next.State != ExternalEffectCancelRequested {
+			return errors.New("unsupported core intent transition")
+		}
+	default:
+		return errors.Errorf("unknown transition origin %q", origin)
 	}
 	if oldEffect.State == next.State {
 		return ValidateActiveEffect(next)
@@ -84,6 +103,19 @@ func ValidateReferenceTransition(oldReference, next EffectReference) error {
 	return nil
 }
 
+func validateControlShape(control EffectControl) error {
+	if control.State == EffectControlInFlight {
+		if control.InFlightAttemptID == "" || control.PollRequestID == "" || control.LeaseExpiresAt.IsZero() {
+			return errors.New("in-flight control lacks claim identity")
+		}
+		return nil
+	}
+	if control.InFlightAttemptID != "" || control.PollRequestID != "" || !control.LeaseExpiresAt.IsZero() {
+		return errors.New("non-in-flight control retains claim identity")
+	}
+	return nil
+}
+
 func ValidateControlTransition(oldControl, next EffectControl) error {
 	if oldControl.ID != next.ID || oldControl.ConfigID != next.ConfigID ||
 		oldControl.ProviderType != next.ProviderType || oldControl.ProviderDigest != next.ProviderDigest ||
@@ -91,7 +123,7 @@ func ValidateControlTransition(oldControl, next EffectControl) error {
 		return errors.New("immutable control identity changed")
 	}
 	if oldControl.State == next.State {
-		return nil
+		return validateControlShape(next)
 	}
 	switch oldControl.State {
 	case EffectControlPending, EffectControlYielded:
@@ -107,5 +139,5 @@ func ValidateControlTransition(oldControl, next EffectControl) error {
 	default:
 		return errors.Errorf("unknown control state %q", oldControl.State)
 	}
-	return nil
+	return validateControlShape(next)
 }

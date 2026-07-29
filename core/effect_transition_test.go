@@ -1,6 +1,9 @@
 package core
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestValidateEffectTransitionMatrix(t *testing.T) {
 	base := validEffect()
@@ -25,7 +28,7 @@ func TestValidateEffectTransitionMatrix(t *testing.T) {
 			oldEffect.State = test.from
 			next.State, next.ExternalRevision = test.to, test.revision
 			next.ResolutionRequired = effectStateRequiresResolution(test.to)
-			if (ValidateEffectTransition(oldEffect, next) == nil) != test.valid {
+			if (ValidateEffectTransition(oldEffect, next, EffectTransitionExternalObservation) == nil) != test.valid {
 				t.Fatalf("valid=%v", test.valid)
 			}
 		})
@@ -33,7 +36,7 @@ func TestValidateEffectTransitionMatrix(t *testing.T) {
 	mutated := base
 	mutated.ExternalJobID = "another"
 	mutated.ExternalRevision++
-	if err := ValidateEffectTransition(base, mutated); err == nil {
+	if err := ValidateEffectTransition(base, mutated, EffectTransitionExternalObservation); err == nil {
 		t.Fatal("bound job replacement accepted")
 	}
 }
@@ -44,6 +47,25 @@ func effectStateRequiresResolution(state ExternalEffectState) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func TestValidateEffectCoreIntentKeepsExternalRevision(t *testing.T) {
+	for _, binding := range []EffectBindingState{EffectBindingUnbound, EffectBindingBound} {
+		oldEffect := validEffect()
+		oldEffect.Binding = binding
+		if binding == EffectBindingUnbound {
+			oldEffect.State, oldEffect.ExternalJobID, oldEffect.ExternalRevision = ExternalEffectEnsuring, "", 0
+		}
+		next := oldEffect
+		next.State = ExternalEffectCancelRequested
+		if err := ValidateEffectTransition(oldEffect, next, EffectTransitionCoreIntent); err != nil {
+			t.Fatalf("binding=%s: %v", binding, err)
+		}
+		next.ExternalRevision++
+		if err := ValidateEffectTransition(oldEffect, next, EffectTransitionCoreIntent); err == nil {
+			t.Fatalf("binding=%s allowed revision mutation", binding)
+		}
 	}
 }
 
@@ -86,6 +108,14 @@ func TestValidateControlTransitionMatrix(t *testing.T) {
 	for _, test := range tests {
 		oldControl, next := base, base
 		oldControl.State, next.State = test.from, test.to
+		if test.from == EffectControlInFlight {
+			oldControl.InFlightAttemptID, oldControl.PollRequestID, oldControl.LeaseExpiresAt = "old-attempt", "old-poll", time.Now().Add(time.Minute)
+		}
+		if test.to == EffectControlInFlight {
+			next.InFlightAttemptID, next.PollRequestID, next.LeaseExpiresAt = "new-attempt", "new-poll", time.Now().Add(time.Minute)
+		} else {
+			next.InFlightAttemptID, next.PollRequestID, next.LeaseExpiresAt = "", "", time.Time{}
+		}
 		if (ValidateControlTransition(oldControl, next) == nil) != test.valid {
 			t.Fatalf("%s -> %s valid=%v", test.from, test.to, test.valid)
 		}
