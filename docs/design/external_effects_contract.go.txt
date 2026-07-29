@@ -1,0 +1,313 @@
+package externaleffects
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+)
+
+type EffectID string
+type ReferenceID string
+type AttemptID string
+type PollRequestID string
+type ControlRequestID string
+type PlanID string
+type Generation uint64
+type OperationKey string
+type ConfigID struct{ Name string }
+
+type BindingState string
+const (
+	BindingUnbound BindingState = "unbound"
+	BindingBound BindingState = "bound"
+)
+
+type EffectState string
+const (
+	EffectEnsuring EffectState = "ensuring"
+	EffectActive EffectState = "active"
+	EffectCancelRequested EffectState = "cancel_requested"
+	EffectCancelling EffectState = "cancelling"
+	EffectCompleted EffectState = "completed"
+	EffectCancelled EffectState = "cancelled"
+	EffectFailed EffectState = "failed"
+	EffectUnknown EffectState = "unknown"
+)
+
+type EnsureFailureKind string
+const (
+	EnsureFailureNone EnsureFailureKind = "none"
+	EnsureFailureTransientKnownNotApplied EnsureFailureKind = "transient_known_not_applied"
+	EnsureFailureUnknownOutcome EnsureFailureKind = "unknown_outcome"
+	EnsureFailureAuthoritativeRejected EnsureFailureKind = "authoritative_rejected"
+)
+
+type ReferenceState string
+const (
+	ReferenceEnsuring ReferenceState = "ensuring"
+	ReferenceActive ReferenceState = "active"
+	ReferenceReleaseRequested ReferenceState = "release_requested"
+	ReferenceReleased ReferenceState = "released"
+)
+
+type EnsureDisposition string
+const (
+	EnsureBound EnsureDisposition = "bound"
+	EnsureUnknown EnsureDisposition = "unknown"
+	EnsureFailed EnsureDisposition = "failed"
+)
+
+type EffectDisposition string
+const (
+	DispositionStillActive EffectDisposition = "still_active"
+	DispositionCompleted EffectDisposition = "completed"
+	DispositionAbsent EffectDisposition = "absent"
+	DispositionCancelled EffectDisposition = "cancelled"
+	DispositionFailed EffectDisposition = "failed"
+)
+
+type CancelDisposition string
+const (
+	CancelAccepted CancelDisposition = "accepted"
+	CancelAlreadyCompleted CancelDisposition = "already_completed"
+	CancelAlreadyCancelled CancelDisposition = "already_cancelled"
+	CancelNotCancellable CancelDisposition = "not_cancellable"
+	CancelUnknown CancelDisposition = "unknown"
+)
+
+type ReleaseDisposition string
+const (
+	ReleaseStillReferenced ReleaseDisposition = "still_referenced"
+	ReleaseLastReferenceCancelRequested ReleaseDisposition = "last_reference_cancel_requested"
+	ReleaseConfirmed ReleaseDisposition = "released"
+	ReleaseUnknown ReleaseDisposition = "unknown"
+	ReleaseFailed ReleaseDisposition = "failed"
+)
+type ReleaseFailureKind string
+const (
+	ReleaseFailureNone ReleaseFailureKind = "none"
+	ReleaseFailureTransient ReleaseFailureKind = "transient"
+	ReleaseFailureUnknownOutcome ReleaseFailureKind = "unknown_outcome"
+	ReleaseFailurePermanent ReleaseFailureKind = "permanent"
+)
+
+type OperationExecutionKind string
+const (
+	ExecutionDirect OperationExecutionKind = "direct"
+	ExecutionEffectEnsure OperationExecutionKind = "effect_ensure"
+	ExecutionEffectObserve OperationExecutionKind = "effect_observe"
+	ExecutionEffectRelease OperationExecutionKind = "effect_release"
+)
+
+type Operation struct {
+	Key OperationKey
+	ExecutionKind OperationExecutionKind
+	EffectKey string
+	Input []byte
+}
+
+type ActiveEffect struct {
+	ID EffectID
+	Binding BindingState
+	ExternalJobID string
+	ArtifactID string
+	IdempotencyKey string
+	SemanticFingerprint string
+	EnsureSpec json.RawMessage
+	ProviderType string
+	ProviderDigest string
+	ConflictKey string
+	State EffectState
+	ResolutionRequired bool
+	ExternalRevision uint64
+	CancelEpoch uint64
+	UpdatedAt time.Time
+}
+
+type EffectReference struct {
+	ID ReferenceID
+	EffectID EffectID
+	ConfigID ConfigID
+	PlanID PlanID
+	Generation Generation
+	EffectKey string
+	State ReferenceState
+}
+
+type EffectIdentity struct {
+	EffectID EffectID
+	ReferenceID ReferenceID
+	ConfigID ConfigID
+	PlanID PlanID
+	Generation Generation
+	OperationKey OperationKey
+	EffectKey string
+	ProviderDigest string
+}
+
+type ProviderEffectError struct { Code, Reason string; Retryable bool }
+
+type EnsureEffectRequest struct {
+	Identity EffectIdentity
+	IdempotencyKey string
+	ArtifactID string
+	SemanticFingerprint string
+	EnsureSpec json.RawMessage
+}
+type EnsureEffectResult struct {
+	EffectID EffectID
+	ReferenceID ReferenceID
+	ExternalJobID string
+	ExternalRevision uint64
+	Disposition EnsureDisposition
+	Failure EnsureFailureKind
+	Code string
+	Reason string
+}
+type ObserveEffectRequest struct {
+	Identity EffectIdentity
+	AttemptID AttemptID
+	PollRequestID PollRequestID
+	ExternalJobID string
+	ExternalRevision uint64
+}
+type EffectObservation struct {
+	EffectID EffectID
+	AttemptID AttemptID
+	PollRequestID PollRequestID
+	ExternalJobID string
+	ExternalRevision uint64
+	Disposition EffectDisposition
+	Retryable bool
+	Code, Reason string
+	NextCheckAt time.Time
+}
+type EnsureReferenceRequest struct {
+	Identity EffectIdentity
+	RequestID ControlRequestID
+	ExternalJobID string
+	ExternalRevision uint64
+}
+type EnsureReferenceResult struct {
+	EffectID EffectID
+	ReferenceID ReferenceID
+	RequestID ControlRequestID
+	ExternalJobID string
+	ExternalRevision uint64
+	Disposition EnsureDisposition
+	Failure EnsureFailureKind
+	Code string
+	Reason string
+}
+type EffectObservationResult struct {
+	Observation *EffectObservation
+	Error *ProviderEffectError
+}
+type ReleaseEffectRequest struct {
+	Identity EffectIdentity
+	ReleaseRequestID ControlRequestID
+	ExternalJobID string
+	ExternalRevision uint64
+}
+type ReleaseEffectResult struct {
+	EffectID EffectID
+	ReferenceID ReferenceID
+	ReleaseRequestID ControlRequestID
+	ExternalJobID string
+	ExternalRevision uint64
+	Disposition ReleaseDisposition
+	Failure ReleaseFailureKind
+	Code string
+	Reason string
+}
+
+type Provider interface {
+	EnsureEffect(context.Context, EnsureEffectRequest) (EnsureEffectResult, error)
+	EnsureReference(context.Context, EnsureReferenceRequest) (EnsureReferenceResult, error)
+	ObserveEffects(context.Context, []ObserveEffectRequest) (map[PollRequestID]EffectObservationResult, error)
+	ReleaseEffect(context.Context, ReleaseEffectRequest) (ReleaseEffectResult, error)
+}
+
+type TransitionDisposition string
+const (
+	TransitionApplied TransitionDisposition = "applied"
+	TransitionDuplicate TransitionDisposition = "duplicate"
+	TransitionStale TransitionDisposition = "stale"
+	TransitionRejected TransitionDisposition = "rejected"
+)
+
+type TransitionIdentity struct {
+	EffectIdentity EffectIdentity
+	AttemptID AttemptID
+	RequestID ControlRequestID
+}
+type ImmutableEnsureSpec struct {
+	IdempotencyKey, ArtifactID, SemanticFingerprint string
+	EnsureSpec json.RawMessage
+}
+
+type ExecutionSnapshot struct {
+	Revision uint64
+	Effects []ActiveEffect
+	EffectReferences []EffectReference
+	EffectControls []EffectControl
+	// Existing Plan, Attempt, tombstone, and Outbox fields remain in Core.
+}
+
+type EffectControlKind string
+const (
+	ControlEnsureRetry EffectControlKind = "ensure_retry"
+	ControlEnsureReference EffectControlKind = "ensure_reference"
+	ControlObserve EffectControlKind = "observe"
+	ControlRelease EffectControlKind = "release"
+	ControlObserveCancellation EffectControlKind = "observe_cancellation"
+)
+type EffectControlState string
+const (
+	ControlPending EffectControlState = "pending"
+	ControlInFlight EffectControlState = "in_flight"
+	ControlYielded EffectControlState = "yielded"
+	ControlCompleted EffectControlState = "completed"
+)
+type EffectControl struct {
+	ID ControlRequestID
+	ConfigID ConfigID
+	ProviderType string
+	ProviderDigest string
+	Kind EffectControlKind
+	State EffectControlState
+	EffectID EffectID
+	ReferenceID ReferenceID
+	NextCheckAt time.Time
+	RetryCount uint32
+	InFlightAttemptID AttemptID
+	PollRequestID PollRequestID
+	LeaseExpiresAt time.Time
+}
+
+type BeginEnsureRequest struct {
+	Identity TransitionIdentity // caller pre-generates EffectID and deterministic ReferenceID
+	Spec ImmutableEnsureSpec
+}
+type BeginReleaseRequest struct {
+	Identity TransitionIdentity // caller supplies deterministic ReleaseRequestID
+}
+type DueControlRef struct {
+	ConfigID ConfigID
+	ControlRequestID ControlRequestID
+	NextCheckAt time.Time
+}
+
+type RegistryCommands interface {
+	BeginEnsureEffect(context.Context, BeginEnsureRequest) (TransitionDisposition, error)
+	ApplyEnsureResult(context.Context, TransitionIdentity, EnsureEffectResult) (TransitionDisposition, error)
+	BeginEnsureReference(context.Context, TransitionIdentity) (TransitionDisposition, error)
+	ApplyEnsureReferenceResult(context.Context, TransitionIdentity, EnsureReferenceResult) (TransitionDisposition, error)
+	ApplyEffectObservation(context.Context, TransitionIdentity, EffectObservation) (TransitionDisposition, error)
+	BeginReleaseEffect(context.Context, BeginReleaseRequest) (TransitionDisposition, error)
+	ApplyReleaseResult(context.Context, TransitionIdentity, ReleaseEffectResult) (TransitionDisposition, error)
+	ListDueControls(context.Context, time.Time) ([]DueControlRef, error)
+	ClaimDueControl(context.Context, ConfigID, ControlRequestID, time.Time, AttemptID, PollRequestID, time.Time) (*EffectControl, error)
+	ReclaimExpiredControl(context.Context, ConfigID, ControlRequestID, time.Time) (TransitionDisposition, error)
+	YieldControl(context.Context, TransitionIdentity, time.Time) (TransitionDisposition, error)
+}
