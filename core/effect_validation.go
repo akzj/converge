@@ -252,3 +252,55 @@ func OperationBlockedByEffect(operation model.Operation, plan *model.Plan, effec
 	isControl := exactEnsureControl || exactObserveControl || exactCurrentRelease || exactRetiredRelease
 	return !isControl
 }
+
+// ValidateEnsureDispositionFailure checks legal combinations of EnsureDisposition
+// and EnsureFailureKind. Illegal combinations are returned as errors so that
+// provider boundaries are enforced at the registry command level.
+// The empty string ("") is treated as EnsureFailureNone for backward compatibility.
+func ValidateEnsureDispositionFailure(disp EnsureDisposition, fail EnsureFailureKind) error {
+	if fail == "" {
+		fail = EnsureFailureNone
+	}
+	switch disp {
+	case EnsureBound:
+		if fail != EnsureFailureNone {
+			return errors.Errorf("EnsureBound cannot carry failure kind %q", fail)
+		}
+		return nil
+	case EnsureUnknown:
+		if fail != EnsureFailureUnknownOutcome && fail != EnsureFailureTransientKnownNotApplied {
+			return errors.Errorf("EnsureUnknown requires unknown_outcome or transient_known_not_applied failure, got %q", fail)
+		}
+		return nil
+	case EnsureFailed:
+		if fail != EnsureFailureAuthoritativeRejected && fail != EnsureFailureNone && fail != EnsureFailureUnknownOutcome {
+			return errors.Errorf("EnsureFailed requires authoritative_rejected, none, or unknown_outcome failure, got %q", fail)
+		}
+		return nil
+	default:
+		return errors.Errorf("unknown ensure disposition %q", disp)
+	}
+}
+
+// ValidateReleaseDispositionFailure checks legal combinations of ReleaseDisposition
+// and ReleaseFailureKind. Illegal combinations signal provider contract violations.
+// The empty string ("") is treated as ReleaseFailureNone for backward compatibility.
+func ValidateReleaseDispositionFailure(disp ReleaseDisposition, fail ReleaseFailureKind) error {
+	if fail == "" {
+		fail = ReleaseFailureNone
+	}
+	switch disp {
+	case ReleaseStillReferenced, ReleaseLastReferenceCancelRequested, ReleaseConfirmed:
+		if fail != ReleaseFailureNone {
+			return errors.Errorf("release disposition %q cannot carry failure kind %q", disp, fail)
+		}
+		return nil
+	case ReleaseUnknown, ReleaseFailed:
+		if fail == ReleaseFailureNone {
+			return errors.Errorf("release disposition %q requires non-none failure kind", disp)
+		}
+		return nil
+	default:
+		return errors.Errorf("unknown release disposition %q", disp)
+	}
+}

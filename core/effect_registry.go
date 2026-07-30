@@ -90,6 +90,9 @@ func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureReq
 // Bound success becomes Active or CancelRequested Bound (late ensure after delete).
 // Unknown/Failed outcomes stay unbound and retain EnsureRetry when retryable.
 func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity TransitionIdentity, result EnsureEffectResult) (TransitionDisposition, error) {
+	if err := ValidateEnsureDispositionFailure(result.Disposition, result.Failure); err != nil {
+		return TransitionRejected, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -299,7 +302,7 @@ func (r *PlanRegistry) ApplyEffectObservation(ctx context.Context, identity Tran
 		return TransitionRejected, errors.New("observation effect id mismatch")
 	}
 	reference := state.references[identity.EffectIdentity.ReferenceID]
-	if reference.ID == "" && observation.Disposition != DispositionAbsent {
+	if reference.ID == "" && observation.Disposition != DispositionAbsent && observation.Disposition != DispositionAuthoritativeGone {
 		return TransitionStale, nil
 	}
 	oldEffect, oldControl := effect, control
@@ -368,13 +371,17 @@ func (r *PlanRegistry) ApplyEffectObservation(ctx context.Context, identity Tran
 		state.effects[effect.ID] = effect
 
 	case DispositionAbsent:
+		// Non-authoritative absence in observation. Apply yields; caller handles.
+		return TransitionRejected, errors.New("non-authoritative absent observation")
+
+	case DispositionAuthoritativeGone:
 		// Authoritative Gone: remove effect and its references; fail closed until
 		// desired recreates via Ensure if still needed.
 		if effect.Binding != EffectBindingBound {
-			return TransitionRejected, errors.New("absent observation requires bound effect")
+			return TransitionRejected, errors.New("authoritative gone requires bound effect")
 		}
 		if observation.ExternalJobID != "" && observation.ExternalJobID != effect.ExternalJobID {
-			return TransitionRejected, errors.New("absent observation job id mismatch")
+			return TransitionRejected, errors.New("authoritative gone job id mismatch")
 		}
 		control.State = EffectControlCompleted
 		control.InFlightAttemptID = ""
@@ -507,7 +514,7 @@ func (r *PlanRegistry) ReclaimExpiredControls(ctx context.Context, now time.Time
 			continue
 		}
 		state := cloneConfigExecution(current)
-	for _, id := range expired {
+		for _, id := range expired {
 			control := state.controls[id]
 			oldControl := control
 			control.State = EffectControlPending
@@ -614,6 +621,9 @@ func (r *PlanRegistry) BeginReleaseEffect(ctx context.Context, req BeginReleaseR
 
 // ApplyReleaseResult applies a provider release disposition to reference/effect state.
 func (r *PlanRegistry) ApplyReleaseResult(ctx context.Context, identity TransitionIdentity, result ReleaseEffectResult) (TransitionDisposition, error) {
+	if err := ValidateReleaseDispositionFailure(result.Disposition, result.Failure); err != nil {
+		return TransitionRejected, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]

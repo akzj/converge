@@ -96,7 +96,7 @@ func (p *FakeDownloadProvider) ObserveEffects(_ context.Context, requests []Obse
 					Observation: &EffectObservation{
 						EffectID: req.Identity.EffectID, AttemptID: req.AttemptID, PollRequestID: req.PollRequestID,
 						ExternalJobID: req.ExternalJobID, ExternalRevision: req.ExternalRevision + 1,
-						Disposition: DispositionAbsent, Code: "gone", Reason: err.Error(),
+						Disposition: DispositionAuthoritativeGone, Code: "gone", Reason: err.Error(),
 					},
 				}
 				continue
@@ -118,7 +118,7 @@ func (p *FakeDownloadProvider) ObserveEffects(_ context.Context, requests []Obse
 				Observation: &EffectObservation{
 					EffectID: req.Identity.EffectID, AttemptID: req.AttemptID, PollRequestID: req.PollRequestID,
 					ExternalJobID: req.ExternalJobID, ExternalRevision: revision,
-					Disposition: DispositionAbsent,
+					Disposition: DispositionAuthoritativeGone,
 				},
 			}
 			continue

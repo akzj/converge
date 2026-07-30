@@ -147,11 +147,12 @@ const (
 type EffectDisposition string
 
 const (
-	DispositionStillActive EffectDisposition = "still_active"
-	DispositionCompleted   EffectDisposition = "completed"
-	DispositionAbsent      EffectDisposition = "absent"
-	DispositionCancelled   EffectDisposition = "cancelled"
-	DispositionFailed      EffectDisposition = "failed"
+	DispositionStillActive        EffectDisposition = "still_active"
+	DispositionCompleted          EffectDisposition = "completed"
+	DispositionAbsent             EffectDisposition = "absent"
+	DispositionAuthoritativeGone  EffectDisposition = "authoritative_gone"
+	DispositionCancelled          EffectDisposition = "cancelled"
+	DispositionFailed             EffectDisposition = "failed"
 )
 
 type ReleaseDisposition string

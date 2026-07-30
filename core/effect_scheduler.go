@@ -124,7 +124,21 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 		obs.Observation.NextCheckAt = next
 		_, err = r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
 		return err
-	case DispositionCompleted, DispositionCancelled, DispositionFailed, DispositionAbsent:
+	case DispositionAbsent:
+		// Non-authoritative absence: yield and retry; do not clean up.
+		_, err = r.registry.YieldControl(ctx, identity, time.Now().Add(10*time.Second))
+		return err
+	case DispositionAuthoritativeGone:
+		// Service authoritatively confirmed the job is gone.
+		disposition, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
+		if err != nil {
+			return err
+		}
+		if disposition == TransitionApplied || disposition == TransitionDuplicate {
+			r.publishControlNodeCompletion(ctx, identity, model.StepCompleted)
+		}
+		return nil
+	case DispositionCompleted, DispositionCancelled, DispositionFailed:
 		disposition, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
 		if err != nil {
 			return err

@@ -419,7 +419,7 @@ func TestMatrixCancelCompleteRaceAndGone(t *testing.T) {
 	goneIdentity := TransitionIdentity{EffectIdentity: identity2.EffectIdentity, AttemptID: "att-g", RequestID: observeID}
 	if d, err := reg.ApplyEffectObservation(ctx, goneIdentity, EffectObservation{
 		EffectID: "gone-e", AttemptID: "att-g", PollRequestID: "poll-g",
-		ExternalJobID: "job-gone", ExternalRevision: 2, Disposition: DispositionAbsent,
+		ExternalJobID: "job-gone", ExternalRevision: 2, Disposition: DispositionAuthoritativeGone,
 	}); err != nil || d != TransitionApplied {
 		t.Fatalf("Gone: %v %v", d, err)
 	}
