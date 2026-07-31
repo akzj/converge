@@ -39,9 +39,6 @@ func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef
 	}
 	r.mu.RLock()
 	provider := r.providerVersions[control.ProviderType][control.ProviderDigest]
-	if provider == nil {
-		provider = r.providers[control.ProviderType]
-	}
 	r.mu.RUnlock()
 	effectProvider, ok := provider.(EffectProvider)
 	if !ok || effectProvider == nil {

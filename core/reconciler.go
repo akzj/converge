@@ -399,9 +399,6 @@ func (r *Reconciler) executeEffectAttempt(ctx context.Context, plan *model.Plan,
 	defer func() { <-r.execSem }()
 	r.mu.RLock()
 	provider := r.providerVersions[operation.Provider][plan.ProviderDigest]
-	if provider == nil {
-		provider = r.providers[operation.Provider]
-	}
 	r.mu.RUnlock()
 	if provider == nil {
 		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "effect_provider_unavailable", Reason: "provider implementation matching plan digest is unavailable", Retryable: true})
@@ -594,29 +591,12 @@ func (r *Reconciler) executeEffectRelease(ctx context.Context, plan *model.Plan,
 		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "begin_release_rejected", Reason: string(disposition), Retryable: true})
 		return
 	}
-	// Control scheduler owns the Release RPC when a Release control is pending.
-	if r.registry.HasActiveEffectControl(plan.ConfigID, operation.EffectKey, EffectControlRelease) {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{
-			State: model.StepWaiting, Code: "release_scheduled", NextCheckAt: time.Now().Add(time.Second),
-		})
-		return
-	}
-	releaseResult, err := effectProvider.ReleaseEffect(ctx, ReleaseEffectRequest{
-		Identity: identity.EffectIdentity, ReleaseRequestID: identity.RequestID,
-		ExternalJobID: effect.ExternalJobID, ExternalRevision: effect.ExternalRevision,
+	// The EffectControl scheduler is the sole owner of ReleaseEffect RPCs.
+	// This DAG path marks the release intent (via BeginReleaseEffect) and
+	// yields so the scheduler can drive the release.
+	r.publishResult(ctx, plan, operation, attempt, model.StepResult{
+		State: model.StepWaiting, Code: "release_scheduled", NextCheckAt: time.Now().Add(time.Second),
 	})
-	if err != nil {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "release_failed", Reason: err.Error(), Retryable: true})
-		return
-	}
-	if disposition, err := r.registry.ApplyReleaseResult(ctx, identity, releaseResult); err != nil {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_release_failed", Reason: err.Error(), Retryable: true})
-		return
-	} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_release_rejected", Reason: string(disposition), Retryable: true})
-		return
-	}
-	r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
 }
 
 func (r *Reconciler) publishResult(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, result model.StepResult) {

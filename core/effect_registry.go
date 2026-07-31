@@ -783,7 +783,10 @@ func (r *PlanRegistry) BeginReleaseEffect(ctx context.Context, req BeginReleaseR
 			ID: controlID, ConfigID: reference.ConfigID,
 			ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 			Kind: EffectControlRelease, State: EffectControlPending,
-			EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
+			EffectID: effect.ID, ReferenceID: reference.ID,
+			PlanID: req.Identity.EffectIdentity.PlanID, Generation: req.Identity.EffectIdentity.Generation,
+			OperationKey: req.Identity.EffectIdentity.OperationKey,
+			NextCheckAt:  time.Now(),
 		}
 	}
 	if err := r.persistLocked(ctx, reference.ConfigID, state.revision, state); err != nil {
