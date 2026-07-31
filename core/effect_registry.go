@@ -1648,3 +1648,136 @@ func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.
 	r.configs[configID.Name] = state
 	return TransitionApplied, nil
 }
+
+// ActivateEffectNode atomically activates the durable EffectControl for an
+// effect DAG node and transitions the node to NodeWaitingOnControl (or
+// NodeCompleted for an already-satisfied carry). It consumes no execSem slot
+// and creates no DAG provider Attempt; the EffectControl scheduler is the sole
+// owner of the Provider RPC.
+func (r *PlanRegistry) ActivateEffectNode(ctx context.Context, configID model.ConfigID, plan *model.Plan, operation model.Operation) (model.NodeStatus, error) {
+	if plan == nil {
+		return "", errors.New("nil plan")
+	}
+	switch operation.ExecutionKind {
+	case model.ExecutionEffectEnsure:
+		effect, ref, found := r.LookupEffectBinding(configID, plan.ID, plan.Generation, operation.EffectKey)
+		if found && effect.Binding == EffectBindingBound && effect.ExternalJobID != "" {
+			if ref.State == EffectReferenceActive {
+				// Already carried and active; the ensure node is satisfied.
+				if err := r.markEffectNode(ctx, configID, operation.Key, model.NodeCompleted); err != nil {
+					return "", err
+				}
+				return model.NodeCompleted, nil
+			}
+			// Waiting for the EnsureReference control to activate the carry.
+			if err := r.markEffectNode(ctx, configID, operation.Key, model.NodeWaitingOnControl); err != nil {
+				return "", err
+			}
+			return model.NodeWaitingOnControl, nil
+		}
+		var effectID EffectID
+		if found {
+			effectID = effect.ID
+		} else {
+			generated, err := newEffectID()
+			if err != nil {
+				return "", err
+			}
+			effectID = generated
+		}
+		refID := newReferenceID(configID, plan.ID, plan.Generation, operation.EffectKey)
+		identity := TransitionIdentity{
+			EffectIdentity: EffectIdentity{
+				EffectID: effectID, ReferenceID: refID,
+				ConfigID: configID, PlanID: plan.ID, Generation: plan.Generation,
+				OperationKey: operation.Key, EffectKey: operation.EffectKey,
+				ProviderType: plan.ProviderType, ProviderDigest: plan.ProviderDigest,
+			},
+			RequestID: ControlRequestID("ensure-" + string(effectID)),
+		}
+		spec := ImmutableEnsureSpec{
+			IdempotencyKey:      "ensure-" + string(plan.ID) + "-" + operation.EffectKey,
+			ArtifactID:          plan.Desired.Digest,
+			SemanticFingerprint: operation.Fingerprint,
+			EnsureSpec:          append([]byte(nil), plan.Desired.Spec...),
+		}
+		if !found {
+			if disp, err := r.BeginEnsureEffect(ctx, BeginEnsureRequest{Identity: identity, Spec: spec}); err != nil {
+				return "", err
+			} else if disp != TransitionApplied && disp != TransitionDuplicate {
+				return "", errors.Errorf("begin ensure rejected: %s", disp)
+			}
+		}
+		if disp, err := r.EnsureEnsureRetryControl(ctx, configID, effectID, refID, plan.ID, plan.Generation, operation.Key); err != nil || disp != TransitionApplied && disp != TransitionDuplicate {
+			return "", errors.Errorf("ensure control: %v %s", err, disp)
+		}
+		if err := r.markEffectNode(ctx, configID, operation.Key, model.NodeWaitingOnControl); err != nil {
+			return "", err
+		}
+		return model.NodeWaitingOnControl, nil
+
+	case model.ExecutionEffectObserve:
+		effect, _, found := r.LookupEffectBinding(configID, plan.ID, plan.Generation, operation.EffectKey)
+		if !found || effect.ExternalJobID == "" {
+			return "", errors.New("no bound effect for observe")
+		}
+		refID := newReferenceID(configID, plan.ID, plan.Generation, operation.EffectKey)
+		if disp, err := r.EnsureObserveControl(ctx, configID, effect.ID, refID, plan.ID, plan.Generation, operation.Key); err != nil || disp != TransitionApplied && disp != TransitionDuplicate {
+			return "", errors.Errorf("observe control: %v %s", err, disp)
+		}
+		if err := r.markEffectNode(ctx, configID, operation.Key, model.NodeWaitingOnControl); err != nil {
+			return "", err
+		}
+		return model.NodeWaitingOnControl, nil
+
+	case model.ExecutionEffectRelease:
+		effect, ref, found := r.LookupEffectBinding(configID, plan.ID, plan.Generation, operation.EffectKey)
+		if !found {
+			return "", errors.New("no effect binding for release")
+		}
+		identity := TransitionIdentity{
+			EffectIdentity: EffectIdentity{
+				EffectID: effect.ID, ReferenceID: ref.ID,
+				ConfigID: configID, PlanID: plan.ID, Generation: plan.Generation,
+				OperationKey: operation.Key, EffectKey: operation.EffectKey,
+				ProviderType: plan.ProviderType, ProviderDigest: plan.ProviderDigest,
+			},
+			RequestID: ControlRequestID("release-" + string(ref.ID)),
+		}
+		if disp, err := r.BeginReleaseEffect(ctx, BeginReleaseRequest{Identity: identity}); err != nil {
+			return "", err
+		} else if disp != TransitionApplied && disp != TransitionDuplicate {
+			return "", errors.Errorf("begin release rejected: %s", disp)
+		}
+		if err := r.markEffectNode(ctx, configID, operation.Key, model.NodeWaitingOnControl); err != nil {
+			return "", err
+		}
+		return model.NodeWaitingOnControl, nil
+	}
+	return "", errors.Errorf("operation %q is not an effect node", operation.Key)
+}
+
+// markEffectNode transitions a plan node to the given status in its own CAS.
+func (r *PlanRegistry) markEffectNode(ctx context.Context, configID model.ConfigID, key model.OperationKey, status model.NodeStatus) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[configID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil || state.active == nil {
+		return errors.New("config not found")
+	}
+	node := state.active.Nodes[key]
+	if node == nil {
+		return errors.Errorf("operation %q not found", key)
+	}
+	if node.Status == status {
+		return nil
+	}
+	node.Status = status
+	node.AttemptID = ""
+	if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
+		return err
+	}
+	r.configs[configID.Name] = state
+	return nil
+}

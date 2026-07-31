@@ -212,6 +212,10 @@ const (
 	NodeReady      NodeStatus = "ready"
 	NodeRunning    NodeStatus = "running"
 	NodeWaiting    NodeStatus = "waiting"
+	// NodeWaitingOnControl marks an effect node that has activated its durable
+	// EffectControl and is waiting for the EffectControl scheduler to drive it.
+	// It consumes no execSem slot and creates no DAG provider Attempt.
+	NodeWaitingOnControl NodeStatus = "waiting_on_control"
 	NodeCancelling NodeStatus = "cancelling"
 	NodeDraining   NodeStatus = "draining"
 	NodeCompleted  NodeStatus = "completed"

@@ -34,13 +34,23 @@ type Reconciler struct {
 	pendingDelete  chan string
 	execSem        chan struct{}
 	outboxWake     chan struct{}
+	controlWake    chan struct{}
 }
 
 func NewReconciler(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
 	return &Reconciler{
 		providers: make(map[string]Provider), providerVersions: make(map[string]map[string]Provider), store: store, events: events, arbiter: arbiter, journal: journal,
 		registry: NewPlanRegistry(executionStore), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc),
-		pendingDesired: make(chan model.DesiredState, 128), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions), outboxWake: make(chan struct{}, 1),
+		pendingDesired: make(chan model.DesiredState, 128), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions), outboxWake: make(chan struct{}, 1), controlWake: make(chan struct{}, 1),
+	}
+}
+
+// wakeControls signals the Run loop that due EffectControls may exist, so it
+// stops blocking in select and runs processDueControls.
+func (r *Reconciler) wakeControls() {
+	select {
+	case r.controlWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -106,6 +116,8 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			r.deleteConfig(ctx, name)
 		case event := <-eventCh:
 			r.handleEvent(ctx, event)
+		case <-r.controlWake:
+			// EffectControl scheduler may have work; processDueControls runs below.
 		case <-ticker.C:
 			r.detectDrift(ctx)
 		}
@@ -299,6 +311,29 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 			continue
 		}
 		for _, operation := range operations {
+			// Effect nodes are activated through the EffectControl scheduler
+			// pathway: ActivateEffectNode persists the control + transitions the
+			// node to WaitingOnControl, consuming no execSem slot and creating
+			// no DAG provider Attempt. The EffectControl scheduler owns all
+			// EffectProvider RPCs.
+			if operation.ExecutionKind == model.ExecutionEffectEnsure ||
+				operation.ExecutionKind == model.ExecutionEffectObserve ||
+				operation.ExecutionKind == model.ExecutionEffectRelease {
+				status, err := r.registry.ActivateEffectNode(ctx, id, plan, operation)
+				if err != nil {
+					zap.L().Error("converge: activate effect node", zap.String("config", id.Name), zap.String("op", string(operation.Key)), zap.Error(err))
+					continue
+				}
+				// Wake the Run loop so processDueControls drives the newly
+				// activated control without blocking in select.
+				r.wakeControls()
+				if status == model.NodeCompleted {
+					// Carry already satisfied; re-scan so downstream nodes that
+					// just became ready are dispatched in this pass.
+					r.executeReady(ctx)
+				}
+				continue
+			}
 			// Capacity is acquired before publishing Running, so the number of
 			// durable running attempts and goroutines is bounded together.
 			select {
@@ -327,12 +362,6 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 				delete(r.cancels, attemptID)
 				r.mu.Unlock()
 				<-r.execSem
-				continue
-			}
-			if operation.ExecutionKind == model.ExecutionEffectEnsure ||
-				operation.ExecutionKind == model.ExecutionEffectObserve ||
-				operation.ExecutionKind == model.ExecutionEffectRelease {
-				go r.executeEffectAttempt(ctx, plan, operation, attempt)
 				continue
 			}
 			go r.executeAttempt(ctx, opCtx, cancel, plan, operation, attempt)
@@ -393,176 +422,6 @@ func (r *Reconciler) executeAttempt(ctx, opCtx context.Context, cancel context.C
 		result = model.StepResult{State: model.StepFailed, Code: "execute_error", Reason: err.Error()}
 	}
 	r.publishResult(ctx, plan, operation, attempt, result)
-}
-
-func (r *Reconciler) executeEffectAttempt(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt) {
-	defer func() { <-r.execSem }()
-	r.mu.RLock()
-	provider := r.providerVersions[operation.Provider][plan.ProviderDigest]
-	r.mu.RUnlock()
-	if provider == nil {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "effect_provider_unavailable", Reason: "provider implementation matching plan digest is unavailable", Retryable: true})
-		return
-	}
-	effectProvider, ok := provider.(EffectProvider)
-	if !ok {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "effect_provider_unsupported", Reason: "provider does not implement EffectProvider"})
-		return
-	}
-
-	switch operation.ExecutionKind {
-	case model.ExecutionEffectEnsure:
-		r.executeEffectEnsure(ctx, plan, operation, attempt, effectProvider)
-	case model.ExecutionEffectObserve:
-		r.executeEffectObserve(ctx, plan, operation, attempt, effectProvider)
-	case model.ExecutionEffectRelease:
-		r.executeEffectRelease(ctx, plan, operation, attempt, effectProvider)
-	default:
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "unknown_effect_kind", Reason: string(operation.ExecutionKind)})
-	}
-}
-
-func (r *Reconciler) effectIdentity(plan *model.Plan, operation model.Operation, effectID EffectID) EffectIdentity {
-	return EffectIdentity{
-		EffectID:       effectID,
-		ReferenceID:    newReferenceID(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey),
-		ConfigID:       plan.ConfigID,
-		PlanID:         plan.ID,
-		Generation:     plan.Generation,
-		OperationKey:   operation.Key,
-		EffectKey:      operation.EffectKey,
-		ProviderType:   plan.ProviderType,
-		ProviderDigest: plan.ProviderDigest,
-	}
-}
-
-func (r *Reconciler) executeEffectEnsure(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {
-	effect, ref, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
-	if found && effect.Binding == EffectBindingBound && effect.ExternalJobID != "" {
-		// Same-artifact carry: EnsureReference owns the new reference; never
-		// CreateOrGet a second job under a new idempotency key. The ensure node
-		// completes when the EnsureReference control activates the reference.
-		if ref.State == EffectReferenceActive {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
-			return
-		}
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{
-			State: model.StepWaiting, Code: "ensure_reference_pending", NextCheckAt: time.Now().Add(time.Second),
-		})
-		return
-	}
-	var effectID EffectID
-	if found {
-		effectID = effect.ID
-	} else {
-		generated, err := newEffectID()
-		if err != nil {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "effect_id_error", Reason: err.Error(), Retryable: true})
-			return
-		}
-		effectID = generated
-	}
-	identity := TransitionIdentity{
-		EffectIdentity: r.effectIdentity(plan, operation, effectID),
-		AttemptID:      attempt.ID,
-		RequestID:      ControlRequestID("ensure-" + string(effectID)),
-	}
-	spec := ImmutableEnsureSpec{
-		IdempotencyKey:      "ensure-" + string(plan.ID) + "-" + operation.EffectKey,
-		ArtifactID:          plan.Desired.Digest,
-		SemanticFingerprint: operation.Fingerprint,
-		EnsureSpec:          append([]byte(nil), plan.Desired.Spec...),
-	}
-	if !found {
-		if disposition, err := r.registry.BeginEnsureEffect(ctx, BeginEnsureRequest{Identity: identity, Spec: spec}); err != nil {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "begin_ensure_failed", Reason: err.Error(), Retryable: true})
-			return
-		} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "begin_ensure_rejected", Reason: string(disposition), Retryable: true})
-			return
-		}
-	}
-	// The EffectControl scheduler is the sole owner of EnsureEffect RPCs. This
-	// DAG path only persists the durable ensure intent and yields; the
-	// scheduler's EnsureRetry control drives the RPC and completes the node.
-	if disp, err := r.registry.EnsureEnsureRetryControl(ctx, plan.ConfigID, effectID, identity.EffectIdentity.ReferenceID, plan.ID, plan.Generation, operation.Key); err != nil || disp != TransitionApplied && disp != TransitionDuplicate {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{
-			State: model.StepWaiting, Code: "ensure_control_pending", NextCheckAt: time.Now().Add(time.Second),
-		})
-		return
-	}
-	r.publishResult(ctx, plan, operation, attempt, model.StepResult{
-		State: model.StepWaiting, Code: "ensure_scheduled", NextCheckAt: time.Now().Add(time.Second),
-	})
-}
-
-func (r *Reconciler) executeEffectObserve(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {
-	effect, _, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
-	if !found || effect.ExternalJobID == "" {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_unbound", Reason: "no bound effect for observe", Retryable: true})
-		return
-	}
-	// The EffectControl scheduler is the sole owner of ObserveEffects RPCs.
-	// This DAG path only verifies that an Observe control exists and yields so
-	// the scheduler can drive the poll. If the control is missing, enqueue a
-	// control so the scheduler picks it up on the next due sweep.
-	identity := TransitionIdentity{
-		EffectIdentity: r.effectIdentity(plan, operation, effect.ID),
-		AttemptID:      attempt.ID,
-		RequestID:      ControlRequestID("observe-" + string(newReferenceID(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey))),
-	}
-	if !r.registry.HasActiveEffectControl(plan.ConfigID, operation.EffectKey, EffectControlObserve) {
-		// Ensure an Observe control exists so the scheduler can drive polling.
-		if disp, err := r.registry.EnsureObserveControl(ctx, plan.ConfigID, effect.ID, identity.EffectIdentity.ReferenceID, plan.ID, plan.Generation, operation.Key); err != nil || disp != TransitionApplied {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{
-				State: model.StepWaiting, Code: "observe_control_pending",
-				NextCheckAt: time.Now().Add(time.Second),
-			})
-			return
-		}
-	}
-	r.publishResult(ctx, plan, operation, attempt, model.StepResult{
-		State:       model.StepWaiting,
-		Code:        "in_progress",
-		NextCheckAt: time.Now().Add(time.Second),
-	})
-}
-
-func (r *Reconciler) executeEffectRelease(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {
-	effect, ref, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
-	if operation.ReleaseTarget == model.ReleaseRetiredReference && operation.TargetReference != "" {
-		ref = EffectReference{ID: ReferenceID(operation.TargetReference), EffectKey: operation.EffectKey}
-		if lookedUp, ok := r.registry.LookupReference(plan.ConfigID, ReferenceID(operation.TargetReference)); ok {
-			ref = lookedUp
-			if eff, ok := r.registry.LookupEffect(plan.ConfigID, ref.EffectID); ok {
-				effect = eff
-				found = true
-			}
-		}
-	}
-	if !found {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "release_missing", Reason: "no effect binding for release", Retryable: true})
-		return
-	}
-	identity := TransitionIdentity{
-		EffectIdentity: r.effectIdentity(plan, operation, effect.ID),
-		AttemptID:      attempt.ID,
-		RequestID:      ControlRequestID("release-" + string(ref.ID)),
-	}
-	identity.EffectIdentity.ReferenceID = ref.ID
-	if disposition, err := r.registry.BeginReleaseEffect(ctx, BeginReleaseRequest{Identity: identity}); err != nil {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "begin_release_failed", Reason: err.Error(), Retryable: true})
-		return
-	} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "begin_release_rejected", Reason: string(disposition), Retryable: true})
-		return
-	}
-	// The EffectControl scheduler is the sole owner of ReleaseEffect RPCs.
-	// This DAG path marks the release intent (via BeginReleaseEffect) and
-	// yields so the scheduler can drive the release.
-	r.publishResult(ctx, plan, operation, attempt, model.StepResult{
-		State: model.StepWaiting, Code: "release_scheduled", NextCheckAt: time.Now().Add(time.Second),
-	})
 }
 
 func (r *Reconciler) publishResult(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, result model.StepResult) {
