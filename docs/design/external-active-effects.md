@@ -598,6 +598,35 @@ Not blockers for the in-memory vertical slice:
 - production SQL schema/transaction and outbox leases;
 - provider-version retention duration;
 - terminal effect/reference/control compaction policy;
+### 15.9 Plan-bound vs Maintenance control shape
+
+Every EffectControl is one of two kinds, distinguished explicitly (not by empty
+fields):
+
+- **Plan-bound**: drives a plan DAG node (ensure, observe, release,
+  ensure-reference). It MUST carry complete NodeIdentity (PlanID, Generation,
+  OperationKey) and its terminal bundle MUST advance the node.
+- **Maintenance**: runs after plan/plan-node lifecycle, e.g. a release or
+  cancellation control created during deletion. It MAY carry empty NodeIdentity
+  and its terminal outcome only updates Effect/Reference/Control state, never a
+  DAG node.
+
+Validators enforce the shape by kind: a Plan-bound control with partial
+NodeIdentity, or a Maintenance control carrying a dangling NodeIdentity, is
+rejected. The current `TargetKind` may be inferred from NodeIdentity presence
+but should become an explicit field before production.
+
+### 15.10 ExternalRevision semantics
+
+`ExternalRevision` is advanced ONLY by the external service through an
+authoritative observation or Ensure result. Core MUST NOT synthesize an
+external revision to satisfy a transition validator.
+
+Core-local knowledge state (Effect `Active` / `Unknown`, `ResolutionRequired`)
+is orthogonal to the external revision and may change while `ExternalRevision`
+is unchanged. Such transitions use the `EffectTransitionCoreResolution` origin,
+which forbids changing `ExternalRevision`.
+
 - administrator override authorization/audit API;
 - real service transport, auth, and worker fencing.
 
