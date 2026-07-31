@@ -260,6 +260,9 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 	if state == nil || state.active == nil {
 		return TransitionRejected, errors.New("config not found")
 	}
+	if disp := verifyControlNodeIdentity(identity, state.active); disp != TransitionApplied {
+		return disp, nil
+	}
 	effect := state.effects[identity.EffectIdentity.EffectID]
 	if effect.ID == "" {
 		return TransitionStale, nil
@@ -596,6 +599,9 @@ func (r *PlanRegistry) CompleteEffectObservationAndNode(
 		return TransitionRejected, errors.New("config not found")
 	}
 
+	if disp := verifyControlNodeIdentity(identity, state.active); disp != TransitionApplied {
+		return disp, nil
+	}
 	// --- Validate the observation against the InFlight control ---
 	control := state.controls[identity.RequestID]
 	if control.ID == "" || control.State != EffectControlInFlight {
@@ -1092,6 +1098,9 @@ func (r *PlanRegistry) CompleteReleaseAndNode(
 	if state == nil || state.active == nil {
 		return TransitionRejected, errors.New("config not found")
 	}
+	if disp := verifyControlNodeIdentity(identity, state.active); disp != TransitionApplied {
+		return disp, nil
+	}
 	reference := state.references[identity.EffectIdentity.ReferenceID]
 	if reference.ID == "" {
 		return TransitionStale, nil
@@ -1320,6 +1329,9 @@ func (r *PlanRegistry) CompleteEnsureReferenceAndNode(
 	state := cloneConfigExecution(current)
 	if state == nil || state.active == nil {
 		return TransitionRejected, errors.New("config not found")
+	}
+	if disp := verifyControlNodeIdentity(identity, state.active); disp != TransitionApplied {
+		return disp, nil
 	}
 	reference := state.references[identity.EffectIdentity.ReferenceID]
 	if reference.ID == "" {

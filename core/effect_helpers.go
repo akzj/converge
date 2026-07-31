@@ -9,6 +9,22 @@ import (
 	"github.com/akzj/converge/pkg/model"
 )
 
+// verifyControlNodeIdentity returns TransitionStale if the control's NodeIdentity
+// does not match the active plan, preventing cross-generation advancement by a
+// stale control. Callers invoke it before mutating any state.
+func verifyControlNodeIdentity(identity TransitionIdentity, active *model.Plan) TransitionDisposition {
+	if active == nil {
+		return TransitionRejected
+	}
+	if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != active.ID {
+		return TransitionStale
+	}
+	if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != active.Generation {
+		return TransitionStale
+	}
+	return TransitionApplied
+}
+
 // retireControlAttemptLocked moves a claimed control-poll Attempt from the
 // active attempts map to retired with the given terminal status. Caller holds
 // the registry write lock.
