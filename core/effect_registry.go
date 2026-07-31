@@ -236,6 +236,130 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 	return TransitionApplied, nil
 }
 
+// CompleteEnsureAndNode atomically applies an EnsureBound result, marks the
+// ensure node terminal, and enqueues the lifecycle outbox event in a single
+// execution Revision CAS. It closes the crash window where the effect is Bound
+// but the ensure node has not advanced.
+func (r *PlanRegistry) CompleteEnsureAndNode(
+	ctx context.Context,
+	identity TransitionIdentity,
+	result EnsureEffectResult,
+	nodeKey model.OperationKey,
+	event model.Event,
+) (TransitionDisposition, error) {
+	if err := ValidateEnsureDispositionFailure(result.Disposition, result.Failure); err != nil {
+		return TransitionRejected, err
+	}
+	if result.Disposition != EnsureBound {
+		return TransitionRejected, errors.Errorf("unsupported terminal ensure disposition %q", result.Disposition)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[identity.EffectIdentity.ConfigID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil || state.active == nil {
+		return TransitionRejected, errors.New("config not found")
+	}
+	effect := state.effects[identity.EffectIdentity.EffectID]
+	if effect.ID == "" {
+		return TransitionStale, nil
+	}
+	if result.EffectID != "" && result.EffectID != effect.ID {
+		return TransitionRejected, errors.New("ensure result effect id mismatch")
+	}
+	if effect.Binding == EffectBindingBound {
+		if effect.ExternalJobID == result.ExternalJobID {
+			return TransitionDuplicate, nil
+		}
+		return TransitionRejected, errors.New("effect already bound")
+	}
+	switch effect.State {
+	case ExternalEffectEnsuring, ExternalEffectUnknown, ExternalEffectCancelRequested:
+	default:
+		return TransitionDuplicate, nil
+	}
+
+	oldEffect := effect
+	effect.Binding = EffectBindingBound
+	effect.ExternalJobID = result.ExternalJobID
+	effect.ExternalRevision = result.ExternalRevision
+	effect.ResolutionRequired = true
+	if oldEffect.State == ExternalEffectCancelRequested {
+		effect.State = ExternalEffectCancelRequested
+	} else {
+		effect.State = ExternalEffectActive
+	}
+	if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionEnsureResult); err != nil {
+		return TransitionRejected, err
+	}
+	state.effects[effect.ID] = effect
+
+	reference := state.references[identity.EffectIdentity.ReferenceID]
+	if reference.ID != "" {
+		oldReference := reference
+		if reference.State != EffectReferenceActive {
+			reference.State = EffectReferenceActive
+			if err := ValidateReferenceTransition(oldReference, reference); err != nil {
+				return TransitionRejected, err
+			}
+		}
+		state.references[reference.ID] = reference
+	}
+
+	// Create the Observe control so the scheduler can drive polling.
+	observeControl := EffectControl{
+		ID:       ControlRequestID("observe-" + string(effect.ID)),
+		ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
+		ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
+		State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
+		PlanID: state.active.ID, Generation: state.active.Generation,
+		OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve),
+		NextCheckAt:  time.Now(),
+	}
+	delete(state.controls, identity.RequestID)
+	state.controls[observeControl.ID] = observeControl
+
+	// --- Verify NodeIdentity matches the active plan, preventing
+	// cross-generation advancement by a stale control. ---
+	if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != state.active.ID {
+		return TransitionStale, nil
+	}
+	if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != state.active.Generation {
+		return TransitionStale, nil
+	}
+
+	// --- Mark the plan node terminal and retire the control attempt ---
+	node := state.active.Nodes[nodeKey]
+	if node == nil {
+		return TransitionRejected, errors.Errorf("operation %q not found", nodeKey)
+	}
+	if node.Status != model.NodeCompleted {
+		attempt := &model.Attempt{
+			ID: identity.AttemptID, PlanID: state.active.ID, Generation: state.active.Generation,
+			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
+			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
+			Status: model.AttemptCompleted,
+		}
+		node.Status = model.NodeCompleted
+		node.AttemptID = identity.AttemptID
+		state.retired[identity.AttemptID] = attempt
+		delete(state.attempts, identity.AttemptID)
+	}
+
+	// --- Enqueue the lifecycle outbox event in the same CAS ---
+	if event.EventID == "" {
+		return TransitionRejected, errors.New("outbox event ID is empty")
+	}
+	state.outbox[event.EventID] = event
+
+	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+		return TransitionRejected, err
+	}
+	r.configs[identity.EffectIdentity.ConfigID.Name] = state
+	return TransitionApplied, nil
+}
+
+
 // ClaimDueControl atomically transitions a Pending/Yielded control to InFlight
 // with the given AttemptID, PollRequestID, and lease expiration, and creates a
 // complete Attempt record so control polls share the global attempt history.
@@ -580,6 +704,15 @@ func (r *PlanRegistry) CompleteEffectObservationAndNode(
 
 	default:
 		return TransitionRejected, errors.Errorf("unsupported terminal observation disposition %q", observation.Disposition)
+	}
+
+// --- Verify NodeIdentity matches the active plan, preventing
+	// cross-generation advancement by a stale control. ---
+	if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != state.active.ID {
+		return TransitionStale, nil
+	}
+	if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != state.active.Generation {
+		return TransitionStale, nil
 	}
 
 	// --- Mark the plan node terminal and retire the control attempt ---
@@ -1013,7 +1146,14 @@ func (r *PlanRegistry) CompleteReleaseAndNode(
 				EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
 			}
 		}
+// --- Verify NodeIdentity matches the active plan, preventing
+	// cross-generation advancement by a stale control. ---
+	if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != state.active.ID {
+		return TransitionStale, nil
 	}
+	if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != state.active.Generation {
+		return TransitionStale, nil
+	}	}
 
 	// --- Mark the plan node terminal and retire the control attempt ---
 	node := state.active.Nodes[nodeKey]
@@ -1234,7 +1374,14 @@ func (r *PlanRegistry) CompleteEnsureReferenceAndNode(
 		}
 	}
 
-	// --- Mark the plan node terminal and retire the control attempt ---
+// --- Verify NodeIdentity matches the active plan, preventing
+	// cross-generation advancement by a stale control. ---
+	if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != state.active.ID {
+		return TransitionStale, nil
+	}
+	if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != state.active.Generation {
+		return TransitionStale, nil
+	}	// --- Mark the plan node terminal and retire the control attempt ---
 	node := state.active.Nodes[nodeKey]
 	if node == nil {
 		return TransitionRejected, errors.Errorf("operation %q not found", nodeKey)

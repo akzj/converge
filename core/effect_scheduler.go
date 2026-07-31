@@ -53,7 +53,8 @@ func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef
 	identity := TransitionIdentity{
 		EffectIdentity: EffectIdentity{
 			EffectID: effect.ID, ReferenceID: reference.ID,
-			ConfigID: reference.ConfigID, PlanID: reference.PlanID, Generation: reference.Generation,
+			ConfigID: reference.ConfigID,
+			PlanID:   control.PlanID, Generation: control.Generation,
 			OperationKey: control.OperationKey,
 			EffectKey:    reference.EffectKey, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		},
@@ -146,12 +147,16 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 			_, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
 			return err
 		}
+		stepState := model.StepCompleted
+		if obs.Observation.Disposition == DispositionFailed {
+			stepState = model.StepFailed
+		}
 		event := model.Event{
 			EventID: string(identity.AttemptID) + "/control-result",
 			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
 			NodeKey: nodeKey,
 			AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
-			State: model.StepCompleted, Result: model.StepResult{State: model.StepCompleted},
+			State: stepState, Result: model.StepResult{State: stepState},
 		}
 		disposition, err := r.registry.CompleteEffectObservationAndNode(ctx, identity, *obs.Observation, nodeKey, event)
 		if err != nil {
@@ -193,15 +198,37 @@ func (r *Reconciler) runEnsureRetryControl(ctx context.Context, provider EffectP
 	}
 	switch result.Disposition {
 	case EnsureBound:
-		disp, err := r.registry.ApplyEnsureResult(ctx, identity, result)
+		// Single CAS: apply the ensure, complete the ensure node, enqueue the
+		// lifecycle event atomically. The node is the control's NodeIdentity.
+		nodeKey := identity.EffectIdentity.OperationKey
+		if nodeKey == "" || identity.EffectIdentity.PlanID == "" {
+			// No DAG node to advance; apply the ensure alone.
+			_, err := r.registry.ApplyEnsureResult(ctx, identity, result)
+			return err
+		}
+		event := model.Event{
+			EventID: string(identity.AttemptID) + "/control-result",
+			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
+			NodeKey: nodeKey,
+			AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
+			State: model.StepCompleted, Result: model.StepResult{State: model.StepCompleted},
+		}
+		disp, err := r.registry.CompleteEnsureAndNode(ctx, identity, result, nodeKey, event)
 		if err != nil {
 			return err
 		}
 		if disp == TransitionApplied || disp == TransitionDuplicate {
-			// Complete the ensure node (identified by the control's durable
-			// NodeIdentity) so observe dependencies can proceed. This retires
-			// the control-claim attempt in the same completion CAS.
-			r.publishControlNodeCompletion(ctx, identity, model.StepCompleted)
+			r.wakeOutbox()
+			snapshot := r.registry.Snapshot(identity.EffectIdentity.ConfigID)
+			if snapshot.Plan != nil && planCompleted(snapshot.Plan) {
+				r.mu.RLock()
+				provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]
+				r.mu.RUnlock()
+				if provider != nil {
+					r.verifyAndRecord(ctx, snapshot.Plan, provider)
+				}
+			}
+			r.executeReady(ctx)
 		}
 		return nil
 	case EnsureUnknown:
