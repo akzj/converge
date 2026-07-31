@@ -8,6 +8,10 @@ const (
 	EffectTransitionCoreIntent          EffectTransitionOrigin = "core_intent"
 	EffectTransitionEnsureResult        EffectTransitionOrigin = "ensure_result"
 	EffectTransitionExternalObservation EffectTransitionOrigin = "external_observation"
+	// EffectTransitionCoreResolution marks a Core-local resolution state change
+	// (e.g. Active -> Unknown after a transport error). It must not advance the
+	// external revision, which only the external service may do.
+	EffectTransitionCoreResolution EffectTransitionOrigin = "core_resolution"
 )
 
 // ValidateEffectTransition rejects state regression, identity mutation, binding
@@ -59,6 +63,13 @@ func ValidateEffectTransition(oldEffect, next ActiveEffect, origin EffectTransit
 		}
 		if next.State != ExternalEffectCancelRequested {
 			return errors.New("unsupported core intent transition")
+		}
+	case EffectTransitionCoreResolution:
+		if next.ExternalRevision != oldEffect.ExternalRevision {
+			return errors.New("core resolution cannot change external revision")
+		}
+		if next.State != ExternalEffectUnknown && oldEffect.State != ExternalEffectUnknown {
+			return errors.New("core resolution must enter or leave Unknown")
 		}
 	default:
 		return errors.Errorf("unknown transition origin %q", origin)

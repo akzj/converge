@@ -163,6 +163,16 @@ func (r *PlanRegistry) Restore(ctx context.Context) error {
 			state.references[reference.ID] = reference
 		}
 		for _, control := range snapshot.EffectControls {
+			if control.State == EffectControlInFlight {
+				// Reclaim on restore: the owning process is gone. Reset to
+				// Pending so the next scheduler sweep re-claims with a fresh
+				// attempt; the prior attempt was already retired as Unknown.
+				control.State = EffectControlPending
+				control.InFlightAttemptID = ""
+				control.PollRequestID = ""
+				control.LeaseExpiresAt = time.Time{}
+				control.RetryCount++
+			}
 			state.controls[control.ID] = control
 		}
 		r.configs[id.Name] = state

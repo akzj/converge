@@ -128,13 +128,37 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 		_, err = r.registry.YieldControl(ctx, identity, time.Now().Add(10*time.Second))
 		return err
 	case DispositionAuthoritativeGone:
-		// Service authoritatively confirmed the job is gone.
-		disposition, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
+		// Service authoritatively confirmed the job is gone. Use the same
+		// single-CAS terminal path as Completed/Cancelled/Failed so the node
+		// completion and outbox event are atomic with the effect removal.
+		stepState := model.StepCompleted
+		event := model.Event{
+			EventID: string(identity.AttemptID) + "/control-result",
+			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
+			NodeKey: identity.EffectIdentity.OperationKey,
+			AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
+			State: stepState, Result: model.StepResult{State: stepState},
+		}
+		if identity.EffectIdentity.OperationKey == "" || identity.EffectIdentity.PlanID == "" {
+			_, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
+			return err
+		}
+		disposition, err := r.registry.CompleteEffectObservationAndNode(ctx, identity, *obs.Observation, identity.EffectIdentity.OperationKey, event)
 		if err != nil {
 			return err
 		}
 		if disposition == TransitionApplied || disposition == TransitionDuplicate {
-			r.publishControlNodeCompletion(ctx, identity, model.StepCompleted)
+			r.wakeOutbox()
+			snapshot := r.registry.Snapshot(identity.EffectIdentity.ConfigID)
+			if snapshot.Plan != nil && planCompleted(snapshot.Plan) {
+				r.mu.RLock()
+				provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]
+				r.mu.RUnlock()
+				if provider != nil {
+					r.verifyAndRecord(ctx, snapshot.Plan, provider)
+				}
+			}
+			r.executeReady(ctx)
 		}
 		return nil
 	case DispositionCompleted, DispositionCancelled, DispositionFailed:
@@ -341,36 +365,3 @@ func (r *Reconciler) runEnsureReferenceControl(ctx context.Context, provider Eff
 	return nil
 }
 
-func (r *Reconciler) publishControlNodeCompletion(ctx context.Context, identity TransitionIdentity, state model.StepState) {
-	// Use the control's durable NodeIdentity (PlanID/Generation/OperationKey)
-	// instead of reverse-looking-up the node by EffectKey.
-	if identity.EffectIdentity.OperationKey == "" || identity.EffectIdentity.PlanID == "" {
-		return
-	}
-	event := model.Event{
-		EventID: string(identity.AttemptID) + "/control-result",
-		PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
-		NodeKey: identity.EffectIdentity.OperationKey,
-		AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
-		State: state, Result: model.StepResult{State: state},
-	}
-	if err := r.registry.CompleteEffectOperation(ctx, identity, identity.EffectIdentity.OperationKey, state); err != nil {
-		zap.L().Warn("converge: complete effect operation from control", zap.Error(err))
-		return
-	}
-	if err := r.registry.EnqueueOutbox(ctx, event); err != nil {
-		zap.L().Warn("converge: enqueue control completion", zap.Error(err))
-		return
-	}
-	r.wakeOutbox()
-	snapshot := r.registry.Snapshot(identity.EffectIdentity.ConfigID)
-	if snapshot.Plan != nil && planCompleted(snapshot.Plan) {
-		r.mu.RLock()
-		provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]
-		r.mu.RUnlock()
-		if provider != nil {
-			r.verifyAndRecord(ctx, snapshot.Plan, provider)
-		}
-	}
-	r.executeReady(ctx)
-}

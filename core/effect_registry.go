@@ -1431,44 +1431,6 @@ func (r *PlanRegistry) LookupEffectAndReference(configID model.ConfigID, effectI
 	return effect, reference, true
 }
 
-// CompleteEffectOperation marks a plan effect node completed using a control attempt.
-func (r *PlanRegistry) CompleteEffectOperation(ctx context.Context, identity TransitionIdentity, key model.OperationKey, state model.StepState) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	current := r.configs[identity.EffectIdentity.ConfigID.Name]
-	exec := cloneConfigExecution(current)
-	if exec == nil || exec.active == nil {
-		return errors.New("config not found")
-	}
-	node := exec.active.Nodes[key]
-	if node == nil {
-		return errors.Errorf("operation %q not found", key)
-	}
-	if node.Status == model.NodeCompleted {
-		return nil
-	}
-	attemptID := identity.AttemptID
-	attempt := &model.Attempt{
-		ID: attemptID, PlanID: exec.active.ID, Generation: exec.active.Generation,
-		ConfigID: identity.EffectIdentity.ConfigID, NodeKey: key,
-		Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
-		Status: model.AttemptCompleted,
-	}
-	if state == model.StepFailed {
-		attempt.Status = model.AttemptFailed
-		node.Status = model.NodeFailed
-	} else {
-		node.Status = model.NodeCompleted
-	}
-	node.AttemptID = attemptID
-	exec.retired[attemptID] = attempt
-	delete(exec.attempts, attemptID)
-	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, exec.revision, exec); err != nil {
-		return err
-	}
-	r.configs[identity.EffectIdentity.ConfigID.Name] = exec
-	return nil
-}
 
 // HasActiveEffectControl reports whether a non-terminal control owns an effect slot.
 func (r *PlanRegistry) HasActiveEffectControl(configID model.ConfigID, effectKey string, kind EffectControlKind) bool {
@@ -1507,15 +1469,8 @@ func (r *PlanRegistry) MarkEffectUnknownBound(ctx context.Context, identity Tran
 	oldEffect := effect
 	effect.State = ExternalEffectUnknown
 	effect.ResolutionRequired = true
-	if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionExternalObservation); err != nil {
-		if oldEffect.ExternalRevision == effect.ExternalRevision && oldEffect.State != effect.State {
-			effect.ExternalRevision = oldEffect.ExternalRevision + 1
-			if err2 := ValidateEffectTransition(oldEffect, effect, EffectTransitionExternalObservation); err2 != nil {
-				return TransitionRejected, err2
-			}
-		} else {
-			return TransitionRejected, err
-		}
+	if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionCoreResolution); err != nil {
+		return TransitionRejected, err
 	}
 	state.effects[effect.ID] = effect
 	control := state.controls[identity.RequestID]
