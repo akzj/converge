@@ -933,6 +933,120 @@ func (r *PlanRegistry) ApplyReleaseResult(ctx context.Context, identity Transiti
 	return TransitionApplied, nil
 }
 
+// CompleteReleaseAndNode atomically applies a terminal release disposition,
+// marks the target plan node terminal, and enqueues the lifecycle outbox event
+// in a single execution Revision CAS. It closes the crash window where the
+// reference is Released but the release node has not advanced.
+func (r *PlanRegistry) CompleteReleaseAndNode(
+	ctx context.Context,
+	identity TransitionIdentity,
+	result ReleaseEffectResult,
+	nodeKey model.OperationKey,
+	event model.Event,
+) (TransitionDisposition, error) {
+	if err := ValidateReleaseDispositionFailure(result.Disposition, result.Failure); err != nil {
+		return TransitionRejected, err
+	}
+	switch result.Disposition {
+	case ReleaseStillReferenced, ReleaseConfirmed, ReleaseLastReferenceCancelRequested:
+	default:
+		return TransitionRejected, errors.Errorf("unsupported terminal release disposition %q", result.Disposition)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[identity.EffectIdentity.ConfigID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil || state.active == nil {
+		return TransitionRejected, errors.New("config not found")
+	}
+	reference := state.references[identity.EffectIdentity.ReferenceID]
+	if reference.ID == "" {
+		return TransitionStale, nil
+	}
+	effect := state.effects[identity.EffectIdentity.EffectID]
+	if effect.ID == "" {
+		return TransitionStale, nil
+	}
+	control := state.controls[identity.RequestID]
+	oldReference := reference
+	var oldControl EffectControl
+	hasControl := control.ID != ""
+	if hasControl {
+		oldControl = control
+	}
+
+	reference.State = EffectReferenceReleased
+	if err := ValidateReferenceTransition(oldReference, reference); err != nil {
+		return TransitionRejected, err
+	}
+	state.references[reference.ID] = reference
+
+	switch result.Disposition {
+	case ReleaseConfirmed:
+		effect.State = ExternalEffectCompleted
+		effect.ResolutionRequired = false
+	case ReleaseLastReferenceCancelRequested:
+		effect.State = ExternalEffectCancelling
+		effect.ResolutionRequired = true
+	}
+	state.effects[effect.ID] = effect
+
+	if hasControl {
+		control.State = EffectControlCompleted
+		control.InFlightAttemptID = ""
+		control.PollRequestID = ""
+		control.LeaseExpiresAt = time.Time{}
+		if oldControl.State == EffectControlInFlight {
+			if err := ValidateControlTransition(oldControl, control); err != nil {
+				return TransitionRejected, err
+			}
+		}
+		state.controls[control.ID] = control
+	}
+	if result.Disposition == ReleaseLastReferenceCancelRequested {
+		cancelControlID := ControlRequestID("observe-cancel-" + string(effect.ID))
+		if _, exists := state.controls[cancelControlID]; !exists {
+			state.controls[cancelControlID] = EffectControl{
+				ID: cancelControlID, ConfigID: identity.EffectIdentity.ConfigID,
+				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
+				Kind: EffectControlObserveCancellation, State: EffectControlPending,
+				EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
+			}
+		}
+	}
+
+	// --- Mark the plan node terminal and retire the control attempt ---
+	node := state.active.Nodes[nodeKey]
+	if node == nil {
+		return TransitionRejected, errors.Errorf("operation %q not found", nodeKey)
+	}
+	if node.Status != model.NodeCompleted {
+		attempt := &model.Attempt{
+			ID: identity.AttemptID, PlanID: state.active.ID, Generation: state.active.Generation,
+			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
+			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
+			Status: model.AttemptCompleted,
+		}
+		node.Status = model.NodeCompleted
+		node.AttemptID = identity.AttemptID
+		state.retired[identity.AttemptID] = attempt
+		delete(state.attempts, identity.AttemptID)
+	}
+
+	// --- Enqueue the lifecycle outbox event in the same CAS ---
+	if event.EventID == "" {
+		return TransitionRejected, errors.New("outbox event ID is empty")
+	}
+	state.outbox[event.EventID] = event
+
+	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+		return TransitionRejected, err
+	}
+	r.configs[identity.EffectIdentity.ConfigID.Name] = state
+	return TransitionApplied, nil
+}
+
+
 // BeginEnsureReference persists a new Ensuring reference against an already-bound effect.
 func (r *PlanRegistry) BeginEnsureReference(ctx context.Context, identity TransitionIdentity) (TransitionDisposition, error) {
 	r.mu.Lock()

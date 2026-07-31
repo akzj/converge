@@ -229,14 +229,45 @@ func (r *Reconciler) runReleaseControl(ctx context.Context, provider EffectProvi
 		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
 		return err
 	}
-	disposition, err := r.registry.ApplyReleaseResult(ctx, identity, result)
-	if err != nil {
+	switch result.Disposition {
+	case ReleaseStillReferenced, ReleaseConfirmed, ReleaseLastReferenceCancelRequested:
+		// Single CAS: apply the release, complete the release node, enqueue the
+		// lifecycle event atomically. The node is the control's NodeIdentity.
+		nodeKey := identity.EffectIdentity.OperationKey
+		if nodeKey == "" || identity.EffectIdentity.PlanID == "" {
+			// No DAG node to advance; apply the release alone.
+			_, err := r.registry.ApplyReleaseResult(ctx, identity, result)
+			return err
+		}
+		event := model.Event{
+			EventID: string(identity.AttemptID) + "/control-result",
+			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
+			NodeKey: nodeKey,
+			AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
+			State: model.StepCompleted, Result: model.StepResult{State: model.StepCompleted},
+		}
+		disposition, err := r.registry.CompleteReleaseAndNode(ctx, identity, result, nodeKey, event)
+		if err != nil {
+			return err
+		}
+		if disposition == TransitionApplied || disposition == TransitionDuplicate {
+			r.wakeOutbox()
+			snapshot := r.registry.Snapshot(identity.EffectIdentity.ConfigID)
+			if snapshot.Plan != nil && planCompleted(snapshot.Plan) {
+				r.mu.RLock()
+				provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]
+				r.mu.RUnlock()
+				if provider != nil {
+					r.verifyAndRecord(ctx, snapshot.Plan, provider)
+				}
+			}
+			r.executeReady(ctx)
+		}
+		return nil
+	default:
+		_, err := r.registry.ApplyReleaseResult(ctx, identity, result)
 		return err
 	}
-	if disposition == TransitionApplied || disposition == TransitionDuplicate {
-		r.publishControlNodeCompletion(ctx, identity, model.StepCompleted)
-	}
-	return nil
 }
 
 func (r *Reconciler) runEnsureReferenceControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect) error {
