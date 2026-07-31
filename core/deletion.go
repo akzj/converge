@@ -74,6 +74,7 @@ func (r *PlanRegistry) MarkDeleting(ctx context.Context, configID model.ConfigID
 			ID: releaseID, ConfigID: configID,
 			ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 			Kind: EffectControlRelease, State: EffectControlPending,
+			TargetKind: EffectTargetMaintenance,
 			EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
 		}
 	}

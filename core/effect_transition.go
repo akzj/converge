@@ -138,12 +138,20 @@ func ValidateReferenceTransition(oldReference, next EffectReference) error {
 }
 
 func validateControlShape(control EffectControl) error {
-	// NodeIdentity: an OperationKey is meaningless without a PlanID to scope it
-	// to, so reject that combination. Empty NodeIdentity is allowed for
-	// maintenance controls that do not advance a DAG node (e.g., deletion
-	// releases) and for isolated registry tests.
-	if control.OperationKey != "" && control.PlanID == "" {
-		return errors.New("control has operation key without plan identity")
+	// NodeIdentity shape is governed by TargetKind when set. The critical safety
+	// property is that Maintenance controls never carry a dangling OperationKey
+	// (they must not advance a DAG node). PlanNode controls with partial
+	// NodeIdentity are tolerated: the terminal commands degrade to effect-only
+	// apply when OperationKey is empty, which is safe.
+	switch control.TargetKind {
+	case EffectTargetMaintenance:
+		if control.OperationKey != "" {
+			return errors.New("maintenance control carries a dangling node key")
+		}
+	default:
+		if control.OperationKey != "" && control.PlanID == "" {
+			return errors.New("control has operation key without plan identity")
+		}
 	}
 	if control.State == EffectControlInFlight {
 		if control.InFlightAttemptID == "" || control.PollRequestID == "" || control.LeaseExpiresAt.IsZero() {

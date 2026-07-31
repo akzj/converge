@@ -51,6 +51,17 @@ const (
 	EffectControlObserveCancellation EffectControlKind = "observe_cancellation"
 )
 
+// EffectTargetKind distinguishes controls that drive a plan DAG node
+// (PlanNode) from maintenance controls that outlive plan-node lifecycle
+// (Maintenance, e.g. deletion releases). PlanNode controls MUST carry complete
+// NodeIdentity; Maintenance controls MUST NOT carry a dangling NodeIdentity.
+type EffectTargetKind string
+
+const (
+	EffectTargetPlanNode    EffectTargetKind = "plan_node"
+	EffectTargetMaintenance EffectTargetKind = "maintenance"
+)
+
 type EffectControlState string
 
 const (
@@ -94,6 +105,7 @@ type EffectControl struct {
 	ProviderType      string             `json:"provider_type"`
 	ProviderDigest    string             `json:"provider_digest"`
 	Kind              EffectControlKind  `json:"kind"`
+	TargetKind        EffectTargetKind   `json:"target_kind,omitempty"`
 	State             EffectControlState `json:"state"`
 	EffectID          EffectID           `json:"effect_id"`
 	ReferenceID       ReferenceID        `json:"reference_id"`

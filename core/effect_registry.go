@@ -73,6 +73,7 @@ func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureReq
 		ID: req.Identity.RequestID, ConfigID: req.Identity.EffectIdentity.ConfigID,
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlEnsureRetry, State: EffectControlPending,
+		TargetKind: EffectTargetPlanNode,
 		EffectID: req.Identity.EffectIdentity.EffectID, ReferenceID: req.Identity.EffectIdentity.ReferenceID,
 		PlanID: req.Identity.EffectIdentity.PlanID, Generation: req.Identity.EffectIdentity.Generation,
 		OperationKey: req.Identity.EffectIdentity.OperationKey,
@@ -165,6 +166,7 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 						ID: releaseID, ConfigID: identity.EffectIdentity.ConfigID,
 						ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 						Kind: EffectControlRelease, State: EffectControlPending,
+						TargetKind: EffectTargetPlanNode,
 						EffectID: effect.ID, ReferenceID: reference.ID,
 						PlanID: identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
 						OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectRelease),
@@ -186,6 +188,7 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 				ID:       ControlRequestID("observe-" + string(identity.EffectIdentity.ReferenceID)),
 				ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
 				ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
+				TargetKind: EffectTargetPlanNode,
 				State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
 				PlanID: identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
 				OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve),
@@ -314,6 +317,7 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 		ID:       ControlRequestID("observe-" + string(identity.EffectIdentity.ReferenceID)),
 		ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
 		ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
+		TargetKind: EffectTargetPlanNode,
 		State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
 		PlanID: state.active.ID, Generation: state.active.Generation,
 		OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve),
@@ -955,6 +959,7 @@ func (r *PlanRegistry) BeginReleaseEffect(ctx context.Context, req BeginReleaseR
 			ID: controlID, ConfigID: reference.ConfigID,
 			ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 			Kind: EffectControlRelease, State: EffectControlPending,
+			TargetKind: EffectTargetPlanNode,
 			EffectID: effect.ID, ReferenceID: reference.ID,
 			PlanID: req.Identity.EffectIdentity.PlanID, Generation: req.Identity.EffectIdentity.Generation,
 			OperationKey: req.Identity.EffectIdentity.OperationKey,
@@ -1024,6 +1029,7 @@ func (r *PlanRegistry) ApplyReleaseResult(ctx context.Context, identity Transiti
 				ID: cancelControlID, ConfigID: identity.EffectIdentity.ConfigID,
 				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 				Kind: EffectControlObserveCancellation, State: EffectControlPending,
+				TargetKind: EffectTargetMaintenance,
 				EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
 			}
 		}
@@ -1152,6 +1158,7 @@ func (r *PlanRegistry) CompleteReleaseAndNode(
 				ID: cancelControlID, ConfigID: identity.EffectIdentity.ConfigID,
 				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 				Kind: EffectControlObserveCancellation, State: EffectControlPending,
+				TargetKind: EffectTargetMaintenance,
 				EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
 			}
 		}
@@ -1227,6 +1234,7 @@ func (r *PlanRegistry) BeginEnsureReference(ctx context.Context, identity Transi
 		ID: controlID, ConfigID: reference.ConfigID,
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlEnsureReference, State: EffectControlPending,
+		TargetKind: EffectTargetPlanNode,
 		EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
 	}
 	if err := r.persistLocked(ctx, reference.ConfigID, state.revision, state); err != nil {
@@ -1296,6 +1304,7 @@ func (r *PlanRegistry) ApplyEnsureReferenceResult(ctx context.Context, identity 
 				ID: releaseID, ConfigID: old.ConfigID,
 				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 				Kind: EffectControlRelease, State: EffectControlPending,
+				TargetKind: EffectTargetMaintenance,
 				EffectID: old.EffectID, ReferenceID: old.ID, NextCheckAt: time.Now(),
 			}
 		}
@@ -1381,6 +1390,7 @@ func (r *PlanRegistry) CompleteEnsureReferenceAndNode(
 				ID: releaseID, ConfigID: old.ConfigID,
 				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 				Kind: EffectControlRelease, State: EffectControlPending,
+				TargetKind: EffectTargetMaintenance,
 				EffectID: old.EffectID, ReferenceID: old.ID, NextCheckAt: time.Now(),
 			}
 		}
@@ -1584,6 +1594,7 @@ func (r *PlanRegistry) EnsureEnsureRetryControl(ctx context.Context, configID mo
 		ID: ctrlID, ConfigID: configID,
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlEnsureRetry, State: EffectControlPending,
+		TargetKind: EffectTargetPlanNode,
 		EffectID: effect.ID, ReferenceID: referenceID,
 		PlanID: planID, Generation: generation, OperationKey: opKey,
 		NextCheckAt: time.Now(),
@@ -1637,6 +1648,7 @@ func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.
 		ID: ctrlID, ConfigID: configID,
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlObserve, State: EffectControlPending,
+		TargetKind: EffectTargetPlanNode,
 		EffectID: effect.ID, ReferenceID: referenceID,
 		PlanID: planID, Generation: generation, OperationKey: opKey,
 		NextCheckAt: time.Now(),
