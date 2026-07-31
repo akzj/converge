@@ -539,7 +539,7 @@ func terminalAttemptStatus(state model.StepState) (model.AttemptStatus, model.No
 }
 
 func isTerminalAttempt(status model.AttemptStatus) bool {
-	return status == model.AttemptCompleted || status == model.AttemptFailed || status == model.AttemptCancelled
+	return status == model.AttemptCompleted || status == model.AttemptFailed || status == model.AttemptCancelled || status == model.AttemptYielded
 }
 
 // ReadyOperations returns dependency-ready nodes not blocked by retired

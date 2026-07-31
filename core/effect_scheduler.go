@@ -192,8 +192,27 @@ func (r *Reconciler) runEnsureRetryControl(ctx context.Context, provider EffectP
 		return err
 	}
 	switch result.Disposition {
-	case EnsureBound, EnsureUnknown, EnsureFailed:
-		_, err = r.registry.ApplyEnsureResult(ctx, identity, result)
+	case EnsureBound:
+		disp, err := r.registry.ApplyEnsureResult(ctx, identity, result)
+		if err != nil {
+			return err
+		}
+		if disp == TransitionApplied || disp == TransitionDuplicate {
+			// Complete the ensure node (identified by the control's durable
+			// NodeIdentity) so observe dependencies can proceed. This retires
+			// the control-claim attempt in the same completion CAS.
+			r.publishControlNodeCompletion(ctx, identity, model.StepCompleted)
+		}
+		return nil
+	case EnsureUnknown:
+		_, err := r.registry.ApplyEnsureResult(ctx, identity, result)
+		// The control returns to Pending for retry with a fresh AttemptID;
+		// retire this claim's attempt as yielded so it does not leak.
+		_, _ = r.registry.RetireControlAttempt(ctx, identity, model.AttemptYielded)
+		return err
+	case EnsureFailed:
+		_, err := r.registry.ApplyEnsureResult(ctx, identity, result)
+		_, _ = r.registry.RetireControlAttempt(ctx, identity, model.AttemptFailed)
 		return err
 	default:
 		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))

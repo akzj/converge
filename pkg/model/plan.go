@@ -28,6 +28,9 @@ const (
 	AttemptFailed     AttemptStatus = "failed"
 	AttemptCancelled  AttemptStatus = "cancelled"
 	AttemptUnknown    AttemptStatus = "unknown"
+	// AttemptYielded marks a control poll attempt that returned control to the
+	// scheduler (non-terminal for the effect, terminal for that short Attempt).
+	AttemptYielded AttemptStatus = "yielded"
 )
 
 // Attempt tracks one actual provider execution independently from plan nodes.

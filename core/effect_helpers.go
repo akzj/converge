@@ -4,9 +4,25 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/akzj/converge/pkg/model"
 )
+
+// retireControlAttemptLocked moves a claimed control-poll Attempt from the
+// active attempts map to retired with the given terminal status. Caller holds
+// the registry write lock.
+func retireControlAttemptLocked(state *configExecution, attemptID model.AttemptID, status model.AttemptStatus) {
+	if attemptID == "" {
+		return
+	}
+	if attempt, ok := state.attempts[attemptID]; ok {
+		attempt.Status = status
+		attempt.UpdatedAt = time.Now()
+		state.retired[attemptID] = attempt
+		delete(state.attempts, attemptID)
+	}
+}
 
 func newEffectID() (EffectID, error) {
 	var value [16]byte

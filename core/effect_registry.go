@@ -237,7 +237,8 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 }
 
 // ClaimDueControl atomically transitions a Pending/Yielded control to InFlight
-// with the given AttemptID, PollRequestID, and lease expiration.
+// with the given AttemptID, PollRequestID, and lease expiration, and creates a
+// complete Attempt record so control polls share the global attempt history.
 func (r *PlanRegistry) ClaimDueControl(ctx context.Context, configID model.ConfigID, controlID ControlRequestID, now time.Time, attemptID model.AttemptID, pollID PollRequestID, leaseUntil time.Time) (*EffectControl, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -263,6 +264,22 @@ func (r *PlanRegistry) ClaimDueControl(ctx context.Context, configID model.Confi
 	control.LeaseExpiresAt = leaseUntil
 	if err := ValidateControlTransition(oldControl, control); err != nil {
 		return nil, err
+	}
+	// Create a complete Attempt record for the poll so it appears in the global
+	// attempt history with the same identity semantics as DAG attempts.
+	var fingerprint, conflictKey string
+	if control.OperationKey != "" && state.active != nil {
+		if node := state.active.Nodes[control.OperationKey]; node != nil {
+			fingerprint, conflictKey = node.Operation.Fingerprint, node.Operation.ConflictKey
+		}
+	}
+	if _, exists := state.attempts[attemptID]; !exists {
+		state.attempts[attemptID] = &model.Attempt{
+			ID: attemptID, PlanID: control.PlanID, Generation: control.Generation,
+			ConfigID: control.ConfigID, NodeKey: control.OperationKey,
+			Fingerprint: fingerprint, ConflictKey: conflictKey,
+			Status: model.AttemptRunning, StartedAt: now, UpdatedAt: now,
+		}
 	}
 	state.controls[control.ID] = control
 	if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
@@ -417,6 +434,17 @@ func (r *PlanRegistry) ApplyEffectObservation(ctx context.Context, identity Tran
 
 	default:
 		return TransitionRejected, errors.Errorf("unhandled observation disposition %q", observation.Disposition)
+	}
+	// Retire the poll attempt: yield for StillActive, complete/fail for
+	// terminal dispositions.
+	if observation.Disposition != DispositionStillActive {
+		status := model.AttemptCompleted
+		if observation.Disposition == DispositionFailed || observation.Disposition == DispositionAuthoritativeGone {
+			status = model.AttemptFailed
+		}
+		retireControlAttemptLocked(state, identity.AttemptID, status)
+	} else {
+		retireControlAttemptLocked(state, identity.AttemptID, model.AttemptYielded)
 	}
 	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
 		return TransitionRejected, err
@@ -611,6 +639,9 @@ func (r *PlanRegistry) YieldControl(ctx context.Context, identity TransitionIden
 	control.PollRequestID = ""
 	control.LeaseExpiresAt = time.Time{}
 	state.controls[control.ID] = control
+	// Retire the poll attempt as yielded: terminal for the short Attempt,
+	// non-terminal for the effect.
+	retireControlAttemptLocked(state, identity.AttemptID, model.AttemptYielded)
 	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
 		return TransitionRejected, err
 	}
@@ -691,6 +722,7 @@ func (r *PlanRegistry) ReclaimExpiredControls(ctx context.Context, now time.Time
 		for _, id := range expired {
 			control := state.controls[id]
 			oldControl := control
+			retireControlAttemptLocked(state, control.InFlightAttemptID, model.AttemptUnknown)
 			control.State = EffectControlPending
 			control.InFlightAttemptID = ""
 			control.PollRequestID = ""
@@ -730,6 +762,7 @@ func (r *PlanRegistry) ReclaimExpiredControl(ctx context.Context, configID model
 		return TransitionRejected, errors.New("control lease not expired")
 	}
 	oldControl := control
+	retireControlAttemptLocked(state, control.InFlightAttemptID, model.AttemptUnknown)
 	control.State = EffectControlPending
 	control.InFlightAttemptID = ""
 	control.PollRequestID = ""
@@ -881,6 +914,18 @@ func (r *PlanRegistry) ApplyReleaseResult(ctx context.Context, identity Transiti
 			state.controls[control.ID] = control
 		}
 	}
+	// Retire the control-poll attempt: terminal release dispositions complete,
+	// unknown/transient yield for retry.
+	switch result.Disposition {
+	case ReleaseUnknown:
+		retireControlAttemptLocked(state, identity.AttemptID, model.AttemptYielded)
+	default:
+		if result.Failure == ReleaseFailurePermanent {
+			retireControlAttemptLocked(state, identity.AttemptID, model.AttemptFailed)
+		} else {
+			retireControlAttemptLocked(state, identity.AttemptID, model.AttemptCompleted)
+		}
+	}
 	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
 		return TransitionRejected, err
 	}
@@ -992,6 +1037,7 @@ func (r *PlanRegistry) ApplyEnsureReferenceResult(ctx context.Context, identity 
 			}
 		}
 	}
+	retireControlAttemptLocked(state, identity.AttemptID, model.AttemptCompleted)
 	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
 		return TransitionRejected, err
 	}
@@ -1123,6 +1169,7 @@ func (r *PlanRegistry) MarkEffectUnknownBound(ctx context.Context, identity Tran
 		}
 		state.controls[control.ID] = control
 	}
+	retireControlAttemptLocked(state, identity.AttemptID, model.AttemptYielded)
 	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
 		return TransitionRejected, err
 	}
@@ -1179,6 +1226,27 @@ var _ RegistryCommands = (*PlanRegistry)(nil)
 // EnsureObserveControl creates an Observe control for a bound effect if one does
 // not already exist. It is called by the DAG observe node to hand polling
 // ownership to the EffectControl scheduler.
+
+// RetireControlAttempt retires a claimed control-poll Attempt with the given
+// terminal status. It is used by the scheduler for non-node-completing control
+// outcomes (e.g., EnsureUnknown retry, EnsureFailed) where the DAG node is not
+// advanced by a completion command.
+func (r *PlanRegistry) RetireControlAttempt(ctx context.Context, identity TransitionIdentity, status model.AttemptStatus) (TransitionDisposition, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[identity.EffectIdentity.ConfigID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil {
+		return TransitionRejected, errors.New("config not found")
+	}
+	retireControlAttemptLocked(state, identity.AttemptID, status)
+	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+		return TransitionRejected, err
+	}
+	r.configs[identity.EffectIdentity.ConfigID.Name] = state
+	return TransitionApplied, nil
+}
+
 func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.ConfigID, effectID EffectID, referenceID ReferenceID, planID model.PlanID, generation model.Generation, opKey model.OperationKey) (TransitionDisposition, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
