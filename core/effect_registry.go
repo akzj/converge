@@ -74,7 +74,9 @@ func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureReq
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlEnsureRetry, State: EffectControlPending,
 		EffectID: req.Identity.EffectIdentity.EffectID, ReferenceID: req.Identity.EffectIdentity.ReferenceID,
-		NextCheckAt: time.Now(),
+		PlanID: req.Identity.EffectIdentity.PlanID, Generation: req.Identity.EffectIdentity.Generation,
+		OperationKey: req.Identity.EffectIdentity.OperationKey,
+		NextCheckAt:  time.Now(),
 	}
 	state.effects[effect.ID] = effect
 	state.references[reference.ID] = reference
@@ -163,7 +165,10 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 						ID: releaseID, ConfigID: identity.EffectIdentity.ConfigID,
 						ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 						Kind: EffectControlRelease, State: EffectControlPending,
-						EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
+						EffectID: effect.ID, ReferenceID: reference.ID,
+						PlanID: identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
+						OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectRelease),
+						NextCheckAt:  time.Now(),
 					}
 				}
 			}
@@ -182,7 +187,9 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 				ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
 				ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
 				State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
-				NextCheckAt: time.Now(),
+				PlanID: identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
+				OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve),
+				NextCheckAt:  time.Now(),
 			}
 			delete(state.controls, identity.RequestID)
 			state.controls[observeControl.ID] = observeControl
@@ -1008,35 +1015,6 @@ func (r *PlanRegistry) LookupEffectAndReference(configID model.ConfigID, effectI
 	return effect, reference, true
 }
 
-// FindEffectOperation finds a plan operation by effect key and preferred kind.
-func (r *PlanRegistry) FindEffectOperation(configID model.ConfigID, effectKey string, kind model.OperationExecutionKind) (*model.Plan, model.Operation, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	state := r.configs[configID.Name]
-	if state == nil || state.active == nil {
-		return nil, model.Operation{}, false
-	}
-	var fallback model.Operation
-	var foundFallback bool
-	for _, node := range state.active.Nodes {
-		op := node.Operation
-		if op.EffectKey != effectKey {
-			continue
-		}
-		if op.ExecutionKind == kind {
-			return state.active.Clone(), op, true
-		}
-		if op.ExecutionKind == model.ExecutionEffectRelease || op.ExecutionKind == model.ExecutionEffectObserve {
-			fallback = op
-			foundFallback = true
-		}
-	}
-	if foundFallback {
-		return state.active.Clone(), fallback, true
-	}
-	return nil, model.Operation{}, false
-}
-
 // CompleteEffectOperation marks a plan effect node completed using a control attempt.
 func (r *PlanRegistry) CompleteEffectOperation(ctx context.Context, identity TransitionIdentity, key model.OperationKey, state model.StepState) error {
 	r.mu.Lock()
@@ -1198,7 +1176,7 @@ var _ RegistryCommands = (*PlanRegistry)(nil)
 // EnsureObserveControl creates an Observe control for a bound effect if one does
 // not already exist. It is called by the DAG observe node to hand polling
 // ownership to the EffectControl scheduler.
-func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.ConfigID, effectID EffectID, referenceID ReferenceID) (TransitionDisposition, error) {
+func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.ConfigID, effectID EffectID, referenceID ReferenceID, planID model.PlanID, generation model.Generation, opKey model.OperationKey) (TransitionDisposition, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]
@@ -1219,6 +1197,7 @@ func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlObserve, State: EffectControlPending,
 		EffectID: effect.ID, ReferenceID: referenceID,
+		PlanID: planID, Generation: generation, OperationKey: opKey,
 		NextCheckAt: time.Now(),
 	}
 	state.controls[control.ID] = control

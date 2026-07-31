@@ -57,7 +57,8 @@ func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef
 		EffectIdentity: EffectIdentity{
 			EffectID: effect.ID, ReferenceID: reference.ID,
 			ConfigID: reference.ConfigID, PlanID: reference.PlanID, Generation: reference.Generation,
-			EffectKey: reference.EffectKey, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
+			OperationKey: control.OperationKey,
+			EffectKey:    reference.EffectKey, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		},
 		AttemptID: attemptID,
 		RequestID: control.ID,
@@ -140,26 +141,28 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 		return nil
 	case DispositionCompleted, DispositionCancelled, DispositionFailed:
 		// Atomically apply the observation, complete the observe node, and
-		// enqueue the lifecycle event in one CAS.
-		plan, op, ok := r.registry.FindEffectOperation(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve)
-		if !ok {
+		// enqueue the lifecycle event in one CAS. The node is identified by the
+		// control's durable NodeIdentity, not a reverse EffectKey lookup.
+		nodeKey := identity.EffectIdentity.OperationKey
+		if nodeKey == "" || identity.EffectIdentity.PlanID == "" {
 			// No DAG node to advance; apply the observation alone.
 			_, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
 			return err
 		}
 		event := model.Event{
 			EventID: string(identity.AttemptID) + "/control-result",
-			PlanID:  plan.ID, Generation: plan.Generation, NodeKey: op.Key,
-			AttemptID: identity.AttemptID, ConfigID: plan.ConfigID.Name,
+			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
+			NodeKey: nodeKey,
+			AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
 			State: model.StepCompleted, Result: model.StepResult{State: model.StepCompleted},
 		}
-		disposition, err := r.registry.CompleteEffectObservationAndNode(ctx, identity, *obs.Observation, op.Key, event)
+		disposition, err := r.registry.CompleteEffectObservationAndNode(ctx, identity, *obs.Observation, nodeKey, event)
 		if err != nil {
 			return err
 		}
 		if disposition == TransitionApplied || disposition == TransitionDuplicate {
 			r.wakeOutbox()
-			snapshot := r.registry.Snapshot(plan.ConfigID)
+			snapshot := r.registry.Snapshot(identity.EffectIdentity.ConfigID)
 			if snapshot.Plan != nil && planCompleted(snapshot.Plan) {
 				r.mu.RLock()
 				provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]
@@ -235,43 +238,27 @@ func (r *Reconciler) runEnsureReferenceControl(ctx context.Context, provider Eff
 	}
 	if disposition == TransitionApplied || disposition == TransitionDuplicate {
 		// Same-artifact carry skips DAG EnsureEffect; complete the ensure node
-		// so observe dependencies can proceed.
-		if plan, op, ok := r.registry.FindEffectOperation(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectKey, model.ExecutionEffectEnsure); ok {
-			r.enqueueControlCompletion(ctx, identity, plan, op, model.StepCompleted)
-		}
+		// (identified by the control's durable NodeIdentity) so observe
+		// dependencies can proceed.
+		r.publishControlNodeCompletion(ctx, identity, model.StepCompleted)
 	}
 	return nil
 }
 
 func (r *Reconciler) publishControlNodeCompletion(ctx context.Context, identity TransitionIdentity, state model.StepState) {
-	kind := model.ExecutionEffectObserve
-	if control, _, ok := r.registry.LookupEffectAndReference(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectID, identity.EffectIdentity.ReferenceID); ok {
-		_ = control
-	}
-	// Prefer release node when releasing; otherwise observe.
-	if plan, op, ok := r.registry.FindEffectOperation(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectKey, model.ExecutionEffectRelease); ok {
-		ref, okRef := r.registry.LookupReference(identity.EffectIdentity.ConfigID, identity.EffectIdentity.ReferenceID)
-		if okRef && (ref.State == EffectReferenceReleased || ref.State == EffectReferenceReleaseRequested) {
-			r.enqueueControlCompletion(ctx, identity, plan, op, state)
-			return
-		}
-		_ = plan
-	}
-	plan, op, ok := r.registry.FindEffectOperation(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectKey, kind)
-	if !ok {
+	// Use the control's durable NodeIdentity (PlanID/Generation/OperationKey)
+	// instead of reverse-looking-up the node by EffectKey.
+	if identity.EffectIdentity.OperationKey == "" || identity.EffectIdentity.PlanID == "" {
 		return
 	}
-	r.enqueueControlCompletion(ctx, identity, plan, op, state)
-}
-
-func (r *Reconciler) enqueueControlCompletion(ctx context.Context, identity TransitionIdentity, plan *model.Plan, op model.Operation, state model.StepState) {
 	event := model.Event{
 		EventID: string(identity.AttemptID) + "/control-result",
-		PlanID:  plan.ID, Generation: plan.Generation, NodeKey: op.Key,
-		AttemptID: identity.AttemptID, ConfigID: plan.ConfigID.Name,
+		PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
+		NodeKey: identity.EffectIdentity.OperationKey,
+		AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
 		State: state, Result: model.StepResult{State: state},
 	}
-	if err := r.registry.CompleteEffectOperation(ctx, identity, op.Key, state); err != nil {
+	if err := r.registry.CompleteEffectOperation(ctx, identity, identity.EffectIdentity.OperationKey, state); err != nil {
 		zap.L().Warn("converge: complete effect operation from control", zap.Error(err))
 		return
 	}
@@ -280,7 +267,7 @@ func (r *Reconciler) enqueueControlCompletion(ctx context.Context, identity Tran
 		return
 	}
 	r.wakeOutbox()
-	snapshot := r.registry.Snapshot(plan.ConfigID)
+	snapshot := r.registry.Snapshot(identity.EffectIdentity.ConfigID)
 	if snapshot.Plan != nil && planCompleted(snapshot.Plan) {
 		r.mu.RLock()
 		provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]

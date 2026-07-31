@@ -505,7 +505,92 @@ plus barrier/outbox/journal unit tests.
 - Outbox duplicate and Journal idempotency.
 - Deletion tombstone restart and fail-closed administrator path.
 
-## 15. Risks and remaining production decisions
+## 15. Control ownership closure (normative)
+
+This section resolves the remaining dual-scheduling ambiguity. It is normative
+and supersedes any earlier text that implied the DAG scheduler may invoke
+EffectProvider methods directly.
+
+### 15.1 Single scheduler ownership
+
+The EffectControl scheduler is the **sole** invoker of EffectProvider RPCs
+(EnsureEffect, ObserveEffects, ReleaseEffect, EnsureReference). The DAG
+scheduler never starts an EffectProvider goroutine and never calls an
+EffectProvider method directly.
+
+DAG nodes with an effect ExecutionKind exist only to:
+
+- declare the dependency graph (ensure -> observe -> activation);
+- carry the desired EffectKey / NodeIdentity;
+- project the terminal outcome of the EffectControl they are bound to.
+
+### 15.2 EffectControl carries durable NodeIdentity
+
+Every EffectControl records the exact plan node it advances:
+
+```text
+PlanID       model.PlanID
+Generation   model.Generation
+OperationKey model.OperationKey
+```
+
+Node completion never reverse-looks-up by EffectKey. The control knows its
+target node at creation and carries it through supersession, restart, and
+reclaim. `FindEffectOperation` is removed from terminal completion paths.
+
+### 15.3 Effect nodes enter WaitingOnControl, not Running
+
+When a ready effect node is first scheduled, an atomic command:
+
+1. creates/activates the durable EffectControl (with NodeIdentity);
+2. transitions the node to `NodeWaitingOnControl` (or equivalent durable
+   marker) with no ordinary provider Attempt.
+
+The node does not consume an execSem slot and does not create a DAG provider
+Attempt. WakeDueWaiting does not resurrect effect nodes; the EffectControl
+scheduler's NextCheckAt does.
+
+### 15.4 Control claim owns the Attempt identity
+
+Each ClaimDueControl binds a fresh AttemptID + PollRequestID. The claim must
+also persist a complete `model.Attempt` record (or, if the AttemptID space is
+intentionally separate, the identifier MUST be renamed `InvocationID` and never
+share the AttemptID namespace). Mixed semantics are prohibited:
+
+- a DAG effect node never holds a provider Attempt while a control poll holds a
+  different AttemptID for the same logical operation;
+- one logical effect poll maps to exactly one Attempt/Invocation record.
+
+### 15.5 Single CAS for every terminal path
+
+Every control terminal transition (Observe completed/cancelled/failed,
+AuthoritativeGone, Release confirmed, EnsureReference activated) atomically
+updates Effect + Reference + Control + Node + Attempt + Outbox in one execution
+Revision CAS. The two-CAS pattern (`CompleteEffectOperation` then
+`EnqueueOutbox`) is removed.
+
+### 15.6 Strict provider digest binding
+
+Effect RPCs use the provider resolved by `(ProviderType, ProviderDigest)`
+recorded at plan install. The `r.providers[type]` latest fallback is removed.
+If the exact digest provider is not registered, the control yields and waits
+for registration; it never runs a different provider version.
+
+### 15.7 No release direct-RPC fallback
+
+Release always goes through a Release control owned by the scheduler. The DAG
+release node only marks intent and transitions to WaitingOnControl; it never
+calls ReleaseEffect directly.
+
+### 15.8 transferEffectReferences creates explicitly-bound controls
+
+Plan install never performs implicit effect workflow orchestration through
+EffectKey reverse-lookup. Every maintenance control (EnsureReference,
+Observe, Release) created during supersession carries the exact NodeIdentity
+and ReferenceID it serves. Matching is Config-scoped and exact; ambiguous
+EffectKey matches are rejected.
+
+## 16. Risks and remaining production decisions
 
 Not blockers for the in-memory vertical slice:
 
@@ -518,7 +603,7 @@ Not blockers for the in-memory vertical slice:
 
 These must be reviewed before a production backend.
 
-## 16. Design-drift control
+## 17. Design-drift control
 
 For every implementation commit:
 

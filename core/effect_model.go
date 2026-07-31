@@ -97,6 +97,9 @@ type EffectControl struct {
 	State             EffectControlState `json:"state"`
 	EffectID          EffectID           `json:"effect_id"`
 	ReferenceID       ReferenceID        `json:"reference_id"`
+	PlanID            model.PlanID       `json:"plan_id,omitempty"`
+	Generation        model.Generation   `json:"generation,omitempty"`
+	OperationKey      model.OperationKey `json:"operation_key,omitempty"`
 	NextCheckAt       time.Time          `json:"next_check_at"`
 	RetryCount        uint32             `json:"retry_count"`
 	InFlightAttemptID model.AttemptID    `json:"in_flight_attempt_id,omitempty"`

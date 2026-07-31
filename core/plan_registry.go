@@ -361,7 +361,10 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 						ID: releaseControlID, ConfigID: installed.ConfigID,
 						ProviderType: oldEffect.ProviderType, ProviderDigest: oldEffect.ProviderDigest,
 						Kind: EffectControlRelease, State: EffectControlPending,
-						EffectID: old.EffectID, ReferenceID: old.ID, NextCheckAt: time.Now(),
+						EffectID: old.EffectID, ReferenceID: old.ID,
+						PlanID: installed.ID, Generation: installed.Generation,
+						OperationKey: findEffectOperationKey(installed, info.effectKey, model.ExecutionEffectRelease),
+						NextCheckAt:  time.Now(),
 					}
 				}
 			}
@@ -386,7 +389,10 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 				ID: ensureRefControlID, ConfigID: installed.ConfigID,
 				ProviderType: oldEffect.ProviderType, ProviderDigest: oldEffect.ProviderDigest,
 				Kind: EffectControlEnsureReference, State: EffectControlPending,
-				EffectID: oldRef.EffectID, ReferenceID: newRef.ID, NextCheckAt: time.Now(),
+				EffectID: oldRef.EffectID, ReferenceID: newRef.ID,
+				PlanID: installed.ID, Generation: installed.Generation,
+				OperationKey: findEffectOperationKey(installed, info.effectKey, model.ExecutionEffectEnsure),
+				NextCheckAt:  time.Now(),
 			}
 		}
 	}
@@ -414,7 +420,9 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 						ProviderType: installed.ProviderType, ProviderDigest: installed.ProviderDigest,
 						Kind: EffectControlRelease, State: EffectControlPending,
 						EffectID: ref.EffectID, ReferenceID: ref.ID,
-						NextCheckAt: time.Now(),
+						PlanID: installed.ID, Generation: installed.Generation,
+						OperationKey: findEffectOperationKey(installed, effectKey, model.ExecutionEffectRelease),
+						NextCheckAt:  time.Now(),
 					}
 				}
 			}

@@ -127,6 +127,13 @@ func ValidateReferenceTransition(oldReference, next EffectReference) error {
 }
 
 func validateControlShape(control EffectControl) error {
+	// NodeIdentity: an OperationKey is meaningless without a PlanID to scope it
+	// to, so reject that combination. Empty NodeIdentity is allowed for
+	// maintenance controls that do not advance a DAG node (e.g., deletion
+	// releases) and for isolated registry tests.
+	if control.OperationKey != "" && control.PlanID == "" {
+		return errors.New("control has operation key without plan identity")
+	}
 	if control.State == EffectControlInFlight {
 		if control.InFlightAttemptID == "" || control.PollRequestID == "" || control.LeaseExpiresAt.IsZero() {
 			return errors.New("in-flight control lacks claim identity")
@@ -142,7 +149,9 @@ func validateControlShape(control EffectControl) error {
 func ValidateControlTransition(oldControl, next EffectControl) error {
 	if oldControl.ID != next.ID || oldControl.ConfigID != next.ConfigID ||
 		oldControl.ProviderType != next.ProviderType || oldControl.ProviderDigest != next.ProviderDigest ||
-		oldControl.Kind != next.Kind || oldControl.EffectID != next.EffectID || oldControl.ReferenceID != next.ReferenceID {
+		oldControl.Kind != next.Kind || oldControl.EffectID != next.EffectID || oldControl.ReferenceID != next.ReferenceID ||
+		oldControl.PlanID != next.PlanID || oldControl.Generation != next.Generation ||
+		oldControl.OperationKey != next.OperationKey {
 		return errors.New("immutable control identity changed")
 	}
 	if oldControl.State == next.State {

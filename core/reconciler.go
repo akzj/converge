@@ -550,7 +550,7 @@ func (r *Reconciler) executeEffectObserve(ctx context.Context, plan *model.Plan,
 	}
 	if !r.registry.HasActiveEffectControl(plan.ConfigID, operation.EffectKey, EffectControlObserve) {
 		// Ensure an Observe control exists so the scheduler can drive polling.
-		if disp, err := r.registry.EnsureObserveControl(ctx, plan.ConfigID, effect.ID, identity.EffectIdentity.ReferenceID); err != nil || disp != TransitionApplied {
+		if disp, err := r.registry.EnsureObserveControl(ctx, plan.ConfigID, effect.ID, identity.EffectIdentity.ReferenceID, plan.ID, plan.Generation, operation.Key); err != nil || disp != TransitionApplied {
 			r.publishResult(ctx, plan, operation, attempt, model.StepResult{
 				State: model.StepWaiting, Code: "observe_control_pending",
 				NextCheckAt: time.Now().Add(time.Second),
