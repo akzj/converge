@@ -252,7 +252,7 @@ func TestApplyObservationRejectsWrongPollID(t *testing.T) {
 	}); err != nil || d != TransitionApplied {
 		t.Fatalf("ApplyEnsure: %v %v", d, err)
 	}
-	observeID := ControlRequestID("observe-" + string(identity.EffectIdentity.EffectID))
+	observeID := ControlRequestID("observe-" + string(identity.EffectIdentity.ReferenceID))
 	now := time.Now()
 	if _, err := reg.ClaimDueControl(ctx, plan.ConfigID, observeID, now, "attempt-1", "poll-good", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)

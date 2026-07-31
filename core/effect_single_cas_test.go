@@ -26,8 +26,9 @@ func setupSingleCASPlan(t *testing.T, store *MemoryExecutionStore) (*PlanRegistr
 	// beginBoundEffect uses a fresh effect ID/ref ID so BeginEnsureEffect + ApplyEnsureResult
 	// create the bound effect and the Observe control.
 	identity := beginBoundEffect(t, reg, plan, "single-eff", "single-ref", "job-1")
-	// Point the identity at the Observe control created by ApplyEnsureResult.
-	identity.RequestID = ControlRequestID("observe-" + string(identity.EffectIdentity.EffectID))
+	// Point the identity at the Observe control created by ApplyEnsureResult
+	// (now keyed by ReferenceID per C2).
+	identity.RequestID = ControlRequestID("observe-" + string(identity.EffectIdentity.ReferenceID))
 	return reg, plan, identity
 }
 

@@ -509,7 +509,7 @@ func (r *Reconciler) executeEffectObserve(ctx context.Context, plan *model.Plan,
 	identity := TransitionIdentity{
 		EffectIdentity: r.effectIdentity(plan, operation, effect.ID),
 		AttemptID:      attempt.ID,
-		RequestID:      ControlRequestID("observe-" + string(effect.ID)),
+		RequestID:      ControlRequestID("observe-" + string(newReferenceID(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey))),
 	}
 	if !r.registry.HasActiveEffectControl(plan.ConfigID, operation.EffectKey, EffectControlObserve) {
 		// Ensure an Observe control exists so the scheduler can drive polling.

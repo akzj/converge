@@ -176,7 +176,7 @@ func TestMatrixUnknownUnboundEnsureRetryAndUnknownBoundObserve(t *testing.T) {
 	}); err != nil || d != TransitionApplied {
 		t.Fatalf("retry bind: %v %v", d, err)
 	}
-	observeID := ControlRequestID("observe-unk-e")
+	observeID := ControlRequestID("observe-unk-r")
 	now := time.Now()
 	if _, err := reg.ClaimDueControl(ctx, plan.ConfigID, observeID, now, "att-1", "poll-1", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
@@ -202,7 +202,7 @@ func TestMatrixSameRevisionDualPollYieldsBothAttempts(t *testing.T) {
 		t.Fatal(err)
 	}
 	identity := beginBoundEffect(t, reg, plan, "dual-e", "dual-r", "job-dual")
-	observeID := ControlRequestID("observe-dual-e")
+	observeID := ControlRequestID("observe-dual-r")
 	now := time.Now()
 	for i, attempt := range []model.AttemptID{"att-a", "att-b"} {
 		poll := PollRequestID("poll-" + string(attempt))
@@ -229,7 +229,7 @@ func TestMatrixWrongIdentityRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	identity := beginBoundEffect(t, reg, plan, "id-e", "id-r", "job-id")
-	observeID := ControlRequestID("observe-id-e")
+	observeID := ControlRequestID("observe-id-r")
 	now := time.Now()
 	if _, err := reg.ClaimDueControl(ctx, plan.ConfigID, observeID, now, "att-1", "poll-good", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
@@ -412,7 +412,7 @@ func TestMatrixCancelCompleteRaceAndGone(t *testing.T) {
 
 	// Gone path on a fresh bound effect with a distinct EffectKey/slot.
 	identity2 := beginBoundEffectKey(t, reg, plan, "gone-e", "gone-r", "job-gone", "download-gone")
-	observeID := ControlRequestID("observe-gone-e")
+	observeID := ControlRequestID("observe-gone-r")
 	if _, err := reg.ClaimDueControl(ctx, plan.ConfigID, observeID, claimAt, "att-g", "poll-g", claimAt.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +503,7 @@ func TestMatrixServiceOutageMarksUnknownBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	identity := beginBoundEffect(t, reg, plan, "outage-e", "outage-r", "job-outage")
-	observeID := ControlRequestID("observe-outage-e")
+	observeID := ControlRequestID("observe-outage-r")
 	now := time.Now()
 	if _, err := reg.ClaimDueControl(ctx, plan.ConfigID, observeID, now, "att-1", "poll-1", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)

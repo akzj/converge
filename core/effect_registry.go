@@ -183,7 +183,7 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 				state.references[nextRef.ID] = nextRef
 			}
 			observeControl := EffectControl{
-				ID:       ControlRequestID("observe-" + string(identity.EffectIdentity.EffectID)),
+				ID:       ControlRequestID("observe-" + string(identity.EffectIdentity.ReferenceID)),
 				ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
 				ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
 				State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
@@ -308,7 +308,7 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 
 	// Create the Observe control so the scheduler can drive polling.
 	observeControl := EffectControl{
-		ID:       ControlRequestID("observe-" + string(effect.ID)),
+		ID:       ControlRequestID("observe-" + string(identity.EffectIdentity.ReferenceID)),
 		ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
 		ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
 		State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
@@ -1617,7 +1617,7 @@ func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.
 	if effect.ID == "" {
 		return TransitionStale, nil
 	}
-	ctrlID := ControlRequestID("observe-" + string(effectID))
+	ctrlID := ControlRequestID("observe-" + string(referenceID))
 	if _, exists := state.controls[ctrlID]; exists {
 		return TransitionDuplicate, nil
 	}
