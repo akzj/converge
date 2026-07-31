@@ -440,7 +440,8 @@ func (r *Reconciler) executeEffectEnsure(ctx context.Context, plan *model.Plan, 
 	effect, ref, found := r.registry.LookupEffectBinding(plan.ConfigID, plan.ID, plan.Generation, operation.EffectKey)
 	if found && effect.Binding == EffectBindingBound && effect.ExternalJobID != "" {
 		// Same-artifact carry: EnsureReference owns the new reference; never
-		// CreateOrGet a second job under a new idempotency key.
+		// CreateOrGet a second job under a new idempotency key. The ensure node
+		// completes when the EnsureReference control activates the reference.
 		if ref.State == EffectReferenceActive {
 			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
 			return
@@ -481,53 +482,18 @@ func (r *Reconciler) executeEffectEnsure(ctx context.Context, plan *model.Plan, 
 			return
 		}
 	}
-
-	ensureResult, err := effectProvider.EnsureEffect(ctx, EnsureEffectRequest{
-		Identity:            identity.EffectIdentity,
-		IdempotencyKey:      spec.IdempotencyKey,
-		ArtifactID:          spec.ArtifactID,
-		SemanticFingerprint: spec.SemanticFingerprint,
-		EnsureSpec:          spec.EnsureSpec,
+	// The EffectControl scheduler is the sole owner of EnsureEffect RPCs. This
+	// DAG path only persists the durable ensure intent and yields; the
+	// scheduler's EnsureRetry control drives the RPC and completes the node.
+	if disp, err := r.registry.EnsureEnsureRetryControl(ctx, plan.ConfigID, effectID, identity.EffectIdentity.ReferenceID, plan.ID, plan.Generation, operation.Key); err != nil || disp != TransitionApplied && disp != TransitionDuplicate {
+		r.publishResult(ctx, plan, operation, attempt, model.StepResult{
+			State: model.StepWaiting, Code: "ensure_control_pending", NextCheckAt: time.Now().Add(time.Second),
+		})
+		return
+	}
+	r.publishResult(ctx, plan, operation, attempt, model.StepResult{
+		State: model.StepWaiting, Code: "ensure_scheduled", NextCheckAt: time.Now().Add(time.Second),
 	})
-	if err != nil {
-		if disposition, applyErr := r.registry.ApplyEnsureResult(ctx, identity, EnsureEffectResult{
-			EffectID: identity.EffectIdentity.EffectID, ReferenceID: identity.EffectIdentity.ReferenceID,
-			Disposition: EnsureUnknown, Failure: EnsureFailureUnknownOutcome,
-			Code: "ensure_rpc_error", Reason: err.Error(),
-		}); applyErr == nil && (disposition == TransitionApplied || disposition == TransitionDuplicate) {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepWaiting, Code: "ensure_unknown", NextCheckAt: time.Now().Add(time.Second), Retryable: true})
-			return
-		}
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_failed", Reason: err.Error(), Retryable: true})
-		return
-	}
-	if ensureResult.Disposition == EnsureUnknown || ensureResult.Failure == EnsureFailureUnknownOutcome || ensureResult.Failure == EnsureFailureTransientKnownNotApplied {
-		if disposition, err := r.registry.ApplyEnsureResult(ctx, identity, ensureResult); err != nil {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_ensure_failed", Reason: err.Error(), Retryable: true})
-			return
-		} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_ensure_rejected", Reason: string(disposition), Retryable: true})
-			return
-		}
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepWaiting, Code: "ensure_unknown", NextCheckAt: time.Now().Add(time.Second), Retryable: true})
-		return
-	}
-	if ensureResult.Disposition != EnsureBound {
-		if disposition, err := r.registry.ApplyEnsureResult(ctx, identity, ensureResult); err == nil && disposition == TransitionApplied {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_not_bound", Reason: string(ensureResult.Disposition), Retryable: ensureResult.Failure != EnsureFailureAuthoritativeRejected})
-			return
-		}
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "ensure_not_bound", Reason: string(ensureResult.Disposition), Retryable: true})
-		return
-	}
-	if disposition, err := r.registry.ApplyEnsureResult(ctx, identity, ensureResult); err != nil {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_ensure_failed", Reason: err.Error(), Retryable: true})
-		return
-	} else if disposition != TransitionApplied && disposition != TransitionDuplicate {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "apply_ensure_rejected", Reason: string(disposition), Retryable: true})
-		return
-	}
-	r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
 }
 
 func (r *Reconciler) executeEffectObserve(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {

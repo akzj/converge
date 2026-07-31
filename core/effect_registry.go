@@ -1227,6 +1227,42 @@ var _ RegistryCommands = (*PlanRegistry)(nil)
 // not already exist. It is called by the DAG observe node to hand polling
 // ownership to the EffectControl scheduler.
 
+// EnsureEnsureRetryControl creates an EnsureRetry control for an effect if one
+// does not already exist, bound to the ensure node. The DAG ensure path calls
+// this to hand EnsureEffect RPC ownership to the scheduler.
+func (r *PlanRegistry) EnsureEnsureRetryControl(ctx context.Context, configID model.ConfigID, effectID EffectID, referenceID ReferenceID, planID model.PlanID, generation model.Generation, opKey model.OperationKey) (TransitionDisposition, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[configID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil {
+		return TransitionRejected, errors.New("config not found")
+	}
+	effect := state.effects[effectID]
+	if effect.ID == "" {
+		return TransitionStale, nil
+	}
+	ctrlID := ControlRequestID("ensure-" + string(effectID))
+	if _, exists := state.controls[ctrlID]; exists {
+		return TransitionDuplicate, nil
+	}
+	control := EffectControl{
+		ID: ctrlID, ConfigID: configID,
+		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
+		Kind: EffectControlEnsureRetry, State: EffectControlPending,
+		EffectID: effect.ID, ReferenceID: referenceID,
+		PlanID: planID, Generation: generation, OperationKey: opKey,
+		NextCheckAt: time.Now(),
+	}
+	state.controls[control.ID] = control
+	if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
+		return TransitionRejected, err
+	}
+	r.configs[configID.Name] = state
+	return TransitionApplied, nil
+}
+
+
 // RetireControlAttempt retires a claimed control-poll Attempt with the given
 // terminal status. It is used by the scheduler for non-node-completing control
 // outcomes (e.g., EnsureUnknown retry, EnsureFailed) where the DAG node is not
