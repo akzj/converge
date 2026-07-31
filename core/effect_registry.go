@@ -1159,6 +1159,112 @@ func (r *PlanRegistry) ApplyEnsureReferenceResult(ctx context.Context, identity 
 	return TransitionApplied, nil
 }
 
+
+// CompleteEnsureReferenceAndNode atomically activates an EnsureReference result,
+// marks the target ensure node terminal, and enqueues the lifecycle outbox event
+// in a single execution Revision CAS. It closes the crash window where the
+// reference is Active but the ensure node has not advanced.
+func (r *PlanRegistry) CompleteEnsureReferenceAndNode(
+	ctx context.Context,
+	identity TransitionIdentity,
+	result EnsureReferenceResult,
+	nodeKey model.OperationKey,
+	event model.Event,
+) (TransitionDisposition, error) {
+	if result.Disposition != EnsureBound {
+		return TransitionRejected, errors.Errorf("ensure reference disposition %q", result.Disposition)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[identity.EffectIdentity.ConfigID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil || state.active == nil {
+		return TransitionRejected, errors.New("config not found")
+	}
+	reference := state.references[identity.EffectIdentity.ReferenceID]
+	if reference.ID == "" {
+		return TransitionStale, nil
+	}
+	if reference.State == EffectReferenceActive {
+		return TransitionDuplicate, nil
+	}
+	oldReference := reference
+	reference.State = EffectReferenceActive
+	if err := ValidateReferenceTransition(oldReference, reference); err != nil {
+		return TransitionRejected, err
+	}
+	state.references[reference.ID] = reference
+	if control, ok := state.controls[identity.RequestID]; ok {
+		oldControl := control
+		control.State = EffectControlCompleted
+		control.InFlightAttemptID = ""
+		control.PollRequestID = ""
+		control.LeaseExpiresAt = time.Time{}
+		if oldControl.State == EffectControlInFlight {
+			if err := ValidateControlTransition(oldControl, control); err != nil {
+				return TransitionRejected, err
+			}
+		}
+		state.controls[control.ID] = control
+	}
+	// After the replacement reference is Active, schedule release of older
+	// Active/ReleaseRequested refs for the same EffectKey on this config.
+	for id, old := range state.references {
+		if old.EffectKey != reference.EffectKey || old.ID == reference.ID {
+			continue
+		}
+		if old.State != EffectReferenceActive && old.State != EffectReferenceEnsuring {
+			continue
+		}
+		if old.Generation >= reference.Generation {
+			continue
+		}
+		old.State = EffectReferenceReleaseRequested
+		state.references[id] = old
+		retireIncompatibleControlsLocked(state, old.ID)
+		releaseID := ControlRequestID("release-" + string(old.ID))
+		if _, exists := state.controls[releaseID]; !exists {
+			effect := state.effects[old.EffectID]
+			state.controls[releaseID] = EffectControl{
+				ID: releaseID, ConfigID: old.ConfigID,
+				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
+				Kind: EffectControlRelease, State: EffectControlPending,
+				EffectID: old.EffectID, ReferenceID: old.ID, NextCheckAt: time.Now(),
+			}
+		}
+	}
+
+	// --- Mark the plan node terminal and retire the control attempt ---
+	node := state.active.Nodes[nodeKey]
+	if node == nil {
+		return TransitionRejected, errors.Errorf("operation %q not found", nodeKey)
+	}
+	if node.Status != model.NodeCompleted {
+		attempt := &model.Attempt{
+			ID: identity.AttemptID, PlanID: state.active.ID, Generation: state.active.Generation,
+			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
+			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
+			Status: model.AttemptCompleted,
+		}
+		node.Status = model.NodeCompleted
+		node.AttemptID = identity.AttemptID
+		state.retired[identity.AttemptID] = attempt
+		delete(state.attempts, identity.AttemptID)
+	}
+
+	// --- Enqueue the lifecycle outbox event in the same CAS ---
+	if event.EventID == "" {
+		return TransitionRejected, errors.New("outbox event ID is empty")
+	}
+	state.outbox[event.EventID] = event
+
+	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+		return TransitionRejected, err
+	}
+	r.configs[identity.EffectIdentity.ConfigID.Name] = state
+	return TransitionApplied, nil
+}
+
 // LookupEffectAndReference returns durable effect+reference by IDs.
 func (r *PlanRegistry) LookupEffectAndReference(configID model.ConfigID, effectID EffectID, referenceID ReferenceID) (ActiveEffect, EffectReference, bool) {
 	r.mu.RLock()
