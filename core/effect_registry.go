@@ -335,31 +335,7 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 		return TransitionStale, nil
 	}
 
-	// --- Mark the plan node terminal and retire the control attempt ---
-	node := state.active.Nodes[nodeKey]
-	if node == nil {
-		return TransitionRejected, errors.Errorf("operation %q not found", nodeKey)
-	}
-	if node.Status != model.NodeCompleted {
-		attempt := &model.Attempt{
-			ID: identity.AttemptID, PlanID: state.active.ID, Generation: state.active.Generation,
-			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
-			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
-			Status: model.AttemptCompleted,
-		}
-		node.Status = model.NodeCompleted
-		node.AttemptID = identity.AttemptID
-		state.retired[identity.AttemptID] = attempt
-		delete(state.attempts, identity.AttemptID)
-	}
-
-	// --- Enqueue the lifecycle outbox event in the same CAS ---
-	if event.EventID == "" {
-		return TransitionRejected, errors.New("outbox event ID is empty")
-	}
-	state.outbox[event.EventID] = event
-
-	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+	if err := r.finishEffectNodeBundleLocked(ctx, state, identity, nodeKey, event); err != nil {
 		return TransitionRejected, err
 	}
 	r.configs[identity.EffectIdentity.ConfigID.Name] = state
@@ -725,38 +701,7 @@ func (r *PlanRegistry) CompleteEffectObservationAndNode(
 		return TransitionStale, nil
 	}
 
-	// --- Mark the plan node terminal and retire the control attempt ---
-	node := state.active.Nodes[nodeKey]
-	if node == nil {
-		return TransitionRejected, errors.Errorf("operation %q not found", nodeKey)
-	}
-	attemptID := identity.AttemptID
-	if node.Status != model.NodeCompleted {
-		attempt := &model.Attempt{
-			ID: attemptID, PlanID: state.active.ID, Generation: state.active.Generation,
-			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
-			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
-			Status: model.AttemptCompleted,
-		}
-		if event.State == model.StepFailed {
-			attempt.Status = model.AttemptFailed
-			node.Status = model.NodeFailed
-		} else {
-			node.Status = model.NodeCompleted
-		}
-		node.AttemptID = attemptID
-		state.retired[attemptID] = attempt
-		delete(state.attempts, attemptID)
-	}
-
-	// --- Enqueue the lifecycle outbox event in the same CAS ---
-	if event.EventID == "" {
-		return TransitionRejected, errors.New("outbox event ID is empty")
-	}
-	state.outbox[event.EventID] = event
-
-	// --- One atomic persist ---
-	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+	if err := r.finishEffectNodeBundleLocked(ctx, state, identity, nodeKey, event); err != nil {
 		return TransitionRejected, err
 	}
 	r.configs[identity.EffectIdentity.ConfigID.Name] = state
@@ -1171,31 +1116,7 @@ func (r *PlanRegistry) CompleteReleaseAndNode(
 		return TransitionStale, nil
 	}	}
 
-	// --- Mark the plan node terminal and retire the control attempt ---
-	node := state.active.Nodes[nodeKey]
-	if node == nil {
-		return TransitionRejected, errors.Errorf("operation %q not found", nodeKey)
-	}
-	if node.Status != model.NodeCompleted {
-		attempt := &model.Attempt{
-			ID: identity.AttemptID, PlanID: state.active.ID, Generation: state.active.Generation,
-			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
-			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
-			Status: model.AttemptCompleted,
-		}
-		node.Status = model.NodeCompleted
-		node.AttemptID = identity.AttemptID
-		state.retired[identity.AttemptID] = attempt
-		delete(state.attempts, identity.AttemptID)
-	}
-
-	// --- Enqueue the lifecycle outbox event in the same CAS ---
-	if event.EventID == "" {
-		return TransitionRejected, errors.New("outbox event ID is empty")
-	}
-	state.outbox[event.EventID] = event
-
-	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+	if err := r.finishEffectNodeBundleLocked(ctx, state, identity, nodeKey, event); err != nil {
 		return TransitionRejected, err
 	}
 	r.configs[identity.EffectIdentity.ConfigID.Name] = state
@@ -1403,31 +1324,8 @@ func (r *PlanRegistry) CompleteEnsureReferenceAndNode(
 	}
 	if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != state.active.Generation {
 		return TransitionStale, nil
-	}	// --- Mark the plan node terminal and retire the control attempt ---
-	node := state.active.Nodes[nodeKey]
-	if node == nil {
-		return TransitionRejected, errors.Errorf("operation %q not found", nodeKey)
-	}
-	if node.Status != model.NodeCompleted {
-		attempt := &model.Attempt{
-			ID: identity.AttemptID, PlanID: state.active.ID, Generation: state.active.Generation,
-			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
-			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
-			Status: model.AttemptCompleted,
-		}
-		node.Status = model.NodeCompleted
-		node.AttemptID = identity.AttemptID
-		state.retired[identity.AttemptID] = attempt
-		delete(state.attempts, identity.AttemptID)
-	}
-
-	// --- Enqueue the lifecycle outbox event in the same CAS ---
-	if event.EventID == "" {
-		return TransitionRejected, errors.New("outbox event ID is empty")
-	}
-	state.outbox[event.EventID] = event
-
-	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+}
+	if err := r.finishEffectNodeBundleLocked(ctx, state, identity, nodeKey, event); err != nil {
 		return TransitionRejected, err
 	}
 	r.configs[identity.EffectIdentity.ConfigID.Name] = state

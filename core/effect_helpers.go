@@ -1,16 +1,52 @@
 package core
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"time"
+
+	"github.com/cockroachdb/errors"
 
 	"github.com/akzj/converge/pkg/model"
 )
 
 // verifyControlNodeIdentity returns TransitionStale if the control's NodeIdentity
 // does not match the active plan, preventing cross-generation advancement by a
+// finishEffectNodeBundleLocked completes the plan node, retires the control
+// attempt, enqueues the lifecycle outbox event, and persists in one CAS.
+// Caller holds the registry write lock and has already mutated effect/
+// reference/control state on the clone. The node becomes Failed when the event
+// carries StepFailed.
+func (r *PlanRegistry) finishEffectNodeBundleLocked(ctx context.Context, state *configExecution, identity TransitionIdentity, nodeKey model.OperationKey, event model.Event) error {
+	node := state.active.Nodes[nodeKey]
+	if node == nil {
+		return errors.Errorf("operation %q not found", nodeKey)
+	}
+	if node.Status != model.NodeCompleted {
+		attempt := &model.Attempt{
+			ID: identity.AttemptID, PlanID: state.active.ID, Generation: state.active.Generation,
+			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
+			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
+			Status: model.AttemptCompleted,
+		}
+		if event.State == model.StepFailed {
+			attempt.Status = model.AttemptFailed
+			node.Status = model.NodeFailed
+		} else {
+			node.Status = model.NodeCompleted
+		}
+		node.AttemptID = identity.AttemptID
+		state.retired[identity.AttemptID] = attempt
+		delete(state.attempts, identity.AttemptID)
+	}
+	if event.EventID == "" {
+		return errors.New("outbox event ID is empty")
+	}
+	state.outbox[event.EventID] = event
+	return r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state)
+}
 // stale control. Callers invoke it before mutating any state.
 func verifyControlNodeIdentity(identity TransitionIdentity, active *model.Plan) TransitionDisposition {
 	if active == nil {
