@@ -139,12 +139,36 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 		}
 		return nil
 	case DispositionCompleted, DispositionCancelled, DispositionFailed:
-		disposition, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
+		// Atomically apply the observation, complete the observe node, and
+		// enqueue the lifecycle event in one CAS.
+		plan, op, ok := r.registry.FindEffectOperation(identity.EffectIdentity.ConfigID, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve)
+		if !ok {
+			// No DAG node to advance; apply the observation alone.
+			_, err := r.registry.ApplyEffectObservation(ctx, identity, *obs.Observation)
+			return err
+		}
+		event := model.Event{
+			EventID: string(identity.AttemptID) + "/control-result",
+			PlanID:  plan.ID, Generation: plan.Generation, NodeKey: op.Key,
+			AttemptID: identity.AttemptID, ConfigID: plan.ConfigID.Name,
+			State: model.StepCompleted, Result: model.StepResult{State: model.StepCompleted},
+		}
+		disposition, err := r.registry.CompleteEffectObservationAndNode(ctx, identity, *obs.Observation, op.Key, event)
 		if err != nil {
 			return err
 		}
 		if disposition == TransitionApplied || disposition == TransitionDuplicate {
-			r.publishControlNodeCompletion(ctx, identity, model.StepCompleted)
+			r.wakeOutbox()
+			snapshot := r.registry.Snapshot(plan.ConfigID)
+			if snapshot.Plan != nil && planCompleted(snapshot.Plan) {
+				r.mu.RLock()
+				provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]
+				r.mu.RUnlock()
+				if provider != nil {
+					r.verifyAndRecord(ctx, snapshot.Plan, provider)
+				}
+			}
+			r.executeReady(ctx)
 		}
 		return nil
 	default:

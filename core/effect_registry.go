@@ -418,6 +418,173 @@ func (r *PlanRegistry) ApplyEffectObservation(ctx context.Context, identity Tran
 	return TransitionApplied, nil
 }
 
+// CompleteEffectObservationAndNode atomically applies a terminal effect
+// observation, marks the target plan node terminal, and enqueues the lifecycle
+// outbox event in a single execution Revision CAS. This closes the crash window
+// where the Effect is terminal but the Node has not advanced.
+func (r *PlanRegistry) CompleteEffectObservationAndNode(
+	ctx context.Context,
+	identity TransitionIdentity,
+	observation EffectObservation,
+	nodeKey model.OperationKey,
+	event model.Event,
+) (TransitionDisposition, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[identity.EffectIdentity.ConfigID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil || state.active == nil {
+		return TransitionRejected, errors.New("config not found")
+	}
+
+	// --- Validate the observation against the InFlight control ---
+	control := state.controls[identity.RequestID]
+	if control.ID == "" || control.State != EffectControlInFlight {
+		return TransitionStale, nil
+	}
+	if observation.PollRequestID != "" && observation.PollRequestID != control.PollRequestID {
+		return TransitionRejected, errors.New("poll request id mismatch")
+	}
+	if observation.AttemptID != "" && observation.AttemptID != control.InFlightAttemptID {
+		return TransitionRejected, errors.New("attempt id mismatch")
+	}
+	if identity.AttemptID != "" && identity.AttemptID != control.InFlightAttemptID {
+		return TransitionRejected, errors.New("attempt id mismatch")
+	}
+	if identity.EffectIdentity.EffectID != "" && identity.EffectIdentity.EffectID != control.EffectID {
+		return TransitionRejected, errors.New("effect id mismatch")
+	}
+	if identity.EffectIdentity.ReferenceID != "" && identity.EffectIdentity.ReferenceID != control.ReferenceID {
+		return TransitionRejected, errors.New("reference id mismatch")
+	}
+	effect := state.effects[identity.EffectIdentity.EffectID]
+	if effect.ID == "" {
+		return TransitionStale, nil
+	}
+	if observation.EffectID != "" && observation.EffectID != effect.ID {
+		return TransitionRejected, errors.New("observation effect id mismatch")
+	}
+	reference := state.references[identity.EffectIdentity.ReferenceID]
+	if reference.ID == "" && observation.Disposition != DispositionAuthoritativeGone {
+		return TransitionStale, nil
+	}
+	oldEffect, oldControl := effect, control
+
+	// --- Apply the terminal observation ---
+	switch observation.Disposition {
+	case DispositionCompleted, DispositionCancelled:
+		control.State = EffectControlCompleted
+		control.InFlightAttemptID = ""
+		control.PollRequestID = ""
+		control.LeaseExpiresAt = time.Time{}
+		effect.State = ExternalEffectCompleted
+		if observation.Disposition == DispositionCancelled {
+			effect.State = ExternalEffectCancelled
+		}
+		effect.ResolutionRequired = false
+		effect.ExternalRevision = observation.ExternalRevision
+		if err := ValidateControlTransition(oldControl, control); err != nil {
+			return TransitionRejected, err
+		}
+		if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionExternalObservation); err != nil {
+			return TransitionRejected, err
+		}
+		state.controls[control.ID] = control
+		state.effects[effect.ID] = effect
+
+	case DispositionFailed:
+		control.State = EffectControlCompleted
+		control.InFlightAttemptID = ""
+		control.PollRequestID = ""
+		control.LeaseExpiresAt = time.Time{}
+		effect.State = ExternalEffectFailed
+		effect.ResolutionRequired = true
+		if observation.ExternalRevision > 0 {
+			effect.ExternalRevision = observation.ExternalRevision
+		}
+		if err := ValidateControlTransition(oldControl, control); err != nil {
+			return TransitionRejected, err
+		}
+		if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionExternalObservation); err != nil {
+			return TransitionRejected, err
+		}
+		state.controls[control.ID] = control
+		state.effects[effect.ID] = effect
+
+	case DispositionAuthoritativeGone:
+		if effect.Binding != EffectBindingBound {
+			return TransitionRejected, errors.New("authoritative gone requires bound effect")
+		}
+		if observation.ExternalJobID != "" && observation.ExternalJobID != effect.ExternalJobID {
+			return TransitionRejected, errors.New("authoritative gone job id mismatch")
+		}
+		control.State = EffectControlCompleted
+		control.InFlightAttemptID = ""
+		control.PollRequestID = ""
+		control.LeaseExpiresAt = time.Time{}
+		if err := ValidateControlTransition(oldControl, control); err != nil {
+			return TransitionRejected, err
+		}
+		state.controls[control.ID] = control
+		delete(state.effects, effect.ID)
+		for id, ref := range state.references {
+			if ref.EffectID != effect.ID {
+				continue
+			}
+			delete(state.references, id)
+			for cid, c := range state.controls {
+				if c.ReferenceID == id || c.EffectID == effect.ID {
+					c.State = EffectControlCompleted
+					c.InFlightAttemptID = ""
+					c.PollRequestID = ""
+					c.LeaseExpiresAt = time.Time{}
+					state.controls[cid] = c
+				}
+			}
+		}
+
+	default:
+		return TransitionRejected, errors.Errorf("unsupported terminal observation disposition %q", observation.Disposition)
+	}
+
+	// --- Mark the plan node terminal and retire the control attempt ---
+	node := state.active.Nodes[nodeKey]
+	if node == nil {
+		return TransitionRejected, errors.Errorf("operation %q not found", nodeKey)
+	}
+	attemptID := identity.AttemptID
+	if node.Status != model.NodeCompleted {
+		attempt := &model.Attempt{
+			ID: attemptID, PlanID: state.active.ID, Generation: state.active.Generation,
+			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
+			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
+			Status: model.AttemptCompleted,
+		}
+		if event.State == model.StepFailed {
+			attempt.Status = model.AttemptFailed
+			node.Status = model.NodeFailed
+		} else {
+			node.Status = model.NodeCompleted
+		}
+		node.AttemptID = attemptID
+		state.retired[attemptID] = attempt
+		delete(state.attempts, attemptID)
+	}
+
+	// --- Enqueue the lifecycle outbox event in the same CAS ---
+	if event.EventID == "" {
+		return TransitionRejected, errors.New("outbox event ID is empty")
+	}
+	state.outbox[event.EventID] = event
+
+	// --- One atomic persist ---
+	if err := r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state); err != nil {
+		return TransitionRejected, err
+	}
+	r.configs[identity.EffectIdentity.ConfigID.Name] = state
+	return TransitionApplied, nil
+}
+
 // YieldControl yields an InFlight control with the next check time.
 func (r *PlanRegistry) YieldControl(ctx context.Context, identity TransitionIdentity, nextCheckAt time.Time) (TransitionDisposition, error) {
 	r.mu.Lock()
@@ -1027,3 +1194,37 @@ type RegistryCommands interface {
 }
 
 var _ RegistryCommands = (*PlanRegistry)(nil)
+
+// EnsureObserveControl creates an Observe control for a bound effect if one does
+// not already exist. It is called by the DAG observe node to hand polling
+// ownership to the EffectControl scheduler.
+func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.ConfigID, effectID EffectID, referenceID ReferenceID) (TransitionDisposition, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[configID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil {
+		return TransitionRejected, errors.New("config not found")
+	}
+	effect := state.effects[effectID]
+	if effect.ID == "" {
+		return TransitionStale, nil
+	}
+	ctrlID := ControlRequestID("observe-" + string(effectID))
+	if _, exists := state.controls[ctrlID]; exists {
+		return TransitionDuplicate, nil
+	}
+	control := EffectControl{
+		ID: ctrlID, ConfigID: configID,
+		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
+		Kind: EffectControlObserve, State: EffectControlPending,
+		EffectID: effect.ID, ReferenceID: referenceID,
+		NextCheckAt: time.Now(),
+	}
+	state.controls[control.ID] = control
+	if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
+		return TransitionRejected, err
+	}
+	r.configs[configID.Name] = state
+	return TransitionApplied, nil
+}

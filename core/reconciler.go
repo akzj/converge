@@ -539,40 +539,30 @@ func (r *Reconciler) executeEffectObserve(ctx context.Context, plan *model.Plan,
 		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_unbound", Reason: "no bound effect for observe", Retryable: true})
 		return
 	}
+	// The EffectControl scheduler is the sole owner of ObserveEffects RPCs.
+	// This DAG path only verifies that an Observe control exists and yields so
+	// the scheduler can drive the poll. If the control is missing, enqueue a
+	// control so the scheduler picks it up on the next due sweep.
 	identity := TransitionIdentity{
 		EffectIdentity: r.effectIdentity(plan, operation, effect.ID),
 		AttemptID:      attempt.ID,
 		RequestID:      ControlRequestID("observe-" + string(effect.ID)),
 	}
-	pollID := PollRequestID("poll-" + string(attempt.ID))
-	observations, err := effectProvider.ObserveEffects(ctx, []ObserveEffectRequest{{
-		Identity:         identity.EffectIdentity,
-		AttemptID:        attempt.ID,
-		PollRequestID:    pollID,
-		ExternalJobID:    effect.ExternalJobID,
-		ExternalRevision: effect.ExternalRevision,
-	}})
-	if err != nil {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_failed", Reason: err.Error(), Retryable: true})
-		return
+	if !r.registry.HasActiveEffectControl(plan.ConfigID, operation.EffectKey, EffectControlObserve) {
+		// Ensure an Observe control exists so the scheduler can drive polling.
+		if disp, err := r.registry.EnsureObserveControl(ctx, plan.ConfigID, effect.ID, identity.EffectIdentity.ReferenceID); err != nil || disp != TransitionApplied {
+			r.publishResult(ctx, plan, operation, attempt, model.StepResult{
+				State: model.StepWaiting, Code: "observe_control_pending",
+				NextCheckAt: time.Now().Add(time.Second),
+			})
+			return
+		}
 	}
-	obs, exists := observations[pollID]
-	if !exists || obs.Observation == nil {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_missing", Reason: "no observation for poll request", Retryable: true})
-		return
-	}
-	switch obs.Observation.Disposition {
-	case DispositionCompleted:
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepCompleted})
-	case DispositionStillActive:
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{
-			State:       model.StepWaiting,
-			Code:        "in_progress",
-			NextCheckAt: time.Now().Add(5 * time.Second),
-		})
-	default:
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "observe_error", Reason: string(obs.Observation.Disposition), Retryable: obs.Observation.Retryable})
-	}
+	r.publishResult(ctx, plan, operation, attempt, model.StepResult{
+		State:       model.StepWaiting,
+		Code:        "in_progress",
+		NextCheckAt: time.Now().Add(time.Second),
+	})
 }
 
 func (r *Reconciler) executeEffectRelease(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, effectProvider EffectProvider) {

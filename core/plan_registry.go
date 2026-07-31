@@ -335,6 +335,9 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 			if ref.EffectKey != info.effectKey {
 				continue
 			}
+			if ref.ConfigID.Name != installed.ConfigID.Name {
+				continue
+			}
 			if ref.State == EffectReferenceReleased || ref.State == EffectReferenceReleaseRequested {
 				continue
 			}
