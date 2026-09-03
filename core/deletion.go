@@ -14,7 +14,7 @@ func (r *PlanRegistry) MarkDeleting(ctx context.Context, configID model.ConfigID
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]
-	if current == nil || current.active == nil {
+	if current == nil {
 		return nil, nil
 	}
 	if current.deleting {
@@ -23,6 +23,9 @@ func (r *PlanRegistry) MarkDeleting(ctx context.Context, configID model.ConfigID
 	state := cloneConfigExecution(current)
 	state.deleting = true
 	for id, attempt := range state.attempts {
+		if state.active == nil {
+			continue
+		}
 		node := state.active.Nodes[attempt.NodeKey]
 		if node == nil || attempt.Status != model.AttemptRunning {
 			continue

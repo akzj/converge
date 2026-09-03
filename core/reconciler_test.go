@@ -16,6 +16,25 @@ type mockProvider struct {
 	executed int32 // number of Execute calls
 }
 
+type blockingInspectProvider struct {
+	*mockProvider
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingInspectProvider) Inspect(ctx context.Context, resource model.ResourceID) (model.ObservedState, error) {
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-p.release:
+		return p.mockProvider.Inspect(ctx, resource)
+	case <-ctx.Done():
+		return model.ObservedState{}, ctx.Err()
+	}
+}
+
 func (m *mockProvider) Type() string   { return m.typeName }
 func (m *mockProvider) Digest() string { return "sha256:mock-" + m.typeName }
 
@@ -60,6 +79,67 @@ func (m *mockProvider) Verify(_ context.Context, _ model.ResourceID, _ model.Des
 
 func (m *mockProvider) EvaluateCondition(_ context.Context, _ model.Condition) (bool, error) {
 	return true, nil
+}
+
+func TestBlockedPlanningDoesNotBlockOtherConfigs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := NewReconciler(NewMemoryStateStore(), NewMemoryExecutionStore(), NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
+	blocked := &blockingInspectProvider{mockProvider: &mockProvider{typeName: "blocked"}, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	r.RegisterProvider(ctx, blocked)
+	r.RegisterProvider(ctx, &mockProvider{typeName: "fast"})
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		close(blocked.release)
+		cancel()
+		<-done
+	}()
+
+	slow := model.DesiredState{ConfigID: model.ConfigID{Name: "slow"}, ProviderType: "blocked", Version: 1, Spec: []byte(`{}`)}
+	slow.Digest = model.DesiredSpecDigest(slow.Spec)
+	if err := r.SubmitDesired(ctx, slow); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("slow provider did not enter Inspect")
+	}
+	fast := model.DesiredState{ConfigID: model.ConfigID{Name: "fast"}, ProviderType: "fast", Version: 1, Spec: []byte(`{}`)}
+	fast.Digest = model.DesiredSpecDigest(fast.Spec)
+	if err := r.SubmitDesired(ctx, fast); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		managed, ok := r.Config("fast")
+		return ok && managed.Status == model.ConfigConverged
+	})
+}
+
+func TestPlanningTimeoutIsReported(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := NewReconciler(NewMemoryStateStore(), NewMemoryExecutionStore(), NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
+	blocked := &blockingInspectProvider{mockProvider: &mockProvider{typeName: "blocked"}, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	r.planTimeout = 20 * time.Millisecond
+	r.RegisterProvider(ctx, blocked)
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		close(blocked.release)
+		cancel()
+		<-done
+	}()
+	desired := model.DesiredState{ConfigID: model.ConfigID{Name: "timeout"}, ProviderType: "blocked", Version: 1, Spec: []byte(`{}`)}
+	desired.Digest = model.DesiredSpecDigest(desired.Spec)
+	if err := r.SubmitDesired(ctx, desired); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		managed, ok := r.Config("timeout")
+		return ok && managed.Status == model.ConfigError && managed.LastError != ""
+	})
 }
 
 func TestReconcilerSubmitsAndProcessesDesiredState(t *testing.T) {

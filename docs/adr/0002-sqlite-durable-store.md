@@ -7,7 +7,13 @@ Accepted for the embedded single-process runtime.
 ## Decision
 
 `core.SQLiteStore` implements `StateStore`, `ExecutionStore`, and `Journal` in
-one SQLite database. The database uses WAL mode and a busy timeout.
+one SQLite database. It also implements `DesiredSnapshotStore`. The database
+uses WAL mode, FULL synchronous durability, and a busy timeout.
+
+Schema changes are versioned with `PRAGMA user_version` and applied in a
+transaction. A non-blocking advisory lock on `<database>.lock` enforces the
+single-process ownership assumption. Databases newer than the binary fail
+closed. `SQLiteStore.Backup` produces a consistent online backup.
 
 Execution snapshots are stored as versioned JSON blobs behind a SQL revision
 compare-and-swap. A caller may publish an in-memory transition only after that
@@ -18,6 +24,10 @@ could be produced.
 Journal rows are ordered by an SQLite sequence. Non-empty event IDs are unique,
 making replayed appends idempotent.
 
+Complete Desired Snapshots and per-Config version high-water marks are updated
+atomically. High-water marks survive deletion, preventing resurrection of an
+older Config revision.
+
 ## Scope and limitations
 
 - The schema is intentionally private to Converge; migrations must preserve
@@ -25,7 +35,8 @@ making replayed appends idempotent.
 - `EventBus` remains an in-process notification mechanism. Durable delivery is
   provided by the execution outbox, not by the bus itself.
 - `Arbiter` remains process-local and is suitable only when one Edge Agent owns
-  the database and managed resources.
+  the database and managed resources. The database lock makes that ownership
+  assumption explicit for the SQLite-backed runtime.
 - `PlanRegistry` serializes transitions per Config. It releases the registry
   map lock while an `ExecutionStore` write is in progress, so slow persistence
   for one Config does not block unrelated Configs. SQLite still has one writer

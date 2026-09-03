@@ -4,8 +4,12 @@ package core
 import (
 	"context"
 
+	"github.com/cockroachdb/errors"
+
 	"github.com/akzj/converge/pkg/model"
 )
+
+var ErrDesiredSnapshotConflict = errors.New("desired snapshot revision conflict")
 
 // Provider owns all resource-specific planning and execution semantics.
 type Provider interface {
@@ -81,6 +85,14 @@ type ExecutionStore interface {
 	ListExecutions(ctx context.Context) ([]model.ConfigID, error)
 	CommitExecutionCAS(ctx context.Context, configID model.ConfigID, expectedRevision uint64, snapshot ExecutionSnapshot) error
 	DeleteExecution(ctx context.Context, configID model.ConfigID) error
+}
+
+// DesiredSnapshotStore durably accepts the latest complete server snapshot.
+// A successful accepted result is the durable ACK boundary; reconciliation is
+// intentionally asynchronous.
+type DesiredSnapshotStore interface {
+	AcceptDesiredSnapshot(ctx context.Context, snapshot model.DesiredSnapshot) (accepted bool, err error)
+	LoadDesiredSnapshot(ctx context.Context) (*model.DesiredSnapshot, error)
 }
 
 // Journal records every Operation transition for audit and recovery.

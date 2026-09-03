@@ -63,6 +63,70 @@ type MemoryExecutionStore struct {
 	executions map[model.ConfigID]ExecutionSnapshot
 }
 
+// MemoryDesiredSnapshotStore implements the durable snapshot contract for
+// tests and embedding prototypes.
+type MemoryDesiredSnapshotStore struct {
+	mu        sync.RWMutex
+	snapshot  *model.DesiredSnapshot
+	highwater map[string]desiredHighwater
+}
+
+type desiredHighwater struct {
+	version uint64
+	digest  string
+}
+
+func NewMemoryDesiredSnapshotStore() *MemoryDesiredSnapshotStore {
+	return &MemoryDesiredSnapshotStore{highwater: make(map[string]desiredHighwater)}
+}
+
+func (s *MemoryDesiredSnapshotStore) AcceptDesiredSnapshot(_ context.Context, snapshot model.DesiredSnapshot) (bool, error) {
+	if err := model.ValidateDesiredSnapshot(snapshot); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.highwater == nil {
+		s.highwater = make(map[string]desiredHighwater)
+	}
+	if s.snapshot != nil {
+		if snapshot.Revision < s.snapshot.Revision || snapshot.Revision == s.snapshot.Revision && snapshot.Digest != s.snapshot.Digest {
+			return false, ErrDesiredSnapshotConflict
+		}
+		if snapshot.Revision == s.snapshot.Revision {
+			return false, nil
+		}
+	}
+	identities := make(map[string]string, len(snapshot.Items))
+	for _, desired := range snapshot.Items {
+		identity, err := model.DesiredStateIdentityDigest(desired)
+		if err != nil {
+			return false, err
+		}
+		identities[desired.ConfigID.Name] = identity
+		if previous, exists := s.highwater[desired.ConfigID.Name]; exists &&
+			(desired.Version < previous.version || desired.Version == previous.version && identity != previous.digest) {
+			return false, ErrDesiredSnapshotConflict
+		}
+	}
+	copy := model.CloneDesiredSnapshot(snapshot)
+	s.snapshot = &copy
+	for _, desired := range snapshot.Items {
+		s.highwater[desired.ConfigID.Name] = desiredHighwater{version: desired.Version, digest: identities[desired.ConfigID.Name]}
+	}
+	return true, nil
+}
+
+func (s *MemoryDesiredSnapshotStore) LoadDesiredSnapshot(_ context.Context) (*model.DesiredSnapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.snapshot == nil {
+		return nil, nil
+	}
+	copy := model.CloneDesiredSnapshot(*s.snapshot)
+	return &copy, nil
+}
+
 func NewMemoryExecutionStore() *MemoryExecutionStore {
 	return &MemoryExecutionStore{executions: make(map[model.ConfigID]ExecutionSnapshot)}
 }

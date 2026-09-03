@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"slices"
 	"sync"
 	"time"
 
@@ -16,6 +17,10 @@ import (
 const (
 	maxConcurrentExecutions = 10
 	maxConcurrentControls   = 10
+	maxConcurrentPlans      = 10
+	maxConcurrentDeletes    = 4
+	providerPlanTimeout     = 30 * time.Second
+	providerExecuteTimeout  = 30 * time.Minute
 )
 
 // Reconciler owns desired state and drives generation-aware plan execution.
@@ -35,22 +40,26 @@ type Reconciler struct {
 	configs      map[string]*model.ManagedConfig
 	cancels      map[model.AttemptID]context.CancelFunc
 	pendingPlans map[string]struct{}
+	planning     map[string]bool
 
 	desiredWake    chan struct{}
-	pendingDelete  chan string
+	pendingDelete  chan deleteRequest
 	execSem        chan struct{}
 	controlSem     chan struct{}
+	planSem        chan struct{}
 	controlScanSem chan struct{}
 	outboxWake     chan struct{}
 	controlWake    chan struct{}
 	controlTimeout time.Duration
+	planTimeout    time.Duration
+	executeTimeout time.Duration
 }
 
 func NewReconciler(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
 	return &Reconciler{
 		providers: make(map[string]Provider), providerVersions: make(map[string]map[string]Provider), store: store, events: events, arbiter: arbiter, journal: journal,
-		registry: NewPlanRegistry(executionStore), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc), pendingPlans: make(map[string]struct{}),
-		desiredWake: make(chan struct{}, 1), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions), controlSem: make(chan struct{}, maxConcurrentControls), controlScanSem: make(chan struct{}, 1), outboxWake: make(chan struct{}, 1), controlWake: make(chan struct{}, 1), controlTimeout: effectControlRPCTimeout,
+		registry: NewPlanRegistry(executionStore), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc), pendingPlans: make(map[string]struct{}), planning: make(map[string]bool),
+		desiredWake: make(chan struct{}, 1), pendingDelete: make(chan deleteRequest, 128), execSem: make(chan struct{}, maxConcurrentExecutions), controlSem: make(chan struct{}, maxConcurrentControls), planSem: make(chan struct{}, maxConcurrentPlans), controlScanSem: make(chan struct{}, 1), outboxWake: make(chan struct{}, 1), controlWake: make(chan struct{}, 1), controlTimeout: effectControlRPCTimeout, planTimeout: providerPlanTimeout, executeTimeout: providerExecuteTimeout,
 	}
 }
 
@@ -81,7 +90,7 @@ func (r *Reconciler) RegisterProvider(ctx context.Context, provider Provider) {
 	}
 	r.mu.Unlock()
 	for _, name := range affected {
-		r.planLatest(ctx, name)
+		r.queuePlan(name)
 	}
 }
 
@@ -132,6 +141,9 @@ func validateDesired(desired model.DesiredState) error {
 	if desired.ProviderType == "" {
 		return errors.New("desired provider type is empty")
 	}
+	if desired.Version == 0 {
+		return errors.New("desired version is zero")
+	}
 	expected := model.DesiredSpecDigest(desired.Spec)
 	if desired.Digest != expected {
 		return errors.Errorf("desired digest mismatch: got %q, want %q", desired.Digest, expected)
@@ -155,9 +167,59 @@ func (r *Reconciler) Config(name string) (model.ManagedConfig, bool) {
 	return copy, true
 }
 
-func (r *Reconciler) SubmitDelete(ctx context.Context, name string) error {
+// ConfigNames returns a stable snapshot of all configurations currently known
+// to the reconciler, including configurations still converging or deleting.
+func (r *Reconciler) ConfigNames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	names := make([]string, 0, len(r.configs))
+	for name := range r.configs {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// Refresh schedules a fresh Inspect/Replan cycle without changing Desired.
+func (r *Reconciler) Refresh(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if r.configs[name] == nil {
+		r.mu.Unlock()
+		return errors.Errorf("config %q not found", name)
+	}
+	r.pendingPlans[name] = struct{}{}
+	r.mu.Unlock()
 	select {
-	case r.pendingDelete <- name:
+	case r.desiredWake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (r *Reconciler) SubmitDelete(ctx context.Context, name string) error {
+	return r.submitDelete(ctx, deleteRequest{name: name})
+}
+
+// SubmitDeleteIfDesired queues deletion only while the accepted Desired still
+// has the supplied identity. It prevents a delayed old-snapshot deletion from
+// removing a configuration reintroduced by a newer snapshot.
+func (r *Reconciler) SubmitDeleteIfDesired(ctx context.Context, desired model.DesiredState) error {
+	return r.submitDelete(ctx, deleteRequest{name: desired.ConfigID.Name, version: desired.Version, digest: desired.Digest, conditional: true})
+}
+
+type deleteRequest struct {
+	name        string
+	version     uint64
+	digest      string
+	conditional bool
+}
+
+func (r *Reconciler) submitDelete(ctx context.Context, request deleteRequest) error {
+	select {
+	case r.pendingDelete <- request:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -165,14 +227,36 @@ func (r *Reconciler) SubmitDelete(ctx context.Context, name string) error {
 }
 
 func (r *Reconciler) Run(ctx context.Context) error {
+	return r.run(ctx, nil)
+}
+
+// RunWithReady is Run with an explicit recovery barrier for embedding
+// runtimes. Exactly one value is sent after recovery succeeds or fails.
+func (r *Reconciler) RunWithReady(ctx context.Context, ready chan<- error) error {
+	return r.run(ctx, ready)
+}
+
+func (r *Reconciler) run(ctx context.Context, ready chan<- error) error {
 	if err := r.recover(ctx); err != nil {
+		if ready != nil {
+			ready <- err
+		}
 		return errors.Wrap(err, "recover")
 	}
 	eventCh, err := r.events.Subscribe(ctx, "")
 	if err != nil {
+		if ready != nil {
+			ready <- err
+		}
 		return errors.Wrap(err, "subscribe")
 	}
 	go r.runOutboxDispatcher(ctx)
+	for range maxConcurrentDeletes {
+		go r.runDeleteWorker(ctx)
+	}
+	if ready != nil {
+		ready <- nil
+	}
 	r.wakeOutbox()
 	driftTicker := time.NewTicker(30 * time.Second)
 	controlTicker := time.NewTicker(time.Second)
@@ -184,8 +268,6 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-r.desiredWake:
 			r.planAcceptedDesired(ctx)
-		case name := <-r.pendingDelete:
-			r.deleteConfig(ctx, name)
 		case event := <-eventCh:
 			r.handleEvent(ctx, event)
 		case <-r.controlWake:
@@ -197,6 +279,17 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		}
 		r.processDueControls(ctx)
 		r.executeReady(ctx)
+	}
+}
+
+func (r *Reconciler) runDeleteWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case request := <-r.pendingDelete:
+			r.deleteConfigRequest(ctx, request)
+		}
 	}
 }
 
@@ -249,15 +342,69 @@ func (r *Reconciler) recover(ctx context.Context) error {
 
 func (r *Reconciler) planAcceptedDesired(ctx context.Context) {
 	r.mu.Lock()
-	names := make([]string, 0, len(r.pendingPlans))
+	var names []string
 	for name := range r.pendingPlans {
+		if r.planning[name] {
+			continue
+		}
+		select {
+		case r.planSem <- struct{}{}:
+		default:
+			continue
+		}
+		r.planning[name] = true
 		names = append(names, name)
 		delete(r.pendingPlans, name)
 	}
 	r.mu.Unlock()
 	for _, name := range names {
-		r.planLatest(ctx, name)
-		r.invalidateDependents(ctx, name)
+		go func(name string) {
+			planCtx, cancel := context.WithTimeout(ctx, r.planTimeout)
+			defer cancel()
+			r.planLatest(planCtx, name)
+			r.invalidateDependents(ctx, name)
+			<-r.planSem
+			r.mu.Lock()
+			delete(r.planning, name)
+			r.mu.Unlock()
+			select {
+			case r.desiredWake <- struct{}{}:
+			default:
+			}
+		}(name)
+	}
+}
+
+func (r *Reconciler) queuePlan(name string) {
+	r.mu.Lock()
+	if r.configs[name] != nil {
+		r.pendingPlans[name] = struct{}{}
+	}
+	r.mu.Unlock()
+	select {
+	case r.desiredWake <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Reconciler) scheduleVerify(ctx context.Context, plan *model.Plan, provider Provider) {
+	select {
+	case r.planSem <- struct{}{}:
+		go func() {
+			defer func() {
+				<-r.planSem
+				select {
+				case r.desiredWake <- struct{}{}:
+				default:
+				}
+			}()
+			verifyCtx, cancel := context.WithTimeout(ctx, r.planTimeout)
+			defer cancel()
+			r.verifyAndRecord(verifyCtx, plan, provider)
+		}()
+	default:
+		// A later plan pass also verifies an already-completed plan.
+		r.queuePlan(plan.ConfigID.Name)
 	}
 }
 
@@ -407,6 +554,8 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 			opCtx, cancel := context.WithCancel(ctx)
 			if operation.Timeout > 0 {
 				opCtx, cancel = context.WithTimeout(ctx, time.Duration(operation.Timeout))
+			} else {
+				opCtx, cancel = context.WithTimeout(ctx, r.executeTimeout)
 			}
 			// Register cancellation before exposing Running to close the launch race.
 			r.mu.Lock()
@@ -472,7 +621,7 @@ func (r *Reconciler) executeAttempt(ctx, opCtx context.Context, cancel context.C
 			zap.L().Error("converge: persist timed-out unknown effect", zap.Error(transitionErr))
 		}
 		// Inspect/Replan is the only safe way to decide whether the effect happened.
-		r.planLatest(ctx, plan.ConfigID.Name)
+		r.queuePlan(plan.ConfigID.Name)
 		return
 	}
 	if err != nil {
@@ -568,7 +717,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 		if r.registry.IsDeleting(configID) && r.registry.DeletionReady(configID) {
 			r.finalizeDeletion(ctx, configID)
 		} else {
-			r.planLatest(ctx, event.ConfigID)
+			r.queuePlan(event.ConfigID)
 		}
 		return
 	}
@@ -588,7 +737,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 		provider := r.providerVersions[snapshot.Plan.ProviderType][snapshot.Plan.ProviderDigest]
 		r.mu.RUnlock()
 		if provider != nil {
-			r.verifyAndRecord(ctx, snapshot.Plan, provider)
+			r.scheduleVerify(ctx, snapshot.Plan, provider)
 		}
 	}
 }
@@ -633,10 +782,10 @@ func (r *Reconciler) dependenciesMet(managed *model.ManagedConfig) bool {
 	return true
 }
 
-func (r *Reconciler) invalidateDependents(ctx context.Context, upstream string) {
+func (r *Reconciler) invalidateDependents(_ context.Context, upstream string) {
 	for _, name := range r.transitiveDependents(upstream) {
 		r.setConfigStatus(name, model.ConfigConverging)
-		r.planLatest(ctx, name)
+		r.queuePlan(name)
 	}
 }
 func (r *Reconciler) wakeDependents(ctx context.Context, name string) {
@@ -644,10 +793,24 @@ func (r *Reconciler) wakeDependents(ctx context.Context, name string) {
 }
 
 func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
+	r.deleteConfigRequest(ctx, deleteRequest{name: name})
+}
+
+func (r *Reconciler) deleteConfigRequest(ctx context.Context, request deleteRequest) {
+	name := request.name
+	if request.conditional {
+		r.mu.RLock()
+		managed := r.configs[name]
+		matches := managed != nil && managed.Desired.Version == request.version && managed.Desired.Digest == request.digest
+		r.mu.RUnlock()
+		if !matches {
+			return
+		}
+	}
 	// Dependents are deleted first so no converged config can reference a
 	// deleted upstream.
 	for _, dependent := range r.transitiveDependents(name) {
-		r.deleteConfig(ctx, dependent)
+		r.deleteConfigRequest(ctx, deleteRequest{name: dependent})
 	}
 	r.mu.RLock()
 	managed := r.configs[name]
@@ -658,6 +821,7 @@ func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
 	attempts, err := r.registry.MarkDeleting(ctx, managed.ID)
 	if err != nil {
 		zap.L().Error("converge: mark config deleting", zap.String("config", name), zap.Error(err))
+		r.setConfigError(name, errors.Wrap(err, "mark deleting"))
 		return
 	}
 	r.setConfigStatus(name, model.ConfigConverging)
@@ -683,10 +847,12 @@ func (r *Reconciler) finalizeDeletion(ctx context.Context, configID model.Config
 	// harmless because the tombstone resumes deletion on recovery.
 	if err := r.store.Delete(ctx, configID); err != nil {
 		zap.L().Error("converge: delete recorded state", zap.String("config", configID.Name), zap.Error(err))
+		r.setConfigError(configID.Name, errors.Wrap(err, "delete recorded state"))
 		return
 	}
 	if err := r.registry.Delete(ctx, configID); err != nil {
 		zap.L().Error("converge: delete execution state", zap.String("config", configID.Name), zap.Error(err))
+		r.setConfigError(configID.Name, errors.Wrap(err, "delete execution state"))
 		return
 	}
 	r.mu.Lock()
@@ -708,7 +874,7 @@ func (r *Reconciler) detectDrift(ctx context.Context) {
 	}
 	r.mu.RUnlock()
 	for _, name := range names {
-		r.planLatest(ctx, name)
+		r.queuePlan(name)
 	}
 }
 

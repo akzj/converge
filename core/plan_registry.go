@@ -63,6 +63,15 @@ func (r *PlanRegistry) Snapshot(configID model.ConfigID) model.PlanSnapshot {
 	return result
 }
 
+// Execution returns a detached durable-state view for status and diagnostics.
+// Provider payloads remain inside Desired/Operation and should be redacted by
+// any external API built on this method.
+func (r *PlanRegistry) Execution(configID model.ConfigID) ExecutionSnapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.executionSnapshotLocked(r.configs[configID.Name])
+}
+
 // ExecutionPlans returns deep copies of all durable active plans.
 func (r *PlanRegistry) ExecutionPlans() []*model.Plan {
 	r.mu.RLock()
