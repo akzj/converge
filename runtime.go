@@ -1,5 +1,5 @@
-// Package edge provides the durable protocol boundary around Converge Core.
-package edge
+// Package converge provides the embeddable durable reconciliation runtime.
+package converge
 
 import (
 	"context"
@@ -40,6 +40,7 @@ type RuntimeStatus struct {
 type Runtime struct {
 	reconciler *core.Reconciler
 	store      core.DesiredSnapshotStore
+	sqlite     *core.SQLiteStore
 	wake       chan struct{}
 
 	mu                 sync.RWMutex
@@ -48,47 +49,72 @@ type Runtime struct {
 	ready              bool
 	started            bool
 	running            bool
+	closed             bool
 }
 
-var ErrRuntimeAlreadyRunning = errors.New("edge runtime Run may only be called once")
+var (
+	ErrRuntimeAlreadyRunning = errors.New("converge runtime Run may only be called once")
+	ErrRuntimeRunning        = errors.New("converge runtime is running")
+	ErrRuntimeClosed         = errors.New("converge runtime is closed")
+)
 
-func NewRuntime(reconciler *core.Reconciler, store core.DesiredSnapshotStore) (*Runtime, error) {
+func newRuntime(reconciler *core.Reconciler, store core.DesiredSnapshotStore) (*Runtime, error) {
 	if reconciler == nil {
-		return nil, errors.New("edge runtime reconciler is nil")
+		return nil, errors.New("converge runtime reconciler is nil")
 	}
 	if isNilDependency(store) {
-		return nil, errors.New("edge runtime snapshot store is nil")
+		return nil, errors.New("converge runtime snapshot store is nil")
 	}
 	if err := reconciler.Validate(); err != nil {
-		return nil, errors.Wrap(err, "invalid edge runtime reconciler")
+		return nil, errors.Wrap(err, "invalid converge runtime reconciler")
 	}
 	return &Runtime{reconciler: reconciler, store: store, wake: make(chan struct{}, 1)}, nil
 }
 
-// OpenSQLiteRuntime wires one SQLite database into all durable Core stores and
-// uses process-local delivery/arbitration under the database's exclusive
-// ownership lock. Callers register Providers before starting Runtime.Run.
-func OpenSQLiteRuntime(ctx context.Context, path string, options ...core.ReconcilerOption) (*Runtime, *core.Reconciler, *core.SQLiteStore, error) {
+// OpenSQLiteRuntime opens a self-contained runtime backed by one SQLite
+// database. Runtime owns the database and closes it from Close.
+func OpenSQLiteRuntime(ctx context.Context, path string, options ...core.ReconcilerOption) (*Runtime, error) {
 	store, err := core.OpenSQLite(ctx, path)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	reconciler, err := core.NewReconcilerChecked(store, store, core.NewMemoryEventBus(), core.NewMemoryArbiter(), store, options...)
 	if err != nil {
 		_ = store.Close()
-		return nil, nil, nil, err
+		return nil, err
 	}
-	runtime, err := NewRuntime(reconciler, store)
+	runtime, err := newRuntime(reconciler, store)
 	if err != nil {
 		_ = store.Close()
-		return nil, nil, nil, err
+		return nil, err
 	}
-	return runtime, reconciler, store, nil
+	runtime.sqlite = store
+	return runtime, nil
+}
+
+// RegisterProvider registers a resource implementation. Register Providers
+// before Run; a later digest for the same type is a rolling upgrade.
+func (r *Runtime) RegisterProvider(ctx context.Context, provider core.Provider) error {
+	if err := r.ensureOpen(); err != nil {
+		return err
+	}
+	return r.reconciler.RegisterProviderChecked(ctx, provider)
+}
+
+// UnregisterProviderVersion removes an unused Provider version while stopped.
+func (r *Runtime) UnregisterProviderVersion(providerType, providerDigest string) error {
+	if err := r.ensureOpen(); err != nil {
+		return err
+	}
+	return r.reconciler.UnregisterProviderVersion(providerType, providerDigest)
 }
 
 // SubmitSnapshot validates and persists the complete snapshot before returning
 // an accepted ACK. Convergence happens asynchronously in Run.
 func (r *Runtime) SubmitSnapshot(ctx context.Context, snapshot model.DesiredSnapshot) SnapshotACK {
+	if err := r.ensureOpen(); err != nil {
+		return SnapshotACK{Revision: snapshot.Revision, Digest: snapshot.Digest, Code: "runtime_closed", Reason: err.Error()}
+	}
 	if err := model.ValidateDesiredSnapshot(snapshot); err != nil {
 		return SnapshotACK{Revision: snapshot.Revision, Digest: snapshot.Digest, Code: "invalid_snapshot", Reason: err.Error()}
 	}
@@ -109,6 +135,9 @@ func (r *Runtime) SubmitSnapshot(ctx context.Context, snapshot model.DesiredSnap
 }
 
 func (r *Runtime) CurrentSnapshot(ctx context.Context) (SnapshotIdentity, error) {
+	if err := r.ensureOpen(); err != nil {
+		return SnapshotIdentity{}, err
+	}
 	snapshot, err := r.store.LoadDesiredSnapshot(ctx)
 	if err != nil {
 		return SnapshotIdentity{}, err
@@ -117,6 +146,17 @@ func (r *Runtime) CurrentSnapshot(ctx context.Context) (SnapshotIdentity, error)
 		return SnapshotIdentity{}, nil
 	}
 	return SnapshotIdentity{Present: true, Revision: snapshot.Revision, Digest: snapshot.Digest}, nil
+}
+
+// Backup creates a transactionally consistent copy of the runtime database.
+func (r *Runtime) Backup(ctx context.Context, destination string) error {
+	if err := r.ensureOpen(); err != nil {
+		return err
+	}
+	if r.sqlite == nil {
+		return errors.New("converge runtime is not backed by SQLite")
+	}
+	return r.sqlite.Backup(ctx, destination)
 }
 
 func (r *Runtime) Status(ctx context.Context) (RuntimeStatus, error) {
@@ -136,6 +176,9 @@ func (r *Runtime) ConfigStatus(name string) (core.ConfigReport, bool) {
 }
 
 func (r *Runtime) Refresh(ctx context.Context, name string) error {
+	if err := r.ensureOpen(); err != nil {
+		return err
+	}
 	return r.reconciler.Refresh(ctx, name)
 }
 
@@ -152,6 +195,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 		return err
 	}
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return ErrRuntimeClosed
+	}
 	if r.started {
 		r.mu.Unlock()
 		return ErrRuntimeAlreadyRunning
@@ -207,6 +254,36 @@ func (r *Runtime) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// Close releases the SQLite database owned by a runtime created with
+// OpenSQLiteRuntime. The caller must first cancel Run and wait for it to return.
+// No other Runtime calls may race with Close. Close is idempotent.
+func (r *Runtime) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.running {
+		return ErrRuntimeRunning
+	}
+	if r.closed {
+		return nil
+	}
+	if r.sqlite != nil {
+		if err := r.sqlite.Close(); err != nil {
+			return err
+		}
+	}
+	r.closed = true
+	return nil
+}
+
+func (r *Runtime) ensureOpen() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return ErrRuntimeClosed
+	}
+	return nil
 }
 
 func isNilDependency(value any) bool {

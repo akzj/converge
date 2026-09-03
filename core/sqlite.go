@@ -30,7 +30,7 @@ type SQLiteStore struct {
 
 const sqliteSchemaVersion = 2
 
-// OpenSQLite opens or creates a SQLite database suitable for an edge runtime.
+// OpenSQLite opens or creates a SQLite database suitable for an embedded runtime.
 // WAL permits readers and writers to make progress concurrently; busy_timeout
 // turns short writer contention into bounded waiting instead of immediate loss.
 func OpenSQLite(ctx context.Context, path string) (*SQLiteStore, error) {

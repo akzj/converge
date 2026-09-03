@@ -5,10 +5,10 @@ accepts complete desired snapshots, builds generation-aware plans, executes
 provider operations, and persists enough state to recover conservatively after
 a process restart.
 
-The repository is split into four public packages:
+The module exposes one recommended entry package and three supporting packages:
 
-- `edge`: recommended Agent integration boundary, including durable snapshot
-  acceptance, status APIs, and an optional HTTP handler;
+- `converge`: recommended Agent integration boundary, including durable
+  snapshot acceptance and status APIs;
 - `core`: reconciliation, plans, attempts, external effects, recovery, and
   SQLite/in-memory storage implementations;
 - `observability`: backend-neutral tracing and transition contracts plus a
@@ -20,7 +20,7 @@ The repository is split into four public packages:
 ```go
 ctx, cancel := context.WithCancel(context.Background())
 
-runtime, reconciler, store, err := edge.OpenSQLiteRuntime(
+runtime, err := converge.OpenSQLiteRuntime(
     ctx,
     "/var/lib/my-agent/converge.db",
     core.WithLogger(logger),
@@ -30,15 +30,15 @@ if err != nil {
     return err
 }
 
-if err := reconciler.RegisterProviderChecked(ctx, provider); err != nil {
-    _ = store.Close()
+if err := runtime.RegisterProvider(ctx, provider); err != nil {
+	_ = runtime.Close()
     return err
 }
 
 runErr := runtime.Run(ctx)
 // Runtime.Run returns only after tracked planning, execution, control,
 // deletion, verification, and outbox workers have stopped.
-if err := store.Close(); err != nil {
+if err := runtime.Close(); err != nil {
     return err
 }
 return runErr
@@ -49,12 +49,12 @@ closing the SQLite store or Provider resources. Providers must honor context
 cancellation; Go cannot forcibly stop an implementation that ignores it.
 `Runtime.Run` and `Reconciler.Run` are single-use and reject a second invocation.
 
-`OpenSQLiteRuntime` returns the store to make resource ownership explicit. The
-caller owns `SQLiteStore.Close` and any `observability.AsyncObserver.Shutdown`.
+`OpenSQLiteRuntime` owns its SQLite store. After `Run` returns, call
+`Runtime.Close` to release it. The caller still owns Provider resources and any
+`observability.AsyncObserver.Shutdown`.
 
-Use `NewReconcilerChecked` for custom storage/event-bus wiring. The legacy
-`NewReconciler` remains source compatible, but records dependency validation
-errors for state-changing methods and `Run` to return.
+Advanced users that need custom storage or event-bus wiring may use the `core`
+package directly and assume its lifecycle invariants.
 
 ## Provider lifecycle
 
@@ -66,7 +66,7 @@ version and rejects removal of a version still referenced by durable state.
 
 ## Durability and protocol
 
-See [Edge Runtime integration](docs/edge-runtime.md),
+See [Runtime integration](docs/runtime.md),
 [SQLite durability](docs/adr/0002-sqlite-durable-store.md),
 [External Active Effects](docs/design/external-active-effects.md), and
 [Observability](docs/design/observability.md).

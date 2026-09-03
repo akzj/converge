@@ -1,12 +1,8 @@
-package edge
+package converge
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -65,7 +61,7 @@ func newTestRuntime(t *testing.T) (*Runtime, *core.Reconciler, *core.MemoryDesir
 	store := core.NewMemoryDesiredSnapshotStore()
 	reconciler := core.NewReconciler(core.NewMemoryStateStore(), core.NewMemoryExecutionStore(), core.NewMemoryEventBus(), core.NewMemoryArbiter(), core.NewMemoryJournal())
 	reconciler.RegisterProvider(context.Background(), noOpProvider{})
-	runtime, err := NewRuntime(reconciler, store)
+	runtime, err := newRuntime(reconciler, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +115,7 @@ func TestRuntimeRejectsPerConfigVersionRollbackAfterDeletion(t *testing.T) {
 
 func TestRuntimeDoesNotAckPersistenceFailure(t *testing.T) {
 	reconciler := core.NewReconciler(core.NewMemoryStateStore(), core.NewMemoryExecutionStore(), core.NewMemoryEventBus(), core.NewMemoryArbiter(), core.NewMemoryJournal())
-	runtime, err := NewRuntime(reconciler, failingSnapshotStore{err: context.DeadlineExceeded})
+	runtime, err := newRuntime(reconciler, failingSnapshotStore{err: context.DeadlineExceeded})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,6 +133,9 @@ func TestRuntimeRejectsConcurrentRun(t *testing.T) {
 	waitFor(t, runtime.Ready)
 	if err := runtime.Run(context.Background()); !errors.Is(err, ErrRuntimeAlreadyRunning) {
 		t.Fatalf("second Run error = %v", err)
+	}
+	if err := runtime.Close(); !errors.Is(err, ErrRuntimeRunning) {
+		t.Fatalf("Close while running error = %v", err)
 	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -168,12 +167,13 @@ func (optionSpan) End(observability.ActivityResult)     {}
 
 func TestOpenSQLiteRuntimePassesReconcilerOptions(t *testing.T) {
 	observer := &optionObserver{committed: make(chan struct{}, 1)}
-	runtime, reconciler, store, err := OpenSQLiteRuntime(context.Background(), filepath.Join(t.TempDir(), "options.db"), core.WithObserver(observer))
+	path := filepath.Join(t.TempDir(), "options.db")
+	backupPath := filepath.Join(t.TempDir(), "options-backup.db")
+	runtime, err := OpenSQLiteRuntime(context.Background(), path, core.WithObserver(observer))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	if err := reconciler.RegisterProviderChecked(context.Background(), noOpProvider{}); err != nil {
+	if err := runtime.RegisterProvider(context.Background(), noOpProvider{}); err != nil {
 		t.Fatal(err)
 	}
 	if ack := runtime.SubmitSnapshot(context.Background(), snapshot(t, 1, desired("a", 1))); !ack.Accepted {
@@ -188,8 +188,37 @@ func TestOpenSQLiteRuntimePassesReconcilerOptions(t *testing.T) {
 		cancel()
 		t.Fatal("observer option did not reach reconciler")
 	}
+	if err := runtime.Backup(context.Background(), backupPath); err != nil {
+		cancel()
+		t.Fatalf("backup: %v", err)
+	}
 	cancel()
-	<-done
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := runtime.RegisterProvider(context.Background(), noOpProvider{}); !errors.Is(err, ErrRuntimeClosed) {
+		t.Fatalf("register after Close error = %v", err)
+	}
+	backup, err := core.OpenSQLite(context.Background(), backupPath)
+	if err != nil {
+		t.Fatalf("open backup: %v", err)
+	}
+	if err := backup.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteRuntime(context.Background(), path)
+	if err != nil {
+		t.Fatalf("reopen after Close: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRuntimeReplaysAcceptedSnapshotAfterRestart(t *testing.T) {
@@ -201,7 +230,7 @@ func TestRuntimeReplaysAcceptedSnapshotAfterRestart(t *testing.T) {
 	}
 	reconciler := core.NewReconciler(store, store, core.NewMemoryEventBus(), core.NewMemoryArbiter(), store)
 	reconciler.RegisterProvider(ctx, noOpProvider{})
-	runtime, _ := NewRuntime(reconciler, store)
+	runtime, _ := newRuntime(reconciler, store)
 	first := snapshot(t, 1, desired("a", 1), desired("b", 1))
 	if ack := runtime.SubmitSnapshot(ctx, first); !ack.Accepted {
 		t.Fatalf("first ack=%#v", ack)
@@ -237,7 +266,7 @@ func TestRuntimeReplaysAcceptedSnapshotAfterRestart(t *testing.T) {
 	defer store.Close()
 	reconciler = core.NewReconciler(store, store, core.NewMemoryEventBus(), core.NewMemoryArbiter(), store)
 	reconciler.RegisterProvider(ctx, noOpProvider{})
-	runtime, _ = NewRuntime(reconciler, store)
+	runtime, _ = newRuntime(reconciler, store)
 	runCtx, cancel = context.WithCancel(ctx)
 	done = make(chan error, 1)
 	go func() { done <- runtime.Run(runCtx) }()
@@ -248,68 +277,6 @@ func TestRuntimeReplaysAcceptedSnapshotAfterRestart(t *testing.T) {
 	})
 	cancel()
 	<-done
-}
-
-func TestHTTPHandlerAuthenticationAndNegotiation(t *testing.T) {
-	runtime, _, _ := newTestRuntime(t)
-	handler, err := NewHTTPHandler(runtime, "secret")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(handler)
-	defer server.Close()
-
-	response, err := http.Get(server.URL + "/v1/status")
-	if err != nil {
-		t.Fatal(err)
-	}
-	response.Body.Close()
-	if response.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated status=%d", response.StatusCode)
-	}
-
-	desiredSnapshot := snapshot(t, 1, desired("a", 1))
-	body, err := json.Marshal(desiredSnapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/desired-snapshots", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer secret")
-	req.Header.Set("Content-Type", "application/json")
-	response, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response.Body.Close()
-	if response.StatusCode != http.StatusAccepted {
-		t.Fatalf("snapshot status=%d", response.StatusCode)
-	}
-	// A retry after a lost ACK is idempotently acknowledged.
-	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/desired-snapshots", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer secret")
-	response, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var ack SnapshotACK
-	if err := json.NewDecoder(response.Body).Decode(&ack); err != nil {
-		t.Fatal(err)
-	}
-	response.Body.Close()
-	if response.StatusCode != http.StatusOK || !ack.Accepted || ack.Code != "duplicate" {
-		t.Fatalf("duplicate status=%d ack=%#v", response.StatusCode, ack)
-	}
-
-	req, _ = http.NewRequest(http.MethodGet, server.URL+"/v1/desired-snapshots/current", nil)
-	req.Header.Set("Authorization", "Bearer secret")
-	response, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("negotiation status=%d", response.StatusCode)
-	}
 }
 
 func waitFor(t *testing.T, condition func() bool) {
