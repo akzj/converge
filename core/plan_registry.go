@@ -33,6 +33,7 @@ type PlanRegistry struct {
 	mu      sync.RWMutex
 	configs map[string]*configExecution
 	store   ExecutionStore
+	locks   sync.Map // map[config name]*sync.Mutex
 }
 
 var ErrDesiredConflict = errors.New("desired revision conflict")
@@ -140,11 +141,23 @@ func (r *PlanRegistry) persistLocked(ctx context.Context, id model.ConfigID, exp
 	if r.store == nil {
 		return nil
 	}
-	if err := r.store.CommitExecutionCAS(ctx, id, expectedRevision, snapshot); err != nil {
+	// The caller holds the config-specific mutex, so the global map lock can be
+	// released during storage I/O without allowing a same-config writer to pass.
+	r.mu.Unlock()
+	err := r.store.CommitExecutionCAS(ctx, id, expectedRevision, snapshot)
+	r.mu.Lock()
+	if err != nil {
 		state.revision = originalRevision
 		return err
 	}
 	return nil
+}
+
+func (r *PlanRegistry) lockConfig(id model.ConfigID) func() {
+	lock, _ := r.locks.LoadOrStore(id.Name, &sync.Mutex{})
+	mutex := lock.(*sync.Mutex)
+	mutex.Lock()
+	return mutex.Unlock
 }
 
 // Restore loads durable state. Previously-running attempts become Unknown and
@@ -288,6 +301,8 @@ func (r *PlanRegistry) AcceptDesired(ctx context.Context, desired model.DesiredS
 	if err := validateDesired(desired); err != nil {
 		return false, err
 	}
+	unlockConfig := r.lockConfig(desired.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[desired.ConfigID.Name]
@@ -338,6 +353,8 @@ func (r *PlanRegistry) Install(ctx context.Context, expected model.Generation, c
 	if candidate == nil {
 		return nil, PlanChange{}, errors.New("candidate plan is nil")
 	}
+	unlockConfig := r.lockConfig(candidate.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	original := r.configs[candidate.ConfigID.Name]
@@ -577,6 +594,8 @@ func (r *PlanRegistry) StartAttempt(ctx context.Context, configID model.ConfigID
 	if attemptID == "" {
 		return nil, errors.New("attempt ID is empty")
 	}
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	currentState := r.configs[configID.Name]
@@ -618,6 +637,8 @@ func (r *PlanRegistry) ApplyEvent(ctx context.Context, event model.Event) (activ
 	if event.AttemptID == "" {
 		return false, false, errors.New("event attempt ID is empty")
 	}
+	unlockConfig := r.lockConfig(model.ConfigID{Name: event.ConfigID})
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	currentState := r.configs[event.ConfigID]
@@ -832,6 +853,8 @@ func (r *PlanRegistry) EnqueueOutbox(ctx context.Context, event model.Event) err
 	if event.EventID == "" {
 		return errors.New("outbox event ID is empty")
 	}
+	unlockConfig := r.lockConfig(model.ConfigID{Name: event.ConfigID})
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[event.ConfigID]
@@ -862,6 +885,8 @@ func (r *PlanRegistry) PendingOutbox() []model.Event {
 
 // AckOutbox removes an event after successful processing.
 func (r *PlanRegistry) AckOutbox(ctx context.Context, configID model.ConfigID, eventID string) error {
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]
@@ -884,10 +909,15 @@ func (r *PlanRegistry) AckOutbox(ctx context.Context, configID model.ConfigID, e
 // Durable deletion happens first so a failed delete cannot expose a partially
 // deleted in-memory state that would reappear after restart.
 func (r *PlanRegistry) Delete(ctx context.Context, configID model.ConfigID) error {
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.store != nil {
-		if err := r.store.DeleteExecution(ctx, configID); err != nil {
+		r.mu.Unlock()
+		err := r.store.DeleteExecution(ctx, configID)
+		r.mu.Lock()
+		if err != nil {
 			return err
 		}
 	}

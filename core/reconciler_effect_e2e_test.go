@@ -71,6 +71,7 @@ func TestEffectEnsureThenObserveThenCompletedE2E(t *testing.T) {
 	}
 
 	// Wait for the observe operation to start and return Waiting.
+	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if provider.Counts().ObserveCount > 0 {
 			break
@@ -105,6 +106,7 @@ func TestEffectEnsureThenObserveThenCompletedE2E(t *testing.T) {
 	t.Log("job advanced to ready")
 
 	// Drive control scheduler and waiting wakeups until observe completes.
+	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		_ = r.registry.WakeDueWaiting(ctx, time.Now().Add(10*time.Second))
 		_ = r.registry.WakeDueControls(ctx, time.Now())

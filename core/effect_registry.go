@@ -33,6 +33,8 @@ type TransitionIdentity struct {
 // Ensuring state, and an EnsureRetry control. All identity and spec fields are
 // immutable after this command.
 func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureRequest) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(req.Identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[req.Identity.EffectIdentity.ConfigID.Name]
@@ -96,6 +98,8 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 	if err := ValidateEnsureDispositionFailure(result.Disposition, result.Failure); err != nil {
 		return TransitionRejected, err
 	}
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -259,6 +263,8 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 	if result.Disposition != EnsureBound {
 		return TransitionRejected, errors.Errorf("unsupported terminal ensure disposition %q", result.Disposition)
 	}
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -350,6 +356,8 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 // with the given AttemptID, PollRequestID, and lease expiration, and creates a
 // complete Attempt record so control polls share the global attempt history.
 func (r *PlanRegistry) ClaimDueControl(ctx context.Context, configID model.ConfigID, controlID ControlRequestID, now time.Time, attemptID model.AttemptID, pollID PollRequestID, leaseUntil time.Time) (*EffectControl, error) {
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]
@@ -402,6 +410,8 @@ func (r *PlanRegistry) ClaimDueControl(ctx context.Context, configID model.Confi
 // ApplyEffectObservation transitions an InFlight control and its associated
 // Effect state based on the provider observation.
 func (r *PlanRegistry) ApplyEffectObservation(ctx context.Context, identity TransitionIdentity, observation EffectObservation) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -574,6 +584,8 @@ func (r *PlanRegistry) CompleteEffectObservationAndNode(
 	nodeKey model.OperationKey,
 	event model.Event,
 ) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -713,6 +725,8 @@ func (r *PlanRegistry) CompleteEffectObservationAndNode(
 
 // YieldControl yields an InFlight control with the next check time.
 func (r *PlanRegistry) YieldControl(ctx context.Context, identity TransitionIdentity, nextCheckAt time.Time) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -767,9 +781,21 @@ type DueControlRef struct {
 
 // WakeDueControls forces Pending/Yielded controls to be due at or before now.
 func (r *PlanRegistry) WakeDueControls(ctx context.Context, now time.Time) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for configName, current := range r.configs {
+	r.mu.RLock()
+	ids := make([]model.ConfigID, 0, len(r.configs))
+	for configName := range r.configs {
+		ids = append(ids, model.ConfigID{Name: configName})
+	}
+	r.mu.RUnlock()
+	for _, configID := range ids {
+		unlockConfig := r.lockConfig(configID)
+		r.mu.Lock()
+		current := r.configs[configID.Name]
+		if current == nil {
+			r.mu.Unlock()
+			unlockConfig()
+			continue
+		}
 		changed := false
 		state := cloneConfigExecution(current)
 		for id, control := range state.controls {
@@ -784,57 +810,43 @@ func (r *PlanRegistry) WakeDueControls(ctx context.Context, now time.Time) error
 			changed = true
 		}
 		if !changed {
+			r.mu.Unlock()
+			unlockConfig()
 			continue
 		}
-		configID := model.ConfigID{Name: configName}
 		if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
+			r.mu.Unlock()
+			unlockConfig()
 			return err
 		}
-		r.configs[configName] = state
+		r.configs[configID.Name] = state
+		r.mu.Unlock()
+		unlockConfig()
 	}
 	return nil
 }
 
 // ReclaimExpiredControls resets InFlight controls whose leases have expired.
 func (r *PlanRegistry) ReclaimExpiredControls(ctx context.Context, now time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	var expired []DueControlRef
 	for configName, current := range r.configs {
-		var expired []ControlRequestID
 		for id, control := range current.controls {
 			if control.State == EffectControlInFlight && !control.LeaseExpiresAt.IsZero() && !control.LeaseExpiresAt.After(now) {
-				expired = append(expired, id)
+				expired = append(expired, DueControlRef{ConfigID: model.ConfigID{Name: configName}, ControlRequestID: id})
 			}
 		}
-		if len(expired) == 0 {
-			continue
-		}
-		state := cloneConfigExecution(current)
-		for _, id := range expired {
-			control := state.controls[id]
-			oldControl := control
-			retireControlAttemptLocked(state, control.InFlightAttemptID, model.AttemptUnknown)
-			control.State = EffectControlPending
-			control.InFlightAttemptID = ""
-			control.PollRequestID = ""
-			control.LeaseExpiresAt = time.Time{}
-			control.RetryCount++
-			control.NextCheckAt = now
-			if err := ValidateControlTransition(oldControl, control); err != nil {
-				continue
-			}
-			state.controls[id] = control
-		}
-		configID := model.ConfigID{Name: configName}
-		if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
-			continue
-		}
-		r.configs[configName] = state
+	}
+	r.mu.RUnlock()
+	for _, ref := range expired {
+		_, _ = r.ReclaimExpiredControl(ctx, ref.ConfigID, ref.ControlRequestID, now)
 	}
 }
 
 // ReclaimExpiredControl resets one expired InFlight control.
 func (r *PlanRegistry) ReclaimExpiredControl(ctx context.Context, configID model.ConfigID, controlID ControlRequestID, now time.Time) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]
@@ -873,6 +885,8 @@ func (r *PlanRegistry) ReclaimExpiredControl(ctx context.Context, configID model
 
 // BeginReleaseEffect marks a reference ReleaseRequested and schedules a Release control.
 func (r *PlanRegistry) BeginReleaseEffect(ctx context.Context, req BeginReleaseRequest) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(req.Identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[req.Identity.EffectIdentity.ConfigID.Name]
@@ -926,6 +940,8 @@ func (r *PlanRegistry) ApplyReleaseResult(ctx context.Context, identity Transiti
 	if err := ValidateReleaseDispositionFailure(result.Disposition, result.Failure); err != nil {
 		return TransitionRejected, err
 	}
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -1045,6 +1061,8 @@ func (r *PlanRegistry) CompleteReleaseAndNode(
 	default:
 		return TransitionRejected, errors.Errorf("unsupported terminal release disposition %q", result.Disposition)
 	}
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -1129,6 +1147,8 @@ func (r *PlanRegistry) CompleteReleaseAndNode(
 
 // BeginEnsureReference persists a new Ensuring reference against an already-bound effect.
 func (r *PlanRegistry) BeginEnsureReference(ctx context.Context, identity TransitionIdentity) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -1172,6 +1192,8 @@ func (r *PlanRegistry) BeginEnsureReference(ctx context.Context, identity Transi
 
 // ApplyEnsureReferenceResult activates a reference after the service confirms it.
 func (r *PlanRegistry) ApplyEnsureReferenceResult(ctx context.Context, identity TransitionIdentity, result EnsureReferenceResult) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -1257,6 +1279,8 @@ func (r *PlanRegistry) CompleteEnsureReferenceAndNode(
 	if result.Disposition != EnsureBound {
 		return TransitionRejected, errors.Errorf("ensure reference disposition %q", result.Disposition)
 	}
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -1378,6 +1402,8 @@ func (r *PlanRegistry) HasActiveEffectControl(configID model.ConfigID, effectKey
 // MarkEffectUnknownBound records transport-unknown after a Bound effect poll/release
 // and reschedules Observe or ObserveCancellation.
 func (r *PlanRegistry) MarkEffectUnknownBound(ctx context.Context, identity TransitionIdentity, nextCheckAt time.Time) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -1428,6 +1454,8 @@ func (r *PlanRegistry) AdministratorResolveFailedEffect(ctx context.Context, con
 	if auditReason == "" {
 		return TransitionRejected, errors.New("administrator resolve requires audit reason")
 	}
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]
@@ -1476,6 +1504,8 @@ var _ RegistryCommands = (*PlanRegistry)(nil)
 // does not already exist, bound to the ensure node. The DAG ensure path calls
 // this to hand EnsureEffect RPC ownership to the scheduler.
 func (r *PlanRegistry) EnsureEnsureRetryControl(ctx context.Context, configID model.ConfigID, effectID EffectID, referenceID ReferenceID, planID model.PlanID, generation model.Generation, opKey model.OperationKey) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]
@@ -1513,6 +1543,8 @@ func (r *PlanRegistry) EnsureEnsureRetryControl(ctx context.Context, configID mo
 // outcomes (e.g., EnsureUnknown retry, EnsureFailed) where the DAG node is not
 // advanced by a completion command.
 func (r *PlanRegistry) RetireControlAttempt(ctx context.Context, identity TransitionIdentity, status model.AttemptStatus) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[identity.EffectIdentity.ConfigID.Name]
@@ -1529,6 +1561,8 @@ func (r *PlanRegistry) RetireControlAttempt(ctx context.Context, identity Transi
 }
 
 func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.ConfigID, effectID EffectID, referenceID ReferenceID, planID model.PlanID, generation model.Generation, opKey model.OperationKey) (TransitionDisposition, error) {
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]
@@ -1671,6 +1705,8 @@ func (r *PlanRegistry) ActivateEffectNode(ctx context.Context, configID model.Co
 
 // markEffectNode transitions a plan node to the given status in its own CAS.
 func (r *PlanRegistry) markEffectNode(ctx context.Context, configID model.ConfigID, key model.OperationKey, status model.NodeStatus) error {
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]

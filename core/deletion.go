@@ -9,6 +9,8 @@ import (
 
 // MarkDeleting durably stops new scheduling and schedules release of effect references.
 func (r *PlanRegistry) MarkDeleting(ctx context.Context, configID model.ConfigID) ([]model.Attempt, error) {
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]
@@ -75,7 +77,7 @@ func (r *PlanRegistry) MarkDeleting(ctx context.Context, configID model.ConfigID
 			ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 			Kind: EffectControlRelease, State: EffectControlPending,
 			TargetKind: EffectTargetMaintenance,
-			EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
+			EffectID:   effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
 		}
 	}
 	if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {

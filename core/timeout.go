@@ -12,6 +12,8 @@ import (
 // external side effect stopped. The conflict barrier remains until provider
 // inspection resolves the attempt.
 func (r *PlanRegistry) MarkAttemptUnknown(ctx context.Context, configID model.ConfigID, attemptID model.AttemptID) error {
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]

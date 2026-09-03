@@ -17,6 +17,8 @@ func (r *PlanRegistry) ApplyRetryableFailure(ctx context.Context, event model.Ev
 	if event.AttemptID == "" || event.State != model.StepFailed || !event.Result.Retryable {
 		return false, false, errors.New("event is not a retryable failure")
 	}
+	unlockConfig := r.lockConfig(model.ConfigID{Name: event.ConfigID})
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[event.ConfigID]

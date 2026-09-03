@@ -14,6 +14,8 @@ func (r *PlanRegistry) ApplyWaiting(ctx context.Context, event model.Event) erro
 	if event.AttemptID == "" || event.Result.NextCheckAt.IsZero() {
 		return errors.New("waiting event requires attempt ID and next check time")
 	}
+	unlockConfig := r.lockConfig(model.ConfigID{Name: event.ConfigID})
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[event.ConfigID]
@@ -41,17 +43,31 @@ func (r *PlanRegistry) ApplyWaiting(ctx context.Context, event model.Event) erro
 // WakeDueWaiting moves due nodes back to Pending. Their prior attempt is
 // terminally retired so execution will allocate a fresh AttemptID.
 func (r *PlanRegistry) WakeDueWaiting(ctx context.Context, now time.Time) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for name, current := range r.configs {
+	r.mu.RLock()
+	ids := make([]model.ConfigID, 0, len(r.configs))
+	for name := range r.configs {
+		ids = append(ids, model.ConfigID{Name: name})
+	}
+	r.mu.RUnlock()
+	for _, configID := range ids {
+		unlockConfig := r.lockConfig(configID)
+		r.mu.Lock()
+		current := r.configs[configID.Name]
 		state := cloneConfigExecution(current)
 		changed := false
+		if state == nil || state.active == nil {
+			r.mu.Unlock()
+			unlockConfig()
+			continue
+		}
 		for id, attempt := range state.attempts {
 			if attempt.Status != model.AttemptWaiting || attempt.NextCheckAt.After(now) {
 				continue
 			}
 			node := state.active.Nodes[attempt.NodeKey]
 			if node == nil || node.AttemptID != id {
+				r.mu.Unlock()
+				unlockConfig()
 				return errors.Errorf("waiting attempt %q does not match active node", id)
 			}
 			attempt.Status = model.AttemptCompleted
@@ -62,10 +78,14 @@ func (r *PlanRegistry) WakeDueWaiting(ctx context.Context, now time.Time) error 
 		}
 		if changed {
 			if err := r.persistLocked(ctx, state.active.ConfigID, state.revision, state); err != nil {
+				r.mu.Unlock()
+				unlockConfig()
 				return err
 			}
-			r.configs[name] = state
+			r.configs[configID.Name] = state
 		}
+		r.mu.Unlock()
+		unlockConfig()
 	}
 	return nil
 }

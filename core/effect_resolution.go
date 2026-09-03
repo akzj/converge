@@ -14,6 +14,8 @@ func (r *PlanRegistry) ResolveEffects(ctx context.Context, configID model.Config
 	if len(resolutions) == 0 {
 		return nil
 	}
+	unlockConfig := r.lockConfig(configID)
+	defer unlockConfig()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current := r.configs[configID.Name]

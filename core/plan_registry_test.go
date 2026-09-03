@@ -4,9 +4,93 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/akzj/converge/pkg/model"
 )
+
+type blockingConfigExecutionStore struct {
+	inner   ExecutionStore
+	blocked model.ConfigID
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingConfigExecutionStore) LoadExecution(ctx context.Context, id model.ConfigID) (*ExecutionSnapshot, error) {
+	return s.inner.LoadExecution(ctx, id)
+}
+
+func (s *blockingConfigExecutionStore) ListExecutions(ctx context.Context) ([]model.ConfigID, error) {
+	return s.inner.ListExecutions(ctx)
+}
+
+func (s *blockingConfigExecutionStore) CommitExecutionCAS(ctx context.Context, id model.ConfigID, expected uint64, snapshot ExecutionSnapshot) error {
+	if id == s.blocked {
+		select {
+		case s.entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.inner.CommitExecutionCAS(ctx, id, expected, snapshot)
+}
+
+func (s *blockingConfigExecutionStore) DeleteExecution(ctx context.Context, id model.ConfigID) error {
+	return s.inner.DeleteExecution(ctx, id)
+}
+
+func TestPlanRegistryPersistenceDoesNotBlockOtherConfigs(t *testing.T) {
+	configA := model.ConfigID{Name: "config-a"}
+	configB := model.ConfigID{Name: "config-b"}
+	store := &blockingConfigExecutionStore{
+		inner:   NewMemoryExecutionStore(),
+		blocked: configA,
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	registry := NewPlanRegistry(store)
+	candidateA := testPlan(t, "digest-a", model.Operation{Key: "apply-a"})
+	candidateA.ConfigID = configA
+	candidateA.Desired.ConfigID = configA
+	aDone := make(chan error, 1)
+	go func() {
+		_, _, err := registry.Install(context.Background(), 0, candidateA)
+		aDone <- err
+	}()
+
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("config A did not enter persistence")
+	}
+
+	candidateB := testPlan(t, "digest-b", model.Operation{Key: "apply-b"})
+	candidateB.ConfigID = configB
+	candidateB.Desired.ConfigID = configB
+	bDone := make(chan error, 1)
+	go func() {
+		_, _, err := registry.Install(context.Background(), 0, candidateB)
+		bDone <- err
+	}()
+
+	select {
+	case err := <-bDone:
+		if err != nil {
+			t.Fatalf("config B install failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(store.release)
+		t.Fatal("config B persistence was blocked by config A")
+	}
+	close(store.release)
+	if err := <-aDone; err != nil {
+		t.Fatalf("config A install failed after release: %v", err)
+	}
+}
 
 func TestPlanRegistryGenerationCASPreservesActivePlan(t *testing.T) {
 	r := NewPlanRegistry()
