@@ -6,6 +6,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/akzj/converge/observability"
 	"github.com/akzj/converge/pkg/model"
 )
 
@@ -47,7 +48,7 @@ func (r *Reconciler) scanDueControls(ctx context.Context) {
 				r.wakeControls()
 			}()
 			if err := r.processOneDueControl(ctx, ref, time.Now()); err != nil {
-				zap.L().Warn("converge: process due control",
+				r.logger.Warn("converge: process due control",
 					zap.String("config", ref.ConfigID.Name),
 					zap.String("control", string(ref.ControlRequestID)),
 					zap.Error(err))
@@ -64,7 +65,7 @@ func (r *Reconciler) effectRPCContext(ctx context.Context) (context.Context, con
 	return context.WithTimeout(ctx, timeout)
 }
 
-func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef, now time.Time) error {
+func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef, now time.Time) (resultErr error) {
 	attemptID, err := newAttemptID()
 	if err != nil {
 		return err
@@ -75,6 +76,15 @@ func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef
 		// Not due / already claimed / stale list entry — harmless.
 		return nil
 	}
+	ctx, rawSpan := r.observer.Start(ctx, observability.Activity{Kind: observability.ActivityEffectControl, ConfigID: control.ConfigID, PlanID: control.PlanID, Generation: control.Generation, Operation: control.OperationKey, AttemptID: attemptID, Provider: control.ProviderType, Cause: control.Cause})
+	span := observability.SafeSpan(rawSpan)
+	defer func() {
+		result := observability.ActivityResult{Outcome: "success"}
+		if resultErr != nil {
+			result.Outcome, result.Code, result.Reason = "error", "control_failed", resultErr.Error()
+		}
+		span.End(result)
+	}()
 	r.mu.RLock()
 	provider := r.providerVersions[control.ProviderType][control.ProviderDigest]
 	r.mu.RUnlock()
@@ -98,21 +108,43 @@ func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef
 		},
 		AttemptID: attemptID,
 		RequestID: control.ID,
+		Cause:     control.Cause,
 	}
 
 	switch control.Kind {
 	case EffectControlObserve, EffectControlObserveCancellation:
-		return r.runObserveControl(ctx, effectProvider, identity, effect, attemptID, pollID)
+		return r.runObservedProviderCall(ctx, observability.ActivityObserveEffects, control, func(callCtx context.Context) error {
+			return r.runObserveControl(callCtx, effectProvider, identity, effect, attemptID, pollID)
+		})
 	case EffectControlEnsureRetry:
-		return r.runEnsureRetryControl(ctx, effectProvider, identity, effect)
+		return r.runObservedProviderCall(ctx, observability.ActivityEnsureEffect, control, func(callCtx context.Context) error {
+			return r.runEnsureRetryControl(callCtx, effectProvider, identity, effect)
+		})
 	case EffectControlRelease:
-		return r.runReleaseControl(ctx, effectProvider, identity, effect)
+		return r.runObservedProviderCall(ctx, observability.ActivityReleaseEffect, control, func(callCtx context.Context) error {
+			return r.runReleaseControl(callCtx, effectProvider, identity, effect)
+		})
 	case EffectControlEnsureReference:
-		return r.runEnsureReferenceControl(ctx, effectProvider, identity, effect)
+		return r.runObservedProviderCall(ctx, observability.ActivityEnsureReference, control, func(callCtx context.Context) error {
+			return r.runEnsureReferenceControl(callCtx, effectProvider, identity, effect)
+		})
 	default:
 		_, _ = r.registry.YieldControl(ctx, identity, now.Add(5*time.Second))
 		return nil
 	}
+}
+
+func (r *Reconciler) runObservedProviderCall(ctx context.Context, kind observability.ActivityKind, control *EffectControl, call func(context.Context) error) error {
+	ctx, rawSpan := r.observer.Start(ctx, observability.Activity{Kind: kind, ConfigID: control.ConfigID, PlanID: control.PlanID, Generation: control.Generation, Operation: control.OperationKey, AttemptID: control.InFlightAttemptID, Provider: control.ProviderType, Cause: control.Cause})
+	span := observability.SafeSpan(rawSpan)
+	err := call(ctx)
+	result := observability.ActivityResult{Outcome: "success"}
+	if err != nil {
+		span.Error(err)
+		result.Outcome, result.Reason = "error", err.Error()
+	}
+	span.End(result)
+	return err
 }
 
 func controlIdentity(control EffectControl, attemptID model.AttemptID) TransitionIdentity {
@@ -124,6 +156,7 @@ func controlIdentity(control EffectControl, attemptID model.AttemptID) Transitio
 		},
 		AttemptID: attemptID,
 		RequestID: control.ID,
+		Cause:     control.Cause,
 	}
 }
 

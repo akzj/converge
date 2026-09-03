@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 
+	"github.com/akzj/converge/observability"
 	"github.com/akzj/converge/pkg/model"
 )
 
@@ -30,10 +31,11 @@ type configExecution struct {
 
 // PlanRegistry is the concurrency boundary for plans and attempts.
 type PlanRegistry struct {
-	mu      sync.RWMutex
-	configs map[string]*configExecution
-	store   ExecutionStore
-	locks   sync.Map // map[config name]*sync.Mutex
+	mu       sync.RWMutex
+	configs  map[string]*configExecution
+	store    ExecutionStore
+	locks    sync.Map // map[config name]*sync.Mutex
+	observer observability.Observer
 }
 
 var ErrDesiredConflict = errors.New("desired revision conflict")
@@ -43,7 +45,7 @@ func NewPlanRegistry(stores ...ExecutionStore) *PlanRegistry {
 	if len(stores) > 0 {
 		store = stores[0]
 	}
-	return &PlanRegistry{configs: make(map[string]*configExecution), store: store}
+	return &PlanRegistry{configs: make(map[string]*configExecution), store: store, observer: observability.Noop()}
 }
 
 func (r *PlanRegistry) Snapshot(configID model.ConfigID) model.PlanSnapshot {
@@ -140,6 +142,8 @@ func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) Execution
 }
 
 func (r *PlanRegistry) persistLocked(ctx context.Context, id model.ConfigID, expectedRevision uint64, state *configExecution) error {
+	previous := r.configs[id.Name]
+	fillMissingCausalContext(state)
 	originalRevision := state.revision
 	state.revision = expectedRevision + 1
 	snapshot := r.executionSnapshotLocked(state)
@@ -148,6 +152,7 @@ func (r *PlanRegistry) persistLocked(ctx context.Context, id model.ConfigID, exp
 		return errors.Wrap(err, "validate execution snapshot before persist")
 	}
 	if r.store == nil {
+		r.emitCommittedDiff(ctx, id, previous, state)
 		return nil
 	}
 	// The caller holds the config-specific mutex, so the global map lock can be
@@ -159,7 +164,279 @@ func (r *PlanRegistry) persistLocked(ctx context.Context, id model.ConfigID, exp
 		state.revision = originalRevision
 		return err
 	}
+	r.emitCommittedDiff(ctx, id, previous, state)
 	return nil
+}
+
+// emitCommittedDiff runs only after the execution snapshot has been committed.
+// It deliberately derives diagnostic transitions from durable state and never
+// from an attempted mutation, so a failed CAS cannot produce a success signal.
+func (r *PlanRegistry) emitCommittedDiff(ctx context.Context, id model.ConfigID, previous, next *configExecution) {
+	if next == nil {
+		return
+	}
+	emit := func(transition observability.Transition) {
+		transition.ExecutionRevision = next.revision
+		transition.At = time.Now()
+		transition.ConfigID = id
+		r.observer.Committed(ctx, transition)
+	}
+	if next.accepted != nil && (previous == nil || previous.accepted == nil ||
+		previous.accepted.Version != next.accepted.Version || previous.accepted.Digest != next.accepted.Digest) {
+		emit(observability.Transition{
+			ID:   fmt.Sprintf("config/%s/revision/%d/desired-accepted", id.Name, next.revision),
+			Kind: observability.TransitionDesiredAccepted, Provider: next.accepted.ProviderType,
+			To: "accepted", Outcome: "accepted", Cause: next.accepted.Cause,
+		})
+	}
+	if next.active != nil && (previous == nil || previous.active == nil || previous.active.ID != next.active.ID) {
+		emit(observability.Transition{
+			ID:   fmt.Sprintf("config/%s/revision/%d/plan-installed", id.Name, next.revision),
+			Kind: observability.TransitionPlanInstalled, PlanID: next.active.ID,
+			Generation: next.active.Generation, Provider: next.active.ProviderType,
+			To: "installed", Outcome: "success", Cause: next.active.Desired.Cause,
+		})
+	}
+	previousAttempts := allAttempts(previous)
+	nextAttempts := allAttempts(next)
+	for attemptID, attempt := range nextAttempts {
+		old := previousAttempts[attemptID]
+		provider, phase := attemptContext(next, previous, attempt)
+		outcome, code, reason := attemptResult(next, attemptID, attempt.Status)
+		switch {
+		case old == nil && attempt.Status == model.AttemptRunning:
+			emit(observability.Transition{
+				ID: "attempt/" + string(attemptID) + "/running", Kind: observability.TransitionAttemptStarted,
+				PlanID: attempt.PlanID, Generation: attempt.Generation, Operation: attempt.NodeKey,
+				AttemptID: attempt.ID, Provider: provider, Phase: phase,
+				To: string(attempt.Status), Outcome: "success", Cause: attempt.Cause,
+			})
+		case old != nil && old.Status != attempt.Status:
+			emit(observability.Transition{
+				ID: "attempt/" + string(attemptID) + "/" + string(attempt.Status), Kind: observability.TransitionAttemptFinished,
+				PlanID: attempt.PlanID, Generation: attempt.Generation, Operation: attempt.NodeKey,
+				AttemptID: attempt.ID, Provider: provider, Phase: phase,
+				From: string(old.Status), To: string(attempt.Status), Outcome: outcome, Code: code, Reason: reason, Cause: attempt.Cause,
+			})
+		case old != nil && old.CarriedTo != attempt.CarriedTo && attempt.CarriedTo != 0:
+			emit(observability.Transition{
+				ID: fmt.Sprintf("attempt/%s/carried/%d", attemptID, attempt.CarriedTo), Kind: observability.TransitionAttemptCarried,
+				PlanID: next.active.ID, Generation: attempt.CarriedTo, Operation: attempt.NodeKey,
+				AttemptID: attempt.ID, Provider: provider, Phase: phase,
+				From: fmt.Sprint(old.Generation), To: fmt.Sprint(attempt.CarriedTo), Outcome: "carried", Cause: attempt.Cause,
+			})
+		}
+	}
+	for attemptID, old := range previousAttempts {
+		if nextAttempts[attemptID] != nil {
+			continue
+		}
+		event, ok := outboxEventForAttempt(next, attemptID)
+		if !ok {
+			continue
+		}
+		status, _, err := terminalAttemptStatus(event.State)
+		if err != nil {
+			continue
+		}
+		provider, phase := attemptContext(next, previous, old)
+		emit(observability.Transition{
+			ID: "attempt/" + string(attemptID) + "/" + string(status), Kind: observability.TransitionAttemptFinished,
+			PlanID: old.PlanID, Generation: old.Generation, Operation: old.NodeKey, AttemptID: old.ID,
+			Provider: provider, Phase: phase, From: string(old.Status), To: string(status),
+			Outcome: string(event.State), Code: event.Result.Code, Reason: event.Result.Reason, Cause: old.Cause,
+		})
+	}
+	for controlID, control := range next.controls {
+		old, existed := controlFrom(previous, controlID)
+		if existed && old.State == control.State {
+			continue
+		}
+		from := ""
+		if existed {
+			from = string(old.State)
+		}
+		emit(observability.Transition{
+			ID:   fmt.Sprintf("control/%s/revision/%d/%s", controlID, next.revision, control.State),
+			Kind: observability.TransitionControlChanged, PlanID: control.PlanID, Generation: control.Generation,
+			Operation: control.OperationKey, AttemptID: control.InFlightAttemptID,
+			EffectID: string(control.EffectID), ReferenceID: string(control.ReferenceID), ControlID: string(control.ID),
+			Provider: control.ProviderType, From: from, To: string(control.State), Outcome: string(control.State), Cause: control.Cause,
+		})
+	}
+	for effectID, effect := range next.effects {
+		old, existed := effectFrom(previous, effectID)
+		if existed && old.State == effect.State && old.ExternalRevision == effect.ExternalRevision {
+			continue
+		}
+		from := ""
+		if existed {
+			from = string(old.State)
+		}
+		emit(observability.Transition{
+			ID:   fmt.Sprintf("effect/%s/revision/%d/%s", effectID, effect.ExternalRevision, effect.State),
+			Kind: observability.TransitionEffectChanged, EffectID: string(effect.ID), Provider: effect.ProviderType,
+			From: from, To: string(effect.State), Outcome: string(effect.State), Cause: causeForEffect(previous, next, effectID),
+		})
+	}
+	for referenceID, reference := range next.references {
+		old, existed := referenceFrom(previous, referenceID)
+		if existed && old.State == reference.State {
+			continue
+		}
+		from := ""
+		if existed {
+			from = string(old.State)
+		}
+		emit(observability.Transition{
+			ID:   fmt.Sprintf("reference/%s/revision/%d/%s", referenceID, next.revision, reference.State),
+			Kind: observability.TransitionEffectChanged, PlanID: reference.PlanID, Generation: reference.Generation,
+			EffectID: string(reference.EffectID), ReferenceID: string(reference.ID),
+			From: from, To: string(reference.State), Outcome: string(reference.State), Cause: reference.Cause,
+		})
+	}
+}
+
+func attemptResult(state *configExecution, id model.AttemptID, fallback model.AttemptStatus) (string, string, string) {
+	if event, ok := outboxEventForAttempt(state, id); ok {
+		return string(event.State), event.Result.Code, event.Result.Reason
+	}
+	return string(fallback), "", ""
+}
+
+func outboxEventForAttempt(state *configExecution, id model.AttemptID) (model.Event, bool) {
+	if state == nil {
+		return model.Event{}, false
+	}
+	for _, event := range state.outbox {
+		if event.AttemptID == id {
+			return event, true
+		}
+	}
+	return model.Event{}, false
+}
+
+func allAttempts(state *configExecution) map[model.AttemptID]*model.Attempt {
+	result := make(map[model.AttemptID]*model.Attempt)
+	if state == nil {
+		return result
+	}
+	for id, attempt := range state.attempts {
+		result[id] = attempt
+	}
+	for id, attempt := range state.retired {
+		result[id] = attempt
+	}
+	return result
+}
+
+func attemptContext(next, previous *configExecution, attempt *model.Attempt) (string, model.Phase) {
+	for _, state := range []*configExecution{next, previous} {
+		if state == nil || state.active == nil {
+			continue
+		}
+		if node := state.active.Nodes[attempt.NodeKey]; node != nil {
+			return state.active.ProviderType, node.Operation.Phase
+		}
+	}
+	return "", ""
+}
+
+func controlFrom(state *configExecution, id ControlRequestID) (EffectControl, bool) {
+	if state == nil {
+		return EffectControl{}, false
+	}
+	value, ok := state.controls[id]
+	return value, ok
+}
+
+func effectFrom(state *configExecution, id EffectID) (ActiveEffect, bool) {
+	if state == nil {
+		return ActiveEffect{}, false
+	}
+	value, ok := state.effects[id]
+	return value, ok
+}
+
+func referenceFrom(state *configExecution, id ReferenceID) (EffectReference, bool) {
+	if state == nil {
+		return EffectReference{}, false
+	}
+	value, ok := state.references[id]
+	return value, ok
+}
+
+func causeForEffect(previous, next *configExecution, id EffectID) model.CausalContext {
+	for controlID, control := range next.controls {
+		old, existed := controlFrom(previous, controlID)
+		if control.EffectID == id && control.Cause != (model.CausalContext{}) && (!existed || old.State != control.State) {
+			return control.Cause
+		}
+	}
+	for referenceID, reference := range next.references {
+		old, existed := referenceFrom(previous, referenceID)
+		if reference.EffectID == id && reference.Cause != (model.CausalContext{}) && (!existed || old.State != reference.State) {
+			return reference.Cause
+		}
+	}
+	// An Effect may be shared. Attribute it only when all remaining owners agree;
+	// otherwise leave Cause empty rather than attach the wrong workflow.
+	var result model.CausalContext
+	for _, reference := range next.references {
+		if reference.EffectID != id || reference.Cause == (model.CausalContext{}) {
+			continue
+		}
+		if result != (model.CausalContext{}) && result != reference.Cause {
+			return model.CausalContext{}
+		}
+		result = reference.Cause
+	}
+	return result
+}
+
+func fillMissingCausalContext(state *configExecution) {
+	if state == nil || state.active == nil {
+		return
+	}
+	cause := state.active.Desired.Cause
+	for _, attempt := range state.attempts {
+		if attempt.Cause == (model.CausalContext{}) {
+			attempt.Cause = cause
+		}
+	}
+	for _, attempt := range state.retired {
+		if attempt.Cause == (model.CausalContext{}) {
+			attempt.Cause = cause
+		}
+	}
+	for id, reference := range state.references {
+		if reference.Cause == (model.CausalContext{}) {
+			reference.Cause = cause
+			state.references[id] = reference
+		}
+	}
+	for id, control := range state.controls {
+		if control.Cause == (model.CausalContext{}) {
+			if reference := state.references[control.ReferenceID]; reference.Cause != (model.CausalContext{}) {
+				control.Cause = reference.Cause
+			} else {
+				control.Cause = cause
+			}
+			state.controls[id] = control
+		}
+	}
+	for id, event := range state.outbox {
+		if event.Cause == (model.CausalContext{}) {
+			if attempt := state.attempts[event.AttemptID]; attempt != nil {
+				event.Cause = attempt.Cause
+			} else if attempt := state.retired[event.AttemptID]; attempt != nil {
+				event.Cause = attempt.Cause
+			} else {
+				event.Cause = cause
+			}
+			state.outbox[id] = event
+		}
+	}
 }
 
 func (r *PlanRegistry) lockConfig(id model.ConfigID) func() {
@@ -630,7 +907,7 @@ func (r *PlanRegistry) StartAttempt(ctx context.Context, configID model.ConfigID
 			return nil, errors.Errorf("attempt %q exists in pending outbox", attemptID)
 		}
 	}
-	attempt := &model.Attempt{ID: attemptID, PlanID: state.active.ID, Generation: generation, ConfigID: configID, NodeKey: key, Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey, Status: model.AttemptRunning}
+	attempt := &model.Attempt{ID: attemptID, PlanID: state.active.ID, Generation: generation, ConfigID: configID, NodeKey: key, Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey, Status: model.AttemptRunning, Cause: state.active.Desired.Cause}
 	node.Status, node.AttemptID = model.NodeRunning, attemptID
 	state.attempts[attemptID] = attempt
 	if err := r.persistLocked(ctx, configID, state.revision, state); err != nil {
@@ -890,6 +1167,31 @@ func (r *PlanRegistry) PendingOutbox() []model.Event {
 		}
 	}
 	return events
+}
+
+// RuntimeCounts returns a detached, point-in-time view for aggregate gauges.
+// The observer is invoked by Reconciler only after this registry lock is gone.
+func (r *PlanRegistry) RuntimeCounts() (map[model.AttemptStatus]int64, map[string]int64, int64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	attempts := make(map[model.AttemptStatus]int64)
+	controls := make(map[string]int64)
+	var outbox int64
+	for _, state := range r.configs {
+		for _, attempt := range state.attempts {
+			attempts[attempt.Status]++
+		}
+		for _, attempt := range state.retired {
+			attempts[attempt.Status]++
+		}
+		for _, control := range state.controls {
+			if control.State != EffectControlCompleted {
+				controls[string(control.Kind)]++
+			}
+		}
+		outbox += int64(len(state.outbox))
+	}
+	return attempts, controls, outbox
 }
 
 // AckOutbox removes an event after successful processing.

@@ -26,6 +26,31 @@ func TestDesiredSnapshotDigestIsOrderIndependent(t *testing.T) {
 	}
 }
 
+func TestCausalContextDoesNotChangeDesiredIdentity(t *testing.T) {
+	desired := DesiredState{ConfigID: ConfigID{Name: "a"}, ProviderType: "test", Version: 1, Spec: []byte(`{"a":1}`)}
+	desired.Digest = DesiredSpecDigest(desired.Spec)
+	firstIdentity, err := DesiredStateIdentityDigest(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSnapshot, err := DesiredSnapshotDigest(1, []DesiredState{desired})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired.Cause = CausalContext{TraceParent: "trace", TraceState: "state", CorrelationID: "correlation", CausationID: "cause"}
+	secondIdentity, err := DesiredStateIdentityDigest(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSnapshot, err := DesiredSnapshotDigest(1, []DesiredState{desired})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstIdentity != secondIdentity || firstSnapshot != secondSnapshot {
+		t.Fatalf("causal metadata changed desired identity: identity %s/%s snapshot %s/%s", firstIdentity, secondIdentity, firstSnapshot, secondSnapshot)
+	}
+}
+
 func TestValidateDesiredSnapshotRejectsInvalidGraphAndDigest(t *testing.T) {
 	a := DesiredState{ConfigID: ConfigID{Name: "a"}, ProviderType: "test", Version: 1, Spec: []byte(`{}`), DependsOn: []string{"b"}}
 	b := DesiredState{ConfigID: ConfigID{Name: "b"}, ProviderType: "test", Version: 1, Spec: []byte(`{}`), DependsOn: []string{"a"}}

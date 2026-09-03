@@ -114,17 +114,17 @@ func CloneDesiredSnapshot(snapshot DesiredSnapshot) DesiredSnapshot {
 // DesiredSnapshotDigest hashes a canonical ordering of the complete snapshot.
 // The revision is included so the digest identifies the exact wire revision.
 func DesiredSnapshotDigest(revision uint64, items []DesiredState) (string, error) {
-	canonical := make([]DesiredState, len(items))
+	canonical := make([]desiredIdentity, len(items))
 	for i := range items {
-		canonical[i] = CloneDesiredState(items[i])
+		canonical[i] = desiredIdentityOf(items[i])
 		slices.Sort(canonical[i].DependsOn)
 	}
-	slices.SortFunc(canonical, func(a, b DesiredState) int {
+	slices.SortFunc(canonical, func(a, b desiredIdentity) int {
 		return cmpString(a.ConfigID.Name, b.ConfigID.Name)
 	})
 	payload, err := json.Marshal(struct {
-		Revision uint64         `json:"revision"`
-		Items    []DesiredState `json:"items"`
+		Revision uint64            `json:"revision"`
+		Items    []desiredIdentity `json:"items"`
 	}{Revision: revision, Items: canonical})
 	if err != nil {
 		return "", errors.Wrap(err, "encode desired snapshot digest")
@@ -136,7 +136,7 @@ func DesiredSnapshotDigest(revision uint64, items []DesiredState) (string, error
 // DesiredStateIdentityDigest covers every field that participates in revision
 // identity, unlike DesiredState.Digest which intentionally covers Spec only.
 func DesiredStateIdentityDigest(desired DesiredState) (string, error) {
-	canonical := CloneDesiredState(desired)
+	canonical := desiredIdentityOf(desired)
 	slices.Sort(canonical.DependsOn)
 	payload, err := json.Marshal(canonical)
 	if err != nil {
@@ -144,6 +144,26 @@ func DesiredStateIdentityDigest(desired DesiredState) (string, error) {
 	}
 	digest := sha256.Sum256(payload)
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+// desiredIdentity intentionally preserves the pre-causality JSON shape. A
+// zero struct with omitempty is still encoded by encoding/json, so merely
+// clearing DesiredState.Cause would silently change every existing identity.
+type desiredIdentity struct {
+	ConfigID     ConfigID `json:"config_id"`
+	ProviderType string   `json:"provider_type"`
+	Version      uint64   `json:"version"`
+	Spec         []byte   `json:"spec"`
+	Digest       string   `json:"digest"`
+	DependsOn    []string `json:"depends_on,omitempty"`
+}
+
+func desiredIdentityOf(desired DesiredState) desiredIdentity {
+	return desiredIdentity{
+		ConfigID: desired.ConfigID, ProviderType: desired.ProviderType, Version: desired.Version,
+		Spec: append([]byte(nil), desired.Spec...), Digest: desired.Digest,
+		DependsOn: append([]string(nil), desired.DependsOn...),
+	}
 }
 
 func cmpString(a, b string) int {

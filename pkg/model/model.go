@@ -29,6 +29,15 @@ type ConfigID struct {
 	Name string // globally unique within Converge
 }
 
+// CausalContext survives asynchronous execution and restart without becoming
+// part of desired or operation semantic identity.
+type CausalContext struct {
+	TraceParent   string `json:"trace_parent,omitempty"`
+	TraceState    string `json:"trace_state,omitempty"`
+	CorrelationID string `json:"correlation_id,omitempty"`
+	CausationID   string `json:"causation_id,omitempty"`
+}
+
 // ResourceID identifies a concrete resource managed by a Provider.
 type ResourceID struct {
 	Type, Namespace, Name, InstanceKey string
@@ -167,12 +176,13 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 // DesiredState is the full specification for one configuration.
 type DesiredState struct {
-	ConfigID     ConfigID `json:"config_id"`
-	ProviderType string   `json:"provider_type"` // which provider handles this (e.g. "nginx.config")
-	Version      uint64   `json:"version"`
-	Spec         []byte   `json:"spec"`                 // provider-specific desired spec (JSON)
-	Digest       string   `json:"digest"`               // sha256 of Spec
-	DependsOn    []string `json:"depends_on,omitempty"` // config names that must converge first
+	ConfigID     ConfigID      `json:"config_id"`
+	ProviderType string        `json:"provider_type"` // which provider handles this (e.g. "nginx.config")
+	Version      uint64        `json:"version"`
+	Spec         []byte        `json:"spec"`                 // provider-specific desired spec (JSON)
+	Digest       string        `json:"digest"`               // sha256 of Spec
+	DependsOn    []string      `json:"depends_on,omitempty"` // config names that must converge first
+	Cause        CausalContext `json:"cause,omitempty"`
 }
 
 // ObservedState is what a Provider reads from the real system.
@@ -342,6 +352,7 @@ type Event struct {
 	State      StepState     `json:"state"`
 	Result     StepResult    `json:"result"`
 	Observed   ObservedState `json:"observed,omitempty"`
+	Cause      CausalContext `json:"cause,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

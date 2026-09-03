@@ -97,26 +97,28 @@ type EffectReference struct {
 	Generation model.Generation     `json:"generation"`
 	EffectKey  string               `json:"effect_key"`
 	State      EffectReferenceState `json:"state"`
+	Cause      model.CausalContext  `json:"cause,omitempty"`
 }
 
 type EffectControl struct {
-	ID                ControlRequestID   `json:"id"`
-	ConfigID          model.ConfigID     `json:"config_id"`
-	ProviderType      string             `json:"provider_type"`
-	ProviderDigest    string             `json:"provider_digest"`
-	Kind              EffectControlKind  `json:"kind"`
-	TargetKind        EffectTargetKind   `json:"target_kind,omitempty"`
-	State             EffectControlState `json:"state"`
-	EffectID          EffectID           `json:"effect_id"`
-	ReferenceID       ReferenceID        `json:"reference_id"`
-	PlanID            model.PlanID       `json:"plan_id,omitempty"`
-	Generation        model.Generation   `json:"generation,omitempty"`
-	OperationKey      model.OperationKey `json:"operation_key,omitempty"`
-	NextCheckAt       time.Time          `json:"next_check_at"`
-	RetryCount        uint32             `json:"retry_count"`
-	InFlightAttemptID model.AttemptID    `json:"in_flight_attempt_id,omitempty"`
-	PollRequestID     PollRequestID      `json:"poll_request_id,omitempty"`
-	LeaseExpiresAt    time.Time          `json:"lease_expires_at,omitempty"`
+	ID                ControlRequestID    `json:"id"`
+	ConfigID          model.ConfigID      `json:"config_id"`
+	ProviderType      string              `json:"provider_type"`
+	ProviderDigest    string              `json:"provider_digest"`
+	Kind              EffectControlKind   `json:"kind"`
+	TargetKind        EffectTargetKind    `json:"target_kind,omitempty"`
+	State             EffectControlState  `json:"state"`
+	EffectID          EffectID            `json:"effect_id"`
+	ReferenceID       ReferenceID         `json:"reference_id"`
+	PlanID            model.PlanID        `json:"plan_id,omitempty"`
+	Generation        model.Generation    `json:"generation,omitempty"`
+	OperationKey      model.OperationKey  `json:"operation_key,omitempty"`
+	NextCheckAt       time.Time           `json:"next_check_at"`
+	RetryCount        uint32              `json:"retry_count"`
+	InFlightAttemptID model.AttemptID     `json:"in_flight_attempt_id,omitempty"`
+	PollRequestID     PollRequestID       `json:"poll_request_id,omitempty"`
+	LeaseExpiresAt    time.Time           `json:"lease_expires_at,omitempty"`
+	Cause             model.CausalContext `json:"cause,omitempty"`
 }
 
 func (e ActiveEffect) Clone() ActiveEffect {

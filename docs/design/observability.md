@@ -1,6 +1,6 @@
 # Converge Observability: Technical Design
 
-- Status: Proposed for implementation
+- Status: Implemented in Core; backend adapter remains embedding-runtime owned
 - Owner: Converge Core
 - Last updated: 2026-09-03
 - Related: [External Active Effects](external-active-effects.md)
@@ -596,3 +596,42 @@ Initial alert candidates are sustained growth of outbox/control age, unresolved
 Unknown or Failed state, Provider error ratio, reconciliation tail latency, and
 telemetry drops. Alerts must link to filtered logs/traces using provider,
 time range, and exemplars rather than metric labels containing object IDs.
+
+## 19. Implementation report
+
+The Core implementation is backend-neutral and lives in `observability`. It
+includes the no-op and panic-safe contracts, bounded asynchronous delivery,
+central field filtering, durable causal metadata, committed transition
+generation, bounded activity spans, injected logging, and periodic runtime
+snapshots. OpenTelemetry/OTLP translation remains the responsibility of the
+embedding runtime as required by this design; Core does not import an OTel SDK.
+
+Default asynchronous limits are 1,024 queued signal items, 32 events per span,
+and 1,024 bytes per Reason or error string. Explicit positive constructor
+arguments override the queue and event limits. A full queue drops new items and
+increments `AsyncObserver.Dropped`; it never waits for exporter I/O.
+
+On 2026-09-03, `linux/amd64` on an Intel Core i7-14700KF, three benchmark runs
+produced these median synthetic results:
+
+| Path | No-op | Recording observer | Allocation change |
+|---|---:|---:|---:|
+| Desired acceptance | 984 ns/op | 1,043 ns/op | 0 B/op, 0 allocs/op |
+| Plan build/install | 4,238 ns/op | 4,299 ns/op | 0 B/op, 0 allocs/op |
+| Attempt completion lifecycle | 7,852 ns/op | 7,762 ns/op | 0 B/op, 0 allocs/op |
+| Control claim/yield polling | 7,507 ns/op | 7,749 ns/op | 0 B/op, 0 allocs/op |
+| Observer activity only | 0.11 ns/op | 290 ns/op (async) | +576 B/op, +2 allocs/op |
+
+The enabled lifecycle benchmark includes the panic-safe and sanitizing adapter.
+Its median latency delta was about 6.0% for Desired acceptance, 1.4% for Plan
+build/install, and 3.2% for control polling; the Attempt result was within
+run-to-run noise. Lifecycle allocation counts were unchanged. These are local
+microbenchmarks, not production latency or soak results.
+
+The repeatable backpressure test drives 10,000 transitions into a two-item queue
+while the sink is permanently blocked. It verifies bounded queue length, a
+growing drop counter, a non-blocking producer path, and a 20 ms shutdown
+deadline. The control-poll benchmark repeatedly performs durable claim/yield
+cycles, while the lifecycle test verifies every poll creates and ends separate
+orchestration and Provider activities. These are saturation and lifecycle
+tests, not a long-duration memory soak.

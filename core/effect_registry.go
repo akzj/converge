@@ -27,6 +27,7 @@ type TransitionIdentity struct {
 	EffectIdentity EffectIdentity
 	AttemptID      model.AttemptID
 	RequestID      ControlRequestID
+	Cause          model.CausalContext
 }
 
 // BeginEnsureEffect persists an Effect in Ensuring state, an EffectReference in
@@ -69,7 +70,7 @@ func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureReq
 		ID: req.Identity.EffectIdentity.ReferenceID, EffectID: req.Identity.EffectIdentity.EffectID,
 		ConfigID: req.Identity.EffectIdentity.ConfigID, PlanID: req.Identity.EffectIdentity.PlanID,
 		Generation: req.Identity.EffectIdentity.Generation, EffectKey: req.Identity.EffectIdentity.EffectKey,
-		State: EffectReferenceEnsuring,
+		State: EffectReferenceEnsuring, Cause: req.Identity.Cause,
 	}
 	control := EffectControl{
 		ID: req.Identity.RequestID, ConfigID: req.Identity.EffectIdentity.ConfigID,
@@ -79,7 +80,7 @@ func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureReq
 		EffectID:   req.Identity.EffectIdentity.EffectID, ReferenceID: req.Identity.EffectIdentity.ReferenceID,
 		PlanID: req.Identity.EffectIdentity.PlanID, Generation: req.Identity.EffectIdentity.Generation,
 		OperationKey: req.Identity.EffectIdentity.OperationKey,
-		NextCheckAt:  time.Now(),
+		NextCheckAt:  time.Now(), Cause: req.Identity.Cause,
 	}
 	state.effects[effect.ID] = effect
 	state.references[reference.ID] = reference
@@ -396,7 +397,7 @@ func (r *PlanRegistry) ClaimDueControl(ctx context.Context, configID model.Confi
 			ID: attemptID, PlanID: control.PlanID, Generation: control.Generation,
 			ConfigID: control.ConfigID, NodeKey: control.OperationKey,
 			Fingerprint: fingerprint, ConflictKey: conflictKey,
-			Status: model.AttemptRunning, StartedAt: now, UpdatedAt: now,
+			Status: model.AttemptRunning, StartedAt: now, UpdatedAt: now, Cause: control.Cause,
 		}
 	}
 	state.controls[control.ID] = control
@@ -1167,7 +1168,7 @@ func (r *PlanRegistry) BeginEnsureReference(ctx context.Context, identity Transi
 		ID: identity.EffectIdentity.ReferenceID, EffectID: effect.ID,
 		ConfigID: identity.EffectIdentity.ConfigID, PlanID: identity.EffectIdentity.PlanID,
 		Generation: identity.EffectIdentity.Generation, EffectKey: identity.EffectIdentity.EffectKey,
-		State: EffectReferenceEnsuring,
+		State: EffectReferenceEnsuring, Cause: identity.Cause,
 	}
 	controlID := identity.RequestID
 	if controlID == "" {
@@ -1181,7 +1182,7 @@ func (r *PlanRegistry) BeginEnsureReference(ctx context.Context, identity Transi
 		TargetKind: EffectTargetPlanNode,
 		EffectID:   effect.ID, ReferenceID: reference.ID,
 		PlanID: identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
-		OperationKey: identity.EffectIdentity.OperationKey, NextCheckAt: time.Now(),
+		OperationKey: identity.EffectIdentity.OperationKey, NextCheckAt: time.Now(), Cause: identity.Cause,
 	}
 	if err := r.persistLocked(ctx, reference.ConfigID, state.revision, state); err != nil {
 		return TransitionRejected, err

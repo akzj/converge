@@ -47,6 +47,7 @@ type Attempt struct {
 	StartedAt   time.Time     `json:"started_at,omitempty"`
 	UpdatedAt   time.Time     `json:"updated_at,omitempty"`
 	NextCheckAt time.Time     `json:"next_check_at,omitempty"`
+	Cause       CausalContext `json:"cause,omitempty"`
 }
 
 // PlanSnapshot is a deep-copy view passed to providers during replanning.

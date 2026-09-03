@@ -30,7 +30,7 @@ func (r *PlanRegistry) finishEffectNodeBundleLocked(ctx context.Context, state *
 			ID: identity.AttemptID, PlanID: state.active.ID, Generation: state.active.Generation,
 			ConfigID: identity.EffectIdentity.ConfigID, NodeKey: nodeKey,
 			Fingerprint: node.Operation.Fingerprint, ConflictKey: node.Operation.ConflictKey,
-			Status: model.AttemptCompleted,
+			Status: model.AttemptCompleted, Cause: identity.Cause,
 		}
 		if event.State == model.StepFailed {
 			attempt.Status = model.AttemptFailed
@@ -44,6 +44,9 @@ func (r *PlanRegistry) finishEffectNodeBundleLocked(ctx context.Context, state *
 	}
 	if event.EventID == "" {
 		return errors.New("outbox event ID is empty")
+	}
+	if event.Cause == (model.CausalContext{}) {
+		event.Cause = identity.Cause
 	}
 	state.outbox[event.EventID] = event
 	return r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state)

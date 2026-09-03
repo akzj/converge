@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
+	"github.com/akzj/converge/observability"
 	"github.com/akzj/converge/pkg/model"
 )
 
@@ -21,6 +23,7 @@ const (
 	maxConcurrentDeletes    = 4
 	providerPlanTimeout     = 30 * time.Second
 	providerExecuteTimeout  = 30 * time.Minute
+	runtimeSnapshotInterval = 15 * time.Second
 )
 
 // Reconciler owns desired state and drives generation-aware plan execution.
@@ -36,6 +39,8 @@ type Reconciler struct {
 	arbiter          Arbiter
 	journal          Journal
 	registry         *PlanRegistry
+	observer         observability.Observer
+	logger           *zap.Logger
 
 	configs      map[string]*model.ManagedConfig
 	cancels      map[model.AttemptID]context.CancelFunc
@@ -55,12 +60,34 @@ type Reconciler struct {
 	executeTimeout time.Duration
 }
 
-func NewReconciler(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
-	return &Reconciler{
+type ReconcilerOption func(*Reconciler)
+
+func WithObserver(observer observability.Observer) ReconcilerOption {
+	return func(r *Reconciler) { r.observer = observability.Safe(observer) }
+}
+
+func WithLogger(logger *zap.Logger) ReconcilerOption {
+	return func(r *Reconciler) {
+		if logger != nil {
+			r.logger = logger
+		}
+	}
+}
+
+func NewReconciler(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal, options ...ReconcilerOption) *Reconciler {
+	r := &Reconciler{
 		providers: make(map[string]Provider), providerVersions: make(map[string]map[string]Provider), store: store, events: events, arbiter: arbiter, journal: journal,
 		registry: NewPlanRegistry(executionStore), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc), pendingPlans: make(map[string]struct{}), planning: make(map[string]bool),
 		desiredWake: make(chan struct{}, 1), pendingDelete: make(chan deleteRequest, 128), execSem: make(chan struct{}, maxConcurrentExecutions), controlSem: make(chan struct{}, maxConcurrentControls), planSem: make(chan struct{}, maxConcurrentPlans), controlScanSem: make(chan struct{}, 1), outboxWake: make(chan struct{}, 1), controlWake: make(chan struct{}, 1), controlTimeout: effectControlRPCTimeout, planTimeout: providerPlanTimeout, executeTimeout: providerExecuteTimeout,
+		observer: observability.Noop(), logger: zap.NewNop(),
 	}
+	for _, option := range options {
+		if option != nil {
+			option(r)
+		}
+	}
+	r.registry.observer = r.observer
+	return r
 }
 
 // wakeControls signals the Run loop that due EffectControls may exist, so it
@@ -94,7 +121,19 @@ func (r *Reconciler) RegisterProvider(ctx context.Context, provider Provider) {
 	}
 }
 
-func (r *Reconciler) SubmitDesired(ctx context.Context, desired model.DesiredState) error {
+func (r *Reconciler) SubmitDesired(ctx context.Context, desired model.DesiredState) (err error) {
+	ctx, rawSpan := r.observer.Start(ctx, observability.Activity{Kind: observability.ActivityAcceptDesired, ConfigID: desired.ConfigID, Provider: desired.ProviderType, Cause: desired.Cause})
+	span := observability.SafeSpan(rawSpan)
+	accepted := false
+	defer func() {
+		result := observability.ActivityResult{Outcome: "accepted"}
+		if err != nil {
+			result.Outcome, result.Code, result.Reason = "error", "desired_rejected", err.Error()
+		} else if !accepted {
+			result.Outcome = "duplicate"
+		}
+		span.End(result)
+	}()
 	if err := validateDesired(desired); err != nil {
 		return err
 	}
@@ -106,7 +145,7 @@ func (r *Reconciler) SubmitDesired(ctx context.Context, desired model.DesiredSta
 	if err := r.validateConfigDependencies(desired); err != nil {
 		return err
 	}
-	accepted, err := r.registry.AcceptDesired(ctx, desired)
+	accepted, err = r.registry.AcceptDesired(ctx, desired)
 	if err != nil {
 		return err
 	}
@@ -237,12 +276,17 @@ func (r *Reconciler) RunWithReady(ctx context.Context, ready chan<- error) error
 }
 
 func (r *Reconciler) run(ctx context.Context, ready chan<- error) error {
-	if err := r.recover(ctx); err != nil {
+	recoverCtx, rawSpan := r.observer.Start(ctx, observability.Activity{Kind: observability.ActivityRecover})
+	span := observability.SafeSpan(rawSpan)
+	if err := r.recover(recoverCtx); err != nil {
+		span.Error(err)
+		span.End(observability.ActivityResult{Outcome: "error", Code: "recovery_failed", Reason: err.Error()})
 		if ready != nil {
 			ready <- err
 		}
 		return errors.Wrap(err, "recover")
 	}
+	span.End(observability.ActivityResult{Outcome: "success"})
 	eventCh, err := r.events.Subscribe(ctx, "")
 	if err != nil {
 		if ready != nil {
@@ -258,10 +302,13 @@ func (r *Reconciler) run(ctx context.Context, ready chan<- error) error {
 		ready <- nil
 	}
 	r.wakeOutbox()
+	r.emitRuntimeSnapshot(ctx)
 	driftTicker := time.NewTicker(30 * time.Second)
 	controlTicker := time.NewTicker(time.Second)
+	runtimeTicker := time.NewTicker(runtimeSnapshotInterval)
 	defer driftTicker.Stop()
 	defer controlTicker.Stop()
+	defer runtimeTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -276,10 +323,27 @@ func (r *Reconciler) run(ctx context.Context, ready chan<- error) error {
 			r.detectDrift(ctx)
 		case <-controlTicker.C:
 			// Periodically wake delayed controls whose NextCheckAt has arrived.
+		case <-runtimeTicker.C:
+			r.emitRuntimeSnapshot(ctx)
 		}
 		r.processDueControls(ctx)
 		r.executeReady(ctx)
 	}
+}
+
+func (r *Reconciler) emitRuntimeSnapshot(ctx context.Context) {
+	configs := make(map[model.ConfigStatus]int64)
+	r.mu.RLock()
+	for _, config := range r.configs {
+		configs[config.Status]++
+	}
+	pending := int64(len(r.pendingPlans) + len(r.planning))
+	r.mu.RUnlock()
+	attempts, controls, outbox := r.registry.RuntimeCounts()
+	r.observer.Runtime(ctx, observability.RuntimeSnapshot{
+		At: time.Now(), ConfigsByState: configs, AttemptsByState: attempts,
+		ControlsByKind: controls, OutboxDepth: outbox, PendingPlans: pending,
+	})
 }
 
 func (r *Reconciler) runDeleteWorker(ctx context.Context) {
@@ -410,6 +474,17 @@ func (r *Reconciler) scheduleVerify(ctx context.Context, plan *model.Plan, provi
 
 // planLatest implements snapshot -> provider replan -> validate -> generation CAS.
 func (r *Reconciler) planLatest(ctx context.Context, name string) {
+	r.mu.RLock()
+	initial := r.configs[name]
+	activity := observability.Activity{Kind: observability.ActivityReplan, ConfigID: model.ConfigID{Name: name}}
+	if initial != nil {
+		activity.Provider, activity.Cause = initial.Desired.ProviderType, initial.Desired.Cause
+	}
+	r.mu.RUnlock()
+	ctx, rawSpan := r.observer.Start(ctx, activity)
+	span := observability.SafeSpan(rawSpan)
+	outcome := observability.ActivityResult{Outcome: "success"}
+	defer func() { span.End(outcome) }()
 	for retries := 0; retries < 4; retries++ {
 		r.mu.RLock()
 		managed := r.configs[name]
@@ -422,7 +497,9 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		provider := r.providers[desired.ProviderType]
 		r.mu.RUnlock()
 		if provider == nil {
-			r.setConfigError(name, errors.Errorf("provider %q is not registered", desired.ProviderType))
+			err := errors.Errorf("provider %q is not registered", desired.ProviderType)
+			outcome = observability.ActivityResult{Outcome: "error", Code: "provider_unavailable", Reason: err.Error()}
+			r.setConfigError(name, err)
 			return
 		}
 		if !r.dependenciesMet(&model.ManagedConfig{DependsOnConfigs: dependencies}) {
@@ -436,15 +513,18 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		}
 		observed, err := provider.Inspect(ctx, model.ResourceID{Name: name})
 		if err != nil {
+			outcome = observability.ActivityResult{Outcome: "error", Code: "inspect_failed", Reason: err.Error()}
 			r.setConfigError(name, errors.Wrap(err, "inspect"))
 			return
 		}
 		result, err := provider.Replan(ctx, ReplanRequest{Observed: observed, Desired: desired, Active: snapshot, ProviderDigest: provider.Digest()})
 		if err != nil {
+			outcome = observability.ActivityResult{Outcome: "error", Code: "replan_failed", Reason: err.Error()}
 			r.setConfigError(name, errors.Wrap(err, "replan"))
 			return
 		}
 		if err := r.registry.ResolveEffects(ctx, desired.ConfigID, result.Resolutions); err != nil {
+			outcome = observability.ActivityResult{Outcome: "error", Code: "effect_resolution_failed", Reason: err.Error()}
 			r.setConfigError(name, errors.Wrap(err, "resolve effects"))
 			return
 		}
@@ -463,6 +543,7 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		}
 		candidate, err := BuildCandidate(desired.ConfigID, desired, provider.Type(), provider.Digest(), result.Operations)
 		if err != nil {
+			outcome = observability.ActivityResult{Outcome: "error", Code: "plan_invalid", Reason: err.Error()}
 			r.setConfigError(name, errors.Wrap(err, "build candidate"))
 			return
 		}
@@ -471,6 +552,7 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 			continue
 		}
 		if err != nil {
+			outcome = observability.ActivityResult{Outcome: "error", Code: "plan_install_failed", Reason: err.Error()}
 			r.setConfigError(name, errors.Wrap(err, "install plan"))
 			return
 		}
@@ -482,7 +564,8 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		r.setConfigStatus(name, model.ConfigConverging)
 		return
 	}
-	zap.L().Warn("converge: replan CAS contention", zap.String("config", name))
+	r.logger.Warn("converge: replan CAS contention", zap.String("config", name))
+	outcome = observability.ActivityResult{Outcome: "error", Code: "cas_contention", Reason: "replan CAS contention"}
 	r.setConfigError(name, errors.New("replan CAS contention"))
 }
 
@@ -525,7 +608,7 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 				operation.ExecutionKind == model.ExecutionEffectRelease {
 				status, err := r.registry.ActivateEffectNode(ctx, id, plan, operation)
 				if err != nil {
-					zap.L().Error("converge: activate effect node", zap.String("config", id.Name), zap.String("op", string(operation.Key)), zap.Error(err))
+					r.logger.Error("converge: activate effect node", zap.String("config", id.Name), zap.String("op", string(operation.Key)), zap.Error(err))
 					continue
 				}
 				// Wake the Run loop so processDueControls drives the newly
@@ -548,7 +631,7 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 			attemptID, err := newAttemptID()
 			if err != nil {
 				<-r.execSem
-				zap.L().Error("converge: generate attempt ID", zap.Error(err))
+				r.logger.Error("converge: generate attempt ID", zap.Error(err))
 				continue
 			}
 			opCtx, cancel := context.WithCancel(ctx)
@@ -585,11 +668,19 @@ func newAttemptID() (model.AttemptID, error) {
 
 func (r *Reconciler) executeAttempt(ctx, opCtx context.Context, cancel context.CancelFunc, plan *model.Plan, operation model.Operation, attempt *model.Attempt) {
 	defer func() { <-r.execSem }()
+	opCtx, rawSpan := r.observer.Start(opCtx, observability.Activity{Kind: observability.ActivityExecuteAttempt, ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation, Operation: operation.Key, AttemptID: attempt.ID, Provider: operation.Provider, Phase: operation.Phase, Cause: attempt.Cause})
+	span := observability.SafeSpan(rawSpan)
+	activityResult := observability.ActivityResult{Outcome: "unknown"}
+	defer func() { span.End(activityResult) }()
 	r.mu.RLock()
 	provider := r.providerVersions[operation.Provider][plan.ProviderDigest]
 	r.mu.RUnlock()
 	if provider == nil {
-		r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "provider_version_unavailable", Reason: "provider implementation matching plan digest is unavailable", Retryable: true})
+		activityResult = observability.ActivityResult{Outcome: "failed", Code: "provider_version_unavailable", Reason: "provider implementation matching plan digest is unavailable", Retryable: true}
+		if err := r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: activityResult.Code, Reason: activityResult.Reason, Retryable: true}); err != nil {
+			activityResult = observability.ActivityResult{Outcome: "error", Code: "outbox_persist_failed", Reason: err.Error(), Retryable: true}
+			span.Error(err)
+		}
 		return
 	}
 	defer func() { cancel(); r.mu.Lock(); delete(r.cancels, attempt.ID); r.mu.Unlock() }()
@@ -597,11 +688,19 @@ func (r *Reconciler) executeAttempt(ctx, opCtx context.Context, cancel context.C
 	for _, condition := range operation.Conditions {
 		met, err := provider.EvaluateCondition(opCtx, condition)
 		if err != nil {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "condition_error", Reason: err.Error(), Retryable: true})
+			activityResult = observability.ActivityResult{Outcome: "failed", Code: "condition_error", Reason: err.Error(), Retryable: true}
+			if err := r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: activityResult.Code, Reason: activityResult.Reason, Retryable: true}); err != nil {
+				activityResult = observability.ActivityResult{Outcome: "error", Code: "outbox_persist_failed", Reason: err.Error(), Retryable: true}
+				span.Error(err)
+			}
 			return
 		}
 		if !met {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepWaiting, Code: "condition_unmet", NextCheckAt: time.Now().Add(5 * time.Second)})
+			activityResult = observability.ActivityResult{Outcome: "waiting", Code: "condition_unmet"}
+			if err := r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepWaiting, Code: activityResult.Code, NextCheckAt: time.Now().Add(5 * time.Second)}); err != nil {
+				activityResult = observability.ActivityResult{Outcome: "error", Code: "outbox_persist_failed", Reason: err.Error(), Retryable: true}
+				span.Error(err)
+			}
 			return
 		}
 	}
@@ -610,15 +709,28 @@ func (r *Reconciler) executeAttempt(ctx, opCtx context.Context, cancel context.C
 		var err error
 		release, err = r.arbiter.Acquire(opCtx, string(attempt.ID))
 		if err != nil {
-			r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: "arbiter_busy", Reason: err.Error()})
+			activityResult = observability.ActivityResult{Outcome: "failed", Code: "arbiter_busy", Reason: err.Error()}
+			if err := r.publishResult(ctx, plan, operation, attempt, model.StepResult{State: model.StepFailed, Code: activityResult.Code, Reason: activityResult.Reason}); err != nil {
+				activityResult = observability.ActivityResult{Outcome: "error", Code: "outbox_persist_failed", Reason: err.Error(), Retryable: true}
+				span.Error(err)
+			}
 			return
 		}
 		defer release()
 	}
-	result, err := provider.Execute(opCtx, operation)
+	providerCtx, rawProviderSpan := r.observer.Start(opCtx, observability.Activity{Kind: observability.ActivityProviderExecute, ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation, Operation: operation.Key, AttemptID: attempt.ID, Provider: operation.Provider, Phase: operation.Phase, Cause: attempt.Cause})
+	providerSpan := observability.SafeSpan(rawProviderSpan)
+	result, err := provider.Execute(providerCtx, operation)
+	providerResult := observability.ActivityResult{Outcome: string(result.State), Code: result.Code, Reason: result.Reason, Retryable: result.Retryable}
+	if err != nil {
+		providerSpan.Error(err)
+		providerResult.Outcome, providerResult.Reason = "error", err.Error()
+	}
+	providerSpan.End(providerResult)
 	if opCtx.Err() == context.DeadlineExceeded {
+		activityResult = observability.ActivityResult{Outcome: "unknown", Code: "execute_timeout", Reason: opCtx.Err().Error(), Retryable: true}
 		if transitionErr := r.registry.MarkAttemptUnknown(ctx, plan.ConfigID, attempt.ID); transitionErr != nil {
-			zap.L().Error("converge: persist timed-out unknown effect", zap.Error(transitionErr))
+			r.logger.Error("converge: persist timed-out unknown effect", zap.Error(transitionErr))
 		}
 		// Inspect/Replan is the only safe way to decide whether the effect happened.
 		r.queuePlan(plan.ConfigID.Name)
@@ -627,22 +739,27 @@ func (r *Reconciler) executeAttempt(ctx, opCtx context.Context, cancel context.C
 	if err != nil {
 		result = model.StepResult{State: model.StepFailed, Code: "execute_error", Reason: err.Error()}
 	}
-	r.publishResult(ctx, plan, operation, attempt, result)
+	activityResult = observability.ActivityResult{Outcome: string(result.State), Code: result.Code, Reason: result.Reason, Retryable: result.Retryable}
+	if err := r.publishResult(ctx, plan, operation, attempt, result); err != nil {
+		activityResult = observability.ActivityResult{Outcome: "error", Code: "outbox_persist_failed", Reason: err.Error(), Retryable: true}
+		span.Error(err)
+	}
 }
 
-func (r *Reconciler) publishResult(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, result model.StepResult) {
-	event := model.Event{EventID: string(attempt.ID) + "/result", PlanID: plan.ID, Generation: plan.Generation, NodeKey: operation.Key, AttemptID: attempt.ID, ConfigID: plan.ConfigID.Name, State: result.State, Result: result}
+func (r *Reconciler) publishResult(ctx context.Context, plan *model.Plan, operation model.Operation, attempt *model.Attempt, result model.StepResult) error {
+	event := model.Event{EventID: string(attempt.ID) + "/result", PlanID: plan.ID, Generation: plan.Generation, NodeKey: operation.Key, AttemptID: attempt.ID, ConfigID: plan.ConfigID.Name, State: result.State, Result: result, Cause: attempt.Cause}
 	if err := r.registry.EnqueueOutbox(ctx, event); err != nil {
-		zap.L().Error("converge: persist event outbox", zap.Error(err))
-		return
+		r.logger.Error("converge: persist event outbox", zap.Error(err))
+		return err
 	}
 	r.wakeOutbox()
+	return nil
 }
 
 func (r *Reconciler) dispatchOutbox(ctx context.Context) {
 	for _, event := range r.registry.PendingOutbox() {
 		if err := r.events.Publish(ctx, event); err != nil {
-			zap.L().Warn("converge: publish outbox event", zap.Error(err))
+			r.logger.Warn("converge: publish outbox event", zap.Error(err))
 			continue
 		}
 	}
@@ -672,18 +789,18 @@ func (r *Reconciler) runOutboxDispatcher(ctx context.Context) {
 
 func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	if err := r.journal.Append(ctx, event); err != nil {
-		zap.L().Error("converge: append journal", zap.Error(err))
+		r.logger.Error("converge: append journal", zap.Error(err))
 
 		return
 	}
 	ack := func() {
 		if err := r.registry.AckOutbox(ctx, model.ConfigID{Name: event.ConfigID}, event.EventID); err != nil {
-			zap.L().Error("converge: acknowledge outbox", zap.Error(err))
+			r.logger.Error("converge: acknowledge outbox", zap.Error(err))
 		}
 	}
 	if event.State == model.StepWaiting {
 		if err := r.registry.ApplyWaiting(ctx, event); err != nil {
-			zap.L().Warn("converge: waiting transition failed; retaining outbox event", zap.Error(err))
+			r.logger.Warn("converge: waiting transition failed; retaining outbox event", zap.Error(err))
 			return
 		}
 		ack()
@@ -692,7 +809,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	if event.State == model.StepFailed && event.Result.Retryable {
 		retried, exhausted, err := r.registry.ApplyRetryableFailure(ctx, event)
 		if err != nil {
-			zap.L().Warn("converge: invalid retry event", zap.Error(err))
+			r.logger.Warn("converge: invalid retry event", zap.Error(err))
 			return
 		}
 		if retried {
@@ -708,7 +825,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 	}
 	changed, retiredFinished, err := r.registry.ApplyEvent(ctx, event)
 	if err != nil {
-		zap.L().Warn("converge: event transition failed; retaining outbox event", zap.Error(err))
+		r.logger.Warn("converge: event transition failed; retaining outbox event", zap.Error(err))
 		return
 	}
 	ack()
@@ -743,9 +860,13 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 }
 
 func (r *Reconciler) verifyAndRecord(ctx context.Context, plan *model.Plan, provider Provider) {
+	ctx, rawSpan := r.observer.Start(ctx, observability.Activity{Kind: observability.ActivityVerify, ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation, Provider: plan.ProviderType, Cause: plan.Desired.Cause})
+	span := observability.SafeSpan(rawSpan)
 	desired := model.CloneDesiredState(plan.Desired)
 	observed, err := provider.Verify(ctx, model.ResourceID{Name: plan.ConfigID.Name}, desired)
 	if err != nil {
+		span.Error(err)
+		span.End(observability.ActivityResult{Outcome: "error", Code: "verify_failed", Reason: err.Error()})
 		r.setConfigError(plan.ConfigID.Name, errors.Wrap(err, "verify"))
 		return
 	}
@@ -753,20 +874,35 @@ func (r *Reconciler) verifyAndRecord(ctx context.Context, plan *model.Plan, prov
 	current := r.registry.Snapshot(plan.ConfigID).Plan
 	if current == nil || current.ID != plan.ID || current.Generation != plan.Generation ||
 		current.DesiredVersion != desired.Version || current.DesiredDigest != desired.Digest {
+		span.End(observability.ActivityResult{Outcome: "stale"})
 		return
 	}
 	recorded := model.RecordedState{ConfigID: plan.ConfigID, ProviderType: provider.Type(), DesiredVersion: desired.Version, DesiredDigest: desired.Digest, HandlerDigest: provider.Digest(), Status: model.ConfigConverged, UpdatedAt: time.Now()}
 	if err := r.store.Record(ctx, recorded); err != nil {
+		span.Error(err)
+		span.End(observability.ActivityResult{Outcome: "error", Code: "record_failed", Reason: err.Error()})
 		r.setConfigError(plan.ConfigID.Name, errors.Wrap(err, "record converged state"))
 		return
 	}
+	committed := false
 	r.mu.Lock()
 	managed := r.configs[plan.ConfigID.Name]
 	if managed != nil && managed.Desired.Version == desired.Version && managed.Desired.Digest == desired.Digest {
 		managed.Observed, managed.Recorded, managed.Status = observed, recorded, model.ConfigConverged
 		managed.LastError = ""
+		committed = true
 	}
 	r.mu.Unlock()
+	if committed {
+		execution := r.registry.Execution(plan.ConfigID)
+		r.observer.Committed(ctx, observability.Transition{
+			ID:   fmt.Sprintf("config/%s/revision/%d/converged", plan.ConfigID.Name, execution.Revision),
+			Kind: observability.TransitionConverged, ExecutionRevision: execution.Revision, At: time.Now(),
+			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
+			Provider: plan.ProviderType, To: string(model.ConfigConverged), Outcome: "converged", Cause: desired.Cause,
+		})
+	}
+	span.End(observability.ActivityResult{Outcome: "converged"})
 	r.wakeDependents(ctx, plan.ConfigID.Name)
 }
 
@@ -798,12 +934,21 @@ func (r *Reconciler) deleteConfig(ctx context.Context, name string) {
 
 func (r *Reconciler) deleteConfigRequest(ctx context.Context, request deleteRequest) {
 	name := request.name
+	activity := observability.Activity{Kind: observability.ActivityDelete, ConfigID: model.ConfigID{Name: name}}
+	if managed, ok := r.Config(name); ok {
+		activity.Provider, activity.Cause = managed.Desired.ProviderType, managed.Desired.Cause
+	}
+	ctx, rawSpan := r.observer.Start(ctx, activity)
+	span := observability.SafeSpan(rawSpan)
+	result := observability.ActivityResult{Outcome: "not_found"}
+	defer func() { span.End(result) }()
 	if request.conditional {
 		r.mu.RLock()
 		managed := r.configs[name]
 		matches := managed != nil && managed.Desired.Version == request.version && managed.Desired.Digest == request.digest
 		r.mu.RUnlock()
 		if !matches {
+			result.Outcome = "stale"
 			return
 		}
 	}
@@ -818,9 +963,12 @@ func (r *Reconciler) deleteConfigRequest(ctx context.Context, request deleteRequ
 	if managed == nil {
 		return
 	}
+	result.Outcome = "tombstoned"
 	attempts, err := r.registry.MarkDeleting(ctx, managed.ID)
 	if err != nil {
-		zap.L().Error("converge: mark config deleting", zap.String("config", name), zap.Error(err))
+		span.Error(err)
+		result = observability.ActivityResult{Outcome: "error", Code: "delete_tombstone_failed", Reason: err.Error()}
+		r.logger.Error("converge: mark config deleting", zap.String("config", name), zap.Error(err))
 		r.setConfigError(name, errors.Wrap(err, "mark deleting"))
 		return
 	}
@@ -837,33 +985,52 @@ func (r *Reconciler) deleteConfigRequest(ctx context.Context, request deleteRequ
 		}
 	}
 	if r.registry.DeletionReady(managed.ID) {
-		r.finalizeDeletion(ctx, managed.ID)
+		if err := r.finalizeDeletion(ctx, managed.ID); err != nil {
+			span.Error(err)
+			result = observability.ActivityResult{Outcome: "error", Code: "delete_finalize_failed", Reason: err.Error()}
+			return
+		}
+		result.Outcome = "deleted"
 	}
 }
 
-func (r *Reconciler) finalizeDeletion(ctx context.Context, configID model.ConfigID) {
+func (r *Reconciler) finalizeDeletion(ctx context.Context, configID model.ConfigID) error {
+	execution := r.registry.Execution(configID)
+	provider := ""
+	cause := model.CausalContext{}
+	if execution.AcceptedDesired != nil {
+		provider, cause = execution.AcceptedDesired.ProviderType, execution.AcceptedDesired.Cause
+	} else if execution.Plan != nil {
+		provider, cause = execution.Plan.ProviderType, execution.Plan.Desired.Cause
+	}
 	// The tombstone remains durable until both user-visible state and execution
 	// state are removed. Recorded state is deleted first; a crash after it is
 	// harmless because the tombstone resumes deletion on recovery.
 	if err := r.store.Delete(ctx, configID); err != nil {
-		zap.L().Error("converge: delete recorded state", zap.String("config", configID.Name), zap.Error(err))
+		r.logger.Error("converge: delete recorded state", zap.String("config", configID.Name), zap.Error(err))
 		r.setConfigError(configID.Name, errors.Wrap(err, "delete recorded state"))
-		return
+		return err
 	}
 	if err := r.registry.Delete(ctx, configID); err != nil {
-		zap.L().Error("converge: delete execution state", zap.String("config", configID.Name), zap.Error(err))
+		r.logger.Error("converge: delete execution state", zap.String("config", configID.Name), zap.Error(err))
 		r.setConfigError(configID.Name, errors.Wrap(err, "delete execution state"))
-		return
+		return err
 	}
 	r.mu.Lock()
 	delete(r.configs, configID.Name)
 	r.mu.Unlock()
+	r.observer.Committed(ctx, observability.Transition{
+		ID:   fmt.Sprintf("config/%s/revision/%d/deleted", configID.Name, execution.Revision),
+		Kind: observability.TransitionDeleted, ExecutionRevision: execution.Revision, At: time.Now(),
+		ConfigID: configID, Provider: provider, To: "deleted", Outcome: "success", Cause: cause,
+	})
+	return nil
 }
 
 func (r *Reconciler) detectDrift(ctx context.Context) {
 	r.wakeOutbox()
 	if err := r.registry.WakeDueWaiting(ctx, time.Now()); err != nil {
-		zap.L().Error("converge: wake waiting", zap.Error(err))
+		r.logger.Error("converge: wake waiting", zap.Error(err))
 	}
 	r.mu.RLock()
 	var names []string
