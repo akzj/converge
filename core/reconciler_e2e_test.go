@@ -65,7 +65,7 @@ func waitFor(t *testing.T, condition func() bool) {
 func TestReconcilerConditionWaitsThenExecutesEndToEnd(t *testing.T) {
 	provider := &lifecycleProvider{name: "condition", conditionFalseCount: 1}
 	r, ctx := startTestReconciler(t, provider)
-	desired := model.DesiredState{ConfigID: model.ConfigID{Name: "condition-config"}, ProviderType: provider.Type(), Version: 1, Digest: "v1"}
+	desired := model.DesiredState{ConfigID: model.ConfigID{Name: "condition-config"}, ProviderType: provider.Type(), Version: 1, Digest: model.DesiredSpecDigest(nil)}
 	if err := r.SubmitDesired(ctx, desired); err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestReconcilerConditionWaitsThenExecutesEndToEnd(t *testing.T) {
 func TestReconcilerRetriesWithFreshAttemptsEndToEnd(t *testing.T) {
 	provider := &lifecycleProvider{name: "retry", retryFailures: 2}
 	r, ctx := startTestReconciler(t, provider)
-	desired := model.DesiredState{ConfigID: model.ConfigID{Name: "retry-config"}, ProviderType: provider.Type(), Version: 1, Digest: "v1"}
+	desired := model.DesiredState{ConfigID: model.ConfigID{Name: "retry-config"}, ProviderType: provider.Type(), Version: 1, Digest: model.DesiredSpecDigest(nil)}
 	if err := r.SubmitDesired(ctx, desired); err != nil {
 		t.Fatal(err)
 	}

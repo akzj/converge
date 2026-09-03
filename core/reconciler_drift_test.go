@@ -155,7 +155,7 @@ func TestSubmitDeleteRemovesConfig(t *testing.T) {
 		ProviderType: "delete",
 		Version:      1,
 		Spec:         []byte(`{"key": "value"}`),
-		Digest:       "sha256:delete-v1",
+		Digest:       "sha256:9724c1e20e6e3e4d7f57ed25f9d4efb006e508590d528c90da597f6a775c13e5",
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -74,7 +74,7 @@ func (r *PlanRegistry) BeginEnsureEffect(ctx context.Context, req BeginEnsureReq
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlEnsureRetry, State: EffectControlPending,
 		TargetKind: EffectTargetPlanNode,
-		EffectID: req.Identity.EffectIdentity.EffectID, ReferenceID: req.Identity.EffectIdentity.ReferenceID,
+		EffectID:   req.Identity.EffectIdentity.EffectID, ReferenceID: req.Identity.EffectIdentity.ReferenceID,
 		PlanID: req.Identity.EffectIdentity.PlanID, Generation: req.Identity.EffectIdentity.Generation,
 		OperationKey: req.Identity.EffectIdentity.OperationKey,
 		NextCheckAt:  time.Now(),
@@ -162,16 +162,18 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 				retireObserveControlsLocked(state, reference.ID)
 				releaseID := ControlRequestID("release-" + string(reference.ID))
 				if _, exists := state.controls[releaseID]; !exists {
-					state.controls[releaseID] = EffectControl{
+					control := EffectControl{
 						ID: releaseID, ConfigID: identity.EffectIdentity.ConfigID,
 						ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 						Kind: EffectControlRelease, State: EffectControlPending,
 						TargetKind: EffectTargetPlanNode,
-						EffectID: effect.ID, ReferenceID: reference.ID,
+						EffectID:   effect.ID, ReferenceID: reference.ID,
 						PlanID: identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
 						OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectRelease),
 						NextCheckAt:  time.Now(),
 					}
+					bindControlToPlanNodeOrMaintenance(&control, state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectRelease)
+					state.controls[releaseID] = control
 				}
 			}
 			delete(state.controls, identity.RequestID)
@@ -189,11 +191,12 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 				ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
 				ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
 				TargetKind: EffectTargetPlanNode,
-				State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
+				State:      EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
 				PlanID: identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
 				OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve),
 				NextCheckAt:  time.Now(),
 			}
+			bindControlToPlanNodeOrMaintenance(&observeControl, state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve)
 			delete(state.controls, identity.RequestID)
 			state.controls[observeControl.ID] = observeControl
 		}
@@ -318,11 +321,12 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 		ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
 		ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
 		TargetKind: EffectTargetPlanNode,
-		State: EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
+		State:      EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
 		PlanID: state.active.ID, Generation: state.active.Generation,
 		OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve),
 		NextCheckAt:  time.Now(),
 	}
+	bindControlToPlanNodeOrMaintenance(&observeControl, state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve)
 	delete(state.controls, identity.RequestID)
 	state.controls[observeControl.ID] = observeControl
 
@@ -341,7 +345,6 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 	r.configs[identity.EffectIdentity.ConfigID.Name] = state
 	return TransitionApplied, nil
 }
-
 
 // ClaimDueControl atomically transitions a Pending/Yielded control to InFlight
 // with the given AttemptID, PollRequestID, and lease expiration, and creates a
@@ -692,7 +695,7 @@ func (r *PlanRegistry) CompleteEffectObservationAndNode(
 		return TransitionRejected, errors.Errorf("unsupported terminal observation disposition %q", observation.Disposition)
 	}
 
-// --- Verify NodeIdentity matches the active plan, preventing
+	// --- Verify NodeIdentity matches the active plan, preventing
 	// cross-generation advancement by a stale control. ---
 	if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != state.active.ID {
 		return TransitionStale, nil
@@ -905,7 +908,7 @@ func (r *PlanRegistry) BeginReleaseEffect(ctx context.Context, req BeginReleaseR
 			ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 			Kind: EffectControlRelease, State: EffectControlPending,
 			TargetKind: EffectTargetPlanNode,
-			EffectID: effect.ID, ReferenceID: reference.ID,
+			EffectID:   effect.ID, ReferenceID: reference.ID,
 			PlanID: req.Identity.EffectIdentity.PlanID, Generation: req.Identity.EffectIdentity.Generation,
 			OperationKey: req.Identity.EffectIdentity.OperationKey,
 			NextCheckAt:  time.Now(),
@@ -975,7 +978,7 @@ func (r *PlanRegistry) ApplyReleaseResult(ctx context.Context, identity Transiti
 				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 				Kind: EffectControlObserveCancellation, State: EffectControlPending,
 				TargetKind: EffectTargetMaintenance,
-				EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
+				EffectID:   effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
 			}
 		}
 	case ReleaseUnknown:
@@ -1104,17 +1107,18 @@ func (r *PlanRegistry) CompleteReleaseAndNode(
 				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 				Kind: EffectControlObserveCancellation, State: EffectControlPending,
 				TargetKind: EffectTargetMaintenance,
-				EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
+				EffectID:   effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
 			}
 		}
-// --- Verify NodeIdentity matches the active plan, preventing
-	// cross-generation advancement by a stale control. ---
-	if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != state.active.ID {
-		return TransitionStale, nil
+		// --- Verify NodeIdentity matches the active plan, preventing
+		// cross-generation advancement by a stale control. ---
+		if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != state.active.ID {
+			return TransitionStale, nil
+		}
+		if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != state.active.Generation {
+			return TransitionStale, nil
+		}
 	}
-	if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != state.active.Generation {
-		return TransitionStale, nil
-	}	}
 
 	if err := r.finishEffectNodeBundleLocked(ctx, state, identity, nodeKey, event); err != nil {
 		return TransitionRejected, err
@@ -1122,7 +1126,6 @@ func (r *PlanRegistry) CompleteReleaseAndNode(
 	r.configs[identity.EffectIdentity.ConfigID.Name] = state
 	return TransitionApplied, nil
 }
-
 
 // BeginEnsureReference persists a new Ensuring reference against an already-bound effect.
 func (r *PlanRegistry) BeginEnsureReference(ctx context.Context, identity TransitionIdentity) (TransitionDisposition, error) {
@@ -1156,7 +1159,9 @@ func (r *PlanRegistry) BeginEnsureReference(ctx context.Context, identity Transi
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlEnsureReference, State: EffectControlPending,
 		TargetKind: EffectTargetPlanNode,
-		EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now(),
+		EffectID:   effect.ID, ReferenceID: reference.ID,
+		PlanID: identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
+		OperationKey: identity.EffectIdentity.OperationKey, NextCheckAt: time.Now(),
 	}
 	if err := r.persistLocked(ctx, reference.ConfigID, state.revision, state); err != nil {
 		return TransitionRejected, err
@@ -1226,7 +1231,7 @@ func (r *PlanRegistry) ApplyEnsureReferenceResult(ctx context.Context, identity 
 				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 				Kind: EffectControlRelease, State: EffectControlPending,
 				TargetKind: EffectTargetMaintenance,
-				EffectID: old.EffectID, ReferenceID: old.ID, NextCheckAt: time.Now(),
+				EffectID:   old.EffectID, ReferenceID: old.ID, NextCheckAt: time.Now(),
 			}
 		}
 	}
@@ -1237,7 +1242,6 @@ func (r *PlanRegistry) ApplyEnsureReferenceResult(ctx context.Context, identity 
 	r.configs[identity.EffectIdentity.ConfigID.Name] = state
 	return TransitionApplied, nil
 }
-
 
 // CompleteEnsureReferenceAndNode atomically activates an EnsureReference result,
 // marks the target ensure node terminal, and enqueues the lifecycle outbox event
@@ -1312,19 +1316,19 @@ func (r *PlanRegistry) CompleteEnsureReferenceAndNode(
 				ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 				Kind: EffectControlRelease, State: EffectControlPending,
 				TargetKind: EffectTargetMaintenance,
-				EffectID: old.EffectID, ReferenceID: old.ID, NextCheckAt: time.Now(),
+				EffectID:   old.EffectID, ReferenceID: old.ID, NextCheckAt: time.Now(),
 			}
 		}
 	}
 
-// --- Verify NodeIdentity matches the active plan, preventing
+	// --- Verify NodeIdentity matches the active plan, preventing
 	// cross-generation advancement by a stale control. ---
 	if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != state.active.ID {
 		return TransitionStale, nil
 	}
 	if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != state.active.Generation {
 		return TransitionStale, nil
-}
+	}
 	if err := r.finishEffectNodeBundleLocked(ctx, state, identity, nodeKey, event); err != nil {
 		return TransitionRejected, err
 	}
@@ -1350,7 +1354,6 @@ func (r *PlanRegistry) LookupEffectAndReference(configID model.ConfigID, effectI
 	}
 	return effect, reference, true
 }
-
 
 // HasActiveEffectControl reports whether a non-terminal control owns an effect slot.
 func (r *PlanRegistry) HasActiveEffectControl(configID model.ConfigID, effectKey string, kind EffectControlKind) bool {
@@ -1493,7 +1496,7 @@ func (r *PlanRegistry) EnsureEnsureRetryControl(ctx context.Context, configID mo
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlEnsureRetry, State: EffectControlPending,
 		TargetKind: EffectTargetPlanNode,
-		EffectID: effect.ID, ReferenceID: referenceID,
+		EffectID:   effect.ID, ReferenceID: referenceID,
 		PlanID: planID, Generation: generation, OperationKey: opKey,
 		NextCheckAt: time.Now(),
 	}
@@ -1504,7 +1507,6 @@ func (r *PlanRegistry) EnsureEnsureRetryControl(ctx context.Context, configID mo
 	r.configs[configID.Name] = state
 	return TransitionApplied, nil
 }
-
 
 // RetireControlAttempt retires a claimed control-poll Attempt with the given
 // terminal status. It is used by the scheduler for non-node-completing control
@@ -1547,7 +1549,7 @@ func (r *PlanRegistry) EnsureObserveControl(ctx context.Context, configID model.
 		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
 		Kind: EffectControlObserve, State: EffectControlPending,
 		TargetKind: EffectTargetPlanNode,
-		EffectID: effect.ID, ReferenceID: referenceID,
+		EffectID:   effect.ID, ReferenceID: referenceID,
 		PlanID: planID, Generation: generation, OperationKey: opKey,
 		NextCheckAt: time.Now(),
 	}

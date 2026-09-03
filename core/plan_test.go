@@ -14,7 +14,11 @@ func testPlan(t *testing.T, digest string, operations ...model.Operation) *model
 			operations[i].ExecutionKind = model.ExecutionDirect
 		}
 	}
-	plan, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{Version: 1, Digest: "desired"}, "test", digest, operations)
+	spec := []byte(`{"desired":true}`)
+	plan, err := BuildCandidate(model.ConfigID{Name: "config"}, model.DesiredState{
+		ConfigID: model.ConfigID{Name: "config"}, ProviderType: "test", Version: 1,
+		Spec: spec, Digest: model.DesiredSpecDigest(spec),
+	}, "test", digest, operations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +177,19 @@ func TestClassifyWaitingNodeOnSupersession(t *testing.T) {
 	}
 	if len(change.Drop) != 1 || change.Drop[0] != "wait" || len(change.Add) != 1 || change.Add[0] != "wait" {
 		t.Fatalf("waiting supersession classification=%#v", change)
+	}
+}
+
+func TestClassifyWaitingOnControlNodeOnSupersession(t *testing.T) {
+	oldPlan := testPlan(t, "digest", model.Operation{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"})
+	oldPlan.Nodes["ensure"].Status = model.NodeWaitingOnControl
+	candidate := testPlan(t, "digest", model.Operation{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download", Input: []byte(`{"version":2}`)})
+	change, err := ClassifyPlanChange(oldPlan, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(change.Drop, []model.OperationKey{"ensure"}) || !reflect.DeepEqual(change.Add, []model.OperationKey{"ensure"}) {
+		t.Fatalf("waiting-on-control supersession classification=%#v", change)
 	}
 }
 

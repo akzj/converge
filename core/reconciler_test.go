@@ -82,7 +82,7 @@ func TestReconcilerSubmitsAndProcessesDesiredState(t *testing.T) {
 		ProviderType: "test",
 		Version:      1,
 		Spec:         []byte(`{"key": "value"}`),
-		Digest:       "sha256:abc",
+		Digest:       "sha256:9724c1e20e6e3e4d7f57ed25f9d4efb006e508590d528c90da597f6a775c13e5",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func TestReconcilerSupersessionCancelsInFlight(t *testing.T) {
 		ProviderType: "slow",
 		Version:      1,
 		Spec:         []byte(`{"v": 1}`),
-		Digest:       "sha256:v1",
+		Digest:       "sha256:9ab2253fc38981f5be9c25cf0a34b62cdf334652344bdef16b3d5dbc0b74f2f1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +128,7 @@ func TestReconcilerSupersessionCancelsInFlight(t *testing.T) {
 		ProviderType: "slow",
 		Version:      2,
 		Spec:         []byte(`{"v": 2}`),
-		Digest:       "sha256:v2",
+		Digest:       "sha256:0b3a178d3458979eb4524c685a11f329077b77c0b98c630b02b928918d1b4f11",
 	})
 	if err != nil {
 		t.Fatal(err)

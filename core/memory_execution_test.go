@@ -59,6 +59,30 @@ func TestMemoryExecutionStoreRejectsStaleSameGenerationTransition(t *testing.T) 
 	}
 }
 
+func TestMemoryExecutionStoreDeepCopiesAcceptedDesired(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	id := model.ConfigID{Name: "config"}
+	desired := model.DesiredState{ConfigID: id, ProviderType: "test", Version: 1, Spec: []byte(`{"v":1}`), DependsOn: []string{"base"}}
+	desired.Digest = model.DesiredSpecDigest(desired.Spec)
+	if err := store.CommitExecutionCAS(ctx, id, 0, ExecutionSnapshot{Revision: 1, AcceptedDesired: &desired}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadExecution(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.AcceptedDesired.Spec[0] = '['
+	loaded.AcceptedDesired.DependsOn[0] = "changed"
+	fresh, err := store.LoadExecution(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(fresh.AcceptedDesired.Spec) != `{"v":1}` || fresh.AcceptedDesired.DependsOn[0] != "base" {
+		t.Fatalf("accepted desired aliased: %#v", fresh.AcceptedDesired)
+	}
+}
+
 func TestMemoryJournalAppendIsIdempotentByEventID(t *testing.T) {
 	ctx := context.Background()
 	journal := NewMemoryJournal()

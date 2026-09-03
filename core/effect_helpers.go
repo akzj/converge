@@ -12,14 +12,15 @@ import (
 	"github.com/akzj/converge/pkg/model"
 )
 
-// verifyControlNodeIdentity returns TransitionStale if the control's NodeIdentity
-// does not match the active plan, preventing cross-generation advancement by a
 // finishEffectNodeBundleLocked completes the plan node, retires the control
 // attempt, enqueues the lifecycle outbox event, and persists in one CAS.
 // Caller holds the registry write lock and has already mutated effect/
 // reference/control state on the clone. The node becomes Failed when the event
 // carries StepFailed.
 func (r *PlanRegistry) finishEffectNodeBundleLocked(ctx context.Context, state *configExecution, identity TransitionIdentity, nodeKey model.OperationKey, event model.Event) error {
+	if nodeKey == "" || nodeKey != identity.EffectIdentity.OperationKey {
+		return errors.New("terminal bundle node key does not match control identity")
+	}
 	node := state.active.Nodes[nodeKey]
 	if node == nil {
 		return errors.Errorf("operation %q not found", nodeKey)
@@ -47,15 +48,24 @@ func (r *PlanRegistry) finishEffectNodeBundleLocked(ctx context.Context, state *
 	state.outbox[event.EventID] = event
 	return r.persistLocked(ctx, identity.EffectIdentity.ConfigID, state.revision, state)
 }
-// stale control. Callers invoke it before mutating any state.
+
+// verifyControlNodeIdentity rejects incomplete identities and returns stale if
+// the complete identity does not match the active plan. Callers invoke it
+// before mutating any state.
 func verifyControlNodeIdentity(identity TransitionIdentity, active *model.Plan) TransitionDisposition {
 	if active == nil {
 		return TransitionRejected
 	}
-	if identity.EffectIdentity.PlanID != "" && identity.EffectIdentity.PlanID != active.ID {
+	if identity.EffectIdentity.PlanID == "" || identity.EffectIdentity.Generation == 0 || identity.EffectIdentity.OperationKey == "" {
+		return TransitionRejected
+	}
+	if identity.EffectIdentity.PlanID != active.ID {
 		return TransitionStale
 	}
-	if identity.EffectIdentity.Generation != 0 && identity.EffectIdentity.Generation != active.Generation {
+	if identity.EffectIdentity.Generation != active.Generation {
+		return TransitionStale
+	}
+	if active.Nodes[identity.EffectIdentity.OperationKey] == nil {
 		return TransitionStale
 	}
 	return TransitionApplied
@@ -101,4 +111,22 @@ func findEffectOperationKey(plan *model.Plan, effectKey string, kind model.Opera
 		}
 	}
 	return ""
+}
+
+// bindControlToPlanNodeOrMaintenance makes the control target explicit. A
+// provider lifecycle action that has no node in the current plan is maintenance
+// work; it must not retain a partial identity that could advance a DAG node.
+func bindControlToPlanNodeOrMaintenance(control *EffectControl, plan *model.Plan, effectKey string, kind model.OperationExecutionKind) {
+	key := findEffectOperationKey(plan, effectKey, kind)
+	if plan == nil || key == "" {
+		control.TargetKind = EffectTargetMaintenance
+		control.PlanID = ""
+		control.Generation = 0
+		control.OperationKey = ""
+		return
+	}
+	control.TargetKind = EffectTargetPlanNode
+	control.PlanID = plan.ID
+	control.Generation = plan.Generation
+	control.OperationKey = key
 }

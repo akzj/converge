@@ -65,11 +65,12 @@ const (
 type EffectDisposition string
 
 const (
-	DispositionStillActive EffectDisposition = "still_active"
-	DispositionCompleted   EffectDisposition = "completed"
-	DispositionAbsent      EffectDisposition = "absent"
-	DispositionCancelled   EffectDisposition = "cancelled"
-	DispositionFailed      EffectDisposition = "failed"
+	DispositionStillActive       EffectDisposition = "still_active"
+	DispositionCompleted         EffectDisposition = "completed"
+	DispositionAbsent            EffectDisposition = "absent"
+	DispositionAuthoritativeGone EffectDisposition = "authoritative_gone"
+	DispositionCancelled         EffectDisposition = "cancelled"
+	DispositionFailed            EffectDisposition = "failed"
 )
 
 type CancelDisposition string
@@ -301,15 +302,26 @@ const (
 	ControlCompleted EffectControlState = "completed"
 )
 
+type EffectTargetKind string
+
+const (
+	EffectTargetPlanNode    EffectTargetKind = "plan_node"
+	EffectTargetMaintenance EffectTargetKind = "maintenance"
+)
+
 type EffectControl struct {
 	ID                ControlRequestID
 	ConfigID          ConfigID
 	ProviderType      string
 	ProviderDigest    string
 	Kind              EffectControlKind
+	TargetKind        EffectTargetKind
 	State             EffectControlState
 	EffectID          EffectID
 	ReferenceID       ReferenceID
+	PlanID            PlanID
+	Generation        Generation
+	OperationKey      OperationKey
 	NextCheckAt       time.Time
 	RetryCount        uint32
 	InFlightAttemptID AttemptID

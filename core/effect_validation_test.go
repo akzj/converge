@@ -56,7 +56,7 @@ func validEffectSnapshot() ExecutionSnapshot {
 	effect := validEffect()
 	plan := &model.Plan{ID: "plan", ConfigID: model.ConfigID{Name: "config"}, Generation: 2}
 	reference := EffectReference{ID: "ref", EffectID: effect.ID, ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation, EffectKey: "artifact", State: EffectReferenceActive}
-	control := EffectControl{ID: "control", ConfigID: reference.ConfigID, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve, State: EffectControlInFlight, EffectID: effect.ID, ReferenceID: reference.ID, InFlightAttemptID: "attempt", PollRequestID: "poll", LeaseExpiresAt: time.Now().Add(time.Minute)}
+	control := EffectControl{ID: "control", ConfigID: reference.ConfigID, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve, TargetKind: EffectTargetMaintenance, State: EffectControlInFlight, EffectID: effect.ID, ReferenceID: reference.ID, InFlightAttemptID: "attempt", PollRequestID: "poll", LeaseExpiresAt: time.Now().Add(time.Minute)}
 	return ExecutionSnapshot{Plan: plan, Effects: []ActiveEffect{effect}, EffectReferences: []EffectReference{reference}, EffectControls: []EffectControl{control}}
 }
 

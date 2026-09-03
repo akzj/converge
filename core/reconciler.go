@@ -13,11 +13,16 @@ import (
 	"github.com/akzj/converge/pkg/model"
 )
 
-const maxConcurrentExecutions = 10
+const (
+	maxConcurrentExecutions = 10
+	maxConcurrentControls   = 10
+)
 
 // Reconciler owns desired state and drives generation-aware plan execution.
 type Reconciler struct {
 	mu sync.RWMutex
+	// submitMu serializes dependency validation with durable desired acceptance.
+	submitMu sync.Mutex
 
 	providers        map[string]Provider
 	providerVersions map[string]map[string]Provider
@@ -27,21 +32,25 @@ type Reconciler struct {
 	journal          Journal
 	registry         *PlanRegistry
 
-	configs map[string]*model.ManagedConfig
-	cancels map[model.AttemptID]context.CancelFunc
+	configs      map[string]*model.ManagedConfig
+	cancels      map[model.AttemptID]context.CancelFunc
+	pendingPlans map[string]struct{}
 
-	pendingDesired chan model.DesiredState
+	desiredWake    chan struct{}
 	pendingDelete  chan string
 	execSem        chan struct{}
+	controlSem     chan struct{}
+	controlScanSem chan struct{}
 	outboxWake     chan struct{}
 	controlWake    chan struct{}
+	controlTimeout time.Duration
 }
 
 func NewReconciler(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal) *Reconciler {
 	return &Reconciler{
 		providers: make(map[string]Provider), providerVersions: make(map[string]map[string]Provider), store: store, events: events, arbiter: arbiter, journal: journal,
-		registry: NewPlanRegistry(executionStore), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc),
-		pendingDesired: make(chan model.DesiredState, 128), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions), outboxWake: make(chan struct{}, 1), controlWake: make(chan struct{}, 1),
+		registry: NewPlanRegistry(executionStore), configs: make(map[string]*model.ManagedConfig), cancels: make(map[model.AttemptID]context.CancelFunc), pendingPlans: make(map[string]struct{}),
+		desiredWake: make(chan struct{}, 1), pendingDelete: make(chan string, 128), execSem: make(chan struct{}, maxConcurrentExecutions), controlSem: make(chan struct{}, maxConcurrentControls), controlScanSem: make(chan struct{}, 1), outboxWake: make(chan struct{}, 1), controlWake: make(chan struct{}, 1), controlTimeout: effectControlRPCTimeout,
 	}
 }
 
@@ -77,12 +86,73 @@ func (r *Reconciler) RegisterProvider(ctx context.Context, provider Provider) {
 }
 
 func (r *Reconciler) SubmitDesired(ctx context.Context, desired model.DesiredState) error {
-	select {
-	case r.pendingDesired <- desired:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := validateDesired(desired); err != nil {
+		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.submitMu.Lock()
+	defer r.submitMu.Unlock()
+	if err := r.validateConfigDependencies(desired); err != nil {
+		return err
+	}
+	accepted, err := r.registry.AcceptDesired(ctx, desired)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	current := r.configs[desired.ConfigID.Name]
+	shouldPlan := accepted || current == nil || current.Status != model.ConfigConverged
+	if current == nil {
+		current = &model.ManagedConfig{ID: desired.ConfigID}
+		r.configs[desired.ConfigID.Name] = current
+	}
+	current.Desired = model.CloneDesiredState(desired)
+	current.DependsOnConfigs = append([]string(nil), desired.DependsOn...)
+	if shouldPlan {
+		current.Status = model.ConfigConverging
+		current.LastError = ""
+		r.pendingPlans[desired.ConfigID.Name] = struct{}{}
+	}
+	r.mu.Unlock()
+	if shouldPlan {
+		select {
+		case r.desiredWake <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func validateDesired(desired model.DesiredState) error {
+	if desired.ConfigID.Name == "" {
+		return errors.New("desired config ID is empty")
+	}
+	if desired.ProviderType == "" {
+		return errors.New("desired provider type is empty")
+	}
+	expected := model.DesiredSpecDigest(desired.Spec)
+	if desired.Digest != expected {
+		return errors.Errorf("desired digest mismatch: got %q, want %q", desired.Digest, expected)
+	}
+	return nil
+}
+
+// Config returns a detached snapshot of the accepted desired and its current
+// convergence status.
+func (r *Reconciler) Config(name string) (model.ManagedConfig, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	managed := r.configs[name]
+	if managed == nil {
+		return model.ManagedConfig{}, false
+	}
+	copy := *managed
+	copy.Desired = model.CloneDesiredState(managed.Desired)
+	copy.DependsOnConfigs = append([]string(nil), managed.DependsOnConfigs...)
+	copy.Observed.Properties = append([]byte(nil), managed.Observed.Properties...)
+	return copy, true
 }
 
 func (r *Reconciler) SubmitDelete(ctx context.Context, name string) error {
@@ -104,22 +174,26 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	}
 	go r.runOutboxDispatcher(ctx)
 	r.wakeOutbox()
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	driftTicker := time.NewTicker(30 * time.Second)
+	controlTicker := time.NewTicker(time.Second)
+	defer driftTicker.Stop()
+	defer controlTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case desired := <-r.pendingDesired:
-			r.handleDesired(ctx, desired)
+		case <-r.desiredWake:
+			r.planAcceptedDesired(ctx)
 		case name := <-r.pendingDelete:
 			r.deleteConfig(ctx, name)
 		case event := <-eventCh:
 			r.handleEvent(ctx, event)
 		case <-r.controlWake:
 			// EffectControl scheduler may have work; processDueControls runs below.
-		case <-ticker.C:
+		case <-driftTicker.C:
 			r.detectDrift(ctx)
+		case <-controlTicker.C:
+			// Periodically wake delayed controls whose NextCheckAt has arrived.
 		}
 		r.processDueControls(ctx)
 		r.executeReady(ctx)
@@ -145,65 +219,46 @@ func (r *Reconciler) recover(ctx context.Context) error {
 		}
 		r.configs[id.Name] = &model.ManagedConfig{ID: id, Recorded: *recorded, Status: recorded.Status, Desired: model.DesiredState{ConfigID: id, ProviderType: recorded.ProviderType, Version: recorded.DesiredVersion, Digest: recorded.DesiredDigest}}
 	}
-	// Execution plans are the authority for in-progress/newer desired revisions.
-	for _, plan := range r.registry.ExecutionPlans() {
-		desired := model.CloneDesiredState(plan.Desired)
-		if desired.ConfigID.Name == "" {
-			desired.ConfigID = plan.ConfigID
-		}
-		managed := r.configs[plan.ConfigID.Name]
+	// AcceptedDesired is authoritative even when planning previously failed.
+	for _, desired := range r.registry.AcceptedDesireds() {
+		managed := r.configs[desired.ConfigID.Name]
 		if managed == nil {
-			managed = &model.ManagedConfig{ID: plan.ConfigID}
-			r.configs[plan.ConfigID.Name] = managed
+			managed = &model.ManagedConfig{ID: desired.ConfigID}
+			r.configs[desired.ConfigID.Name] = managed
 		}
 		if desired.Version >= managed.Desired.Version {
-			managed.Desired = desired
+			managed.Desired = model.CloneDesiredState(desired)
 			managed.DependsOnConfigs = append([]string(nil), desired.DependsOn...)
 			managed.Status = model.ConfigConverging
+			r.pendingPlans[desired.ConfigID.Name] = struct{}{}
 		}
 	}
 	r.mu.Unlock()
-	// Unknown/draining effects need active inspection/replanning after recovery.
-	for _, plan := range r.registry.ExecutionPlans() {
-		if r.registry.IsDeleting(plan.ConfigID) && r.registry.DeletionReady(plan.ConfigID) {
-			r.finalizeDeletion(ctx, plan.ConfigID)
-			continue
+	// Deletions that were already drained can finish without a provider.
+	for _, desired := range r.registry.AcceptedDesireds() {
+		if r.registry.IsDeleting(desired.ConfigID) && r.registry.DeletionReady(desired.ConfigID) {
+			r.finalizeDeletion(ctx, desired.ConfigID)
 		}
-		r.mu.RLock()
-		providerAvailable := r.providers[plan.ProviderType] != nil
-		r.mu.RUnlock()
-		if providerAvailable {
-			r.planLatest(ctx, plan.ConfigID.Name)
-		}
+	}
+	select {
+	case r.desiredWake <- struct{}{}:
+	default:
 	}
 	return nil
 }
 
-func (r *Reconciler) handleDesired(ctx context.Context, desired model.DesiredState) {
-	name := desired.ConfigID.Name
-	if err := r.validateConfigDependencies(desired); err != nil {
-		zap.L().Error("converge: rejected configuration dependency graph", zap.String("config", name), zap.Error(err))
-		return
-	}
+func (r *Reconciler) planAcceptedDesired(ctx context.Context) {
 	r.mu.Lock()
-	current := r.configs[name]
-	if current != nil {
-		if desired.Version < current.Desired.Version || (desired.Version == current.Desired.Version && desired.Digest != current.Desired.Digest) {
-			r.mu.Unlock()
-			zap.L().Error("converge: rejected desired revision conflict", zap.String("config", name))
-			return
-		}
-		if desired.Version == current.Desired.Version && desired.Digest == current.Desired.Digest {
-			r.mu.Unlock()
-			return
-		}
-		current.Desired, current.DependsOnConfigs, current.Status = desired, append([]string(nil), desired.DependsOn...), model.ConfigConverging
-	} else {
-		r.configs[name] = &model.ManagedConfig{ID: desired.ConfigID, Desired: desired, DependsOnConfigs: append([]string(nil), desired.DependsOn...), Status: model.ConfigConverging}
+	names := make([]string, 0, len(r.pendingPlans))
+	for name := range r.pendingPlans {
+		names = append(names, name)
+		delete(r.pendingPlans, name)
 	}
 	r.mu.Unlock()
-	r.planLatest(ctx, name)
-	r.invalidateDependents(ctx, name)
+	for _, name := range names {
+		r.planLatest(ctx, name)
+		r.invalidateDependents(ctx, name)
+	}
 }
 
 // planLatest implements snapshot -> provider replan -> validate -> generation CAS.
@@ -215,14 +270,15 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 			r.mu.RUnlock()
 			return
 		}
-		desired := managed.Desired
+		desired := model.CloneDesiredState(managed.Desired)
+		dependencies := append([]string(nil), managed.DependsOnConfigs...)
 		provider := r.providers[desired.ProviderType]
 		r.mu.RUnlock()
 		if provider == nil {
-			r.setConfigStatus(name, model.ConfigError)
+			r.setConfigError(name, errors.Errorf("provider %q is not registered", desired.ProviderType))
 			return
 		}
-		if !r.dependenciesMet(managed) {
+		if !r.dependenciesMet(&model.ManagedConfig{DependsOnConfigs: dependencies}) {
 			return
 		}
 
@@ -233,16 +289,16 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		}
 		observed, err := provider.Inspect(ctx, model.ResourceID{Name: name})
 		if err != nil {
-			r.setConfigStatus(name, model.ConfigError)
+			r.setConfigError(name, errors.Wrap(err, "inspect"))
 			return
 		}
 		result, err := provider.Replan(ctx, ReplanRequest{Observed: observed, Desired: desired, Active: snapshot, ProviderDigest: provider.Digest()})
 		if err != nil {
-			r.setConfigStatus(name, model.ConfigError)
+			r.setConfigError(name, errors.Wrap(err, "replan"))
 			return
 		}
 		if err := r.registry.ResolveEffects(ctx, desired.ConfigID, result.Resolutions); err != nil {
-			r.setConfigStatus(name, model.ConfigError)
+			r.setConfigError(name, errors.Wrap(err, "resolve effects"))
 			return
 		}
 		if r.registry.IsDeleting(desired.ConfigID) {
@@ -260,7 +316,7 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		}
 		candidate, err := BuildCandidate(desired.ConfigID, desired, provider.Type(), provider.Digest(), result.Operations)
 		if err != nil {
-			r.setConfigStatus(name, model.ConfigError)
+			r.setConfigError(name, errors.Wrap(err, "build candidate"))
 			return
 		}
 		installed, change, err := r.registry.Install(ctx, expected, candidate)
@@ -268,7 +324,7 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 			continue
 		}
 		if err != nil {
-			r.setConfigStatus(name, model.ConfigError)
+			r.setConfigError(name, errors.Wrap(err, "install plan"))
 			return
 		}
 		r.cancelRetired(snapshot, change)
@@ -280,6 +336,7 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		return
 	}
 	zap.L().Warn("converge: replan CAS contention", zap.String("config", name))
+	r.setConfigError(name, errors.New("replan CAS contention"))
 }
 
 func (r *Reconciler) cancelRetired(snapshot model.PlanSnapshot, change PlanChange) {
@@ -523,7 +580,7 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 		return
 	}
 	if planFailed(snapshot.Plan) {
-		r.setConfigStatus(event.ConfigID, model.ConfigError)
+		r.setConfigError(event.ConfigID, errors.Errorf("operation %q failed: %s", event.NodeKey, event.Result.Reason))
 		return
 	}
 	if planCompleted(snapshot.Plan) {
@@ -540,7 +597,7 @@ func (r *Reconciler) verifyAndRecord(ctx context.Context, plan *model.Plan, prov
 	desired := model.CloneDesiredState(plan.Desired)
 	observed, err := provider.Verify(ctx, model.ResourceID{Name: plan.ConfigID.Name}, desired)
 	if err != nil {
-		r.setConfigStatus(plan.ConfigID.Name, model.ConfigError)
+		r.setConfigError(plan.ConfigID.Name, errors.Wrap(err, "verify"))
 		return
 	}
 	// Do not let completion of an old plan record a newer mutable desired state.
@@ -551,13 +608,14 @@ func (r *Reconciler) verifyAndRecord(ctx context.Context, plan *model.Plan, prov
 	}
 	recorded := model.RecordedState{ConfigID: plan.ConfigID, ProviderType: provider.Type(), DesiredVersion: desired.Version, DesiredDigest: desired.Digest, HandlerDigest: provider.Digest(), Status: model.ConfigConverged, UpdatedAt: time.Now()}
 	if err := r.store.Record(ctx, recorded); err != nil {
-		r.setConfigStatus(plan.ConfigID.Name, model.ConfigError)
+		r.setConfigError(plan.ConfigID.Name, errors.Wrap(err, "record converged state"))
 		return
 	}
 	r.mu.Lock()
 	managed := r.configs[plan.ConfigID.Name]
 	if managed != nil && managed.Desired.Version == desired.Version && managed.Desired.Digest == desired.Digest {
 		managed.Observed, managed.Recorded, managed.Status = observed, recorded, model.ConfigConverged
+		managed.LastError = ""
 	}
 	r.mu.Unlock()
 	r.wakeDependents(ctx, plan.ConfigID.Name)
@@ -658,6 +716,20 @@ func (r *Reconciler) setConfigStatus(name string, status model.ConfigStatus) {
 	r.mu.Lock()
 	if c := r.configs[name]; c != nil {
 		c.Status = status
+		if status != model.ConfigError {
+			c.LastError = ""
+		}
+	}
+	r.mu.Unlock()
+}
+
+func (r *Reconciler) setConfigError(name string, err error) {
+	r.mu.Lock()
+	if c := r.configs[name]; c != nil {
+		c.Status = model.ConfigError
+		if err != nil {
+			c.LastError = err.Error()
+		}
 	}
 	r.mu.Unlock()
 }

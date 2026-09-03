@@ -41,6 +41,22 @@ func TestPersistenceFailureDoesNotPublishPlanInMemory(t *testing.T) {
 	}
 }
 
+func TestSubmitDesiredDoesNotAckPersistenceFailure(t *testing.T) {
+	store := &failingExecutionStore{inner: NewMemoryExecutionStore(), fail: true}
+	r := NewReconciler(NewMemoryStateStore(), store, NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
+	desired := model.DesiredState{
+		ConfigID: model.ConfigID{Name: "config"}, ProviderType: "missing", Version: 1,
+		Spec: []byte(`{"v":1}`),
+	}
+	desired.Digest = model.DesiredSpecDigest(desired.Spec)
+	if err := r.SubmitDesired(context.Background(), desired); err == nil {
+		t.Fatal("expected durable acceptance failure")
+	}
+	if _, ok := r.Config(desired.ConfigID.Name); ok {
+		t.Fatal("failed durable acceptance leaked into reconciler state")
+	}
+}
+
 func TestPersistenceFailureDoesNotStartAttemptInMemory(t *testing.T) {
 	store := &failingExecutionStore{inner: NewMemoryExecutionStore()}
 	registry := NewPlanRegistry(store)

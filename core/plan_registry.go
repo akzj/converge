@@ -1,8 +1,10 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -16,6 +18,7 @@ var ErrGenerationChanged = errors.New("active plan generation changed")
 type configExecution struct {
 	revision   uint64
 	deleting   bool
+	accepted   *model.DesiredState
 	active     *model.Plan
 	attempts   map[model.AttemptID]*model.Attempt
 	retired    map[model.AttemptID]*model.Attempt
@@ -72,11 +75,39 @@ func (r *PlanRegistry) ExecutionPlans() []*model.Plan {
 	return plans
 }
 
+// AcceptedDesireds returns the durable desired revisions, including revisions
+// that have not produced an executable plan yet.
+func (r *PlanRegistry) AcceptedDesireds() []model.DesiredState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]model.DesiredState, 0, len(r.configs))
+	for _, state := range r.configs {
+		if state.accepted != nil {
+			result = append(result, model.CloneDesiredState(*state.accepted))
+		}
+	}
+	return result
+}
+
+func (r *PlanRegistry) AcceptedDesired(configID model.ConfigID) (model.DesiredState, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state := r.configs[configID.Name]
+	if state == nil || state.accepted == nil {
+		return model.DesiredState{}, false
+	}
+	return model.CloneDesiredState(*state.accepted), true
+}
+
 func (r *PlanRegistry) executionSnapshotLocked(state *configExecution) ExecutionSnapshot {
 	if state == nil {
 		return ExecutionSnapshot{}
 	}
 	snapshot := ExecutionSnapshot{Revision: state.revision, Deleting: state.deleting, Plan: state.active.Clone()}
+	if state.accepted != nil {
+		desired := model.CloneDesiredState(*state.accepted)
+		snapshot.AcceptedDesired = &desired
+	}
 	for _, attempt := range state.attempts {
 		snapshot.Attempts = append(snapshot.Attempts, *attempt)
 	}
@@ -133,21 +164,39 @@ func (r *PlanRegistry) Restore(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if snapshot == nil || snapshot.Plan == nil {
+		if snapshot == nil || (snapshot.Plan == nil && snapshot.AcceptedDesired == nil) {
 			continue
 		}
+		if snapshot.AcceptedDesired != nil {
+			if snapshot.AcceptedDesired.ConfigID != id {
+				return errors.Errorf("accepted desired belongs to %q, loaded as %q", snapshot.AcceptedDesired.ConfigID.Name, id.Name)
+			}
+			if err := validateDesired(*snapshot.AcceptedDesired); err != nil {
+				return errors.Wrapf(err, "invalid accepted desired for %q", id.Name)
+			}
+		}
+		migrateLegacyControlTargets(snapshot)
 		if err := ValidateEffectSnapshot(*snapshot); err != nil {
 			return errors.Wrapf(err, "invalid execution snapshot for %q", id.Name)
 		}
 		state := &configExecution{revision: snapshot.Revision, deleting: snapshot.Deleting, active: snapshot.Plan.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event), effects: make(map[EffectID]ActiveEffect), references: make(map[ReferenceID]EffectReference), controls: make(map[ControlRequestID]EffectControl)}
+		if snapshot.AcceptedDesired != nil {
+			desired := model.CloneDesiredState(*snapshot.AcceptedDesired)
+			state.accepted = &desired
+		} else if snapshot.Plan != nil {
+			desired := model.CloneDesiredState(snapshot.Plan.Desired)
+			state.accepted = &desired
+		}
 		for i := range snapshot.Attempts {
 			attempt := snapshot.Attempts[i]
 			copy := attempt
 			if attempt.Status == model.AttemptRunning || attempt.Status == model.AttemptCancelling || attempt.Status == model.AttemptDraining {
 				copy.Status = model.AttemptUnknown
 				state.retired[copy.ID] = &copy
-				if node := state.active.Nodes[copy.NodeKey]; node != nil && node.AttemptID == copy.ID {
-					node.Status = model.NodeDraining
+				if state.active != nil {
+					if node := state.active.Nodes[copy.NodeKey]; node != nil && node.AttemptID == copy.ID {
+						node.Status = model.NodeDraining
+					}
 				}
 			} else {
 				state.attempts[copy.ID] = &copy
@@ -180,11 +229,35 @@ func (r *PlanRegistry) Restore(ctx context.Context) error {
 	return nil
 }
 
+// migrateLegacyControlTargets upgrades snapshots written before TargetKind was
+// mandatory. Complete identities are plan nodes; empty identities are
+// maintenance. Partially populated identities remain invalid and fail restore.
+func migrateLegacyControlTargets(snapshot *ExecutionSnapshot) {
+	for i := range snapshot.EffectControls {
+		control := &snapshot.EffectControls[i]
+		if control.TargetKind != "" {
+			continue
+		}
+		complete := control.PlanID != "" && control.Generation != 0 && control.OperationKey != ""
+		empty := control.PlanID == "" && control.Generation == 0 && control.OperationKey == ""
+		switch {
+		case complete:
+			control.TargetKind = EffectTargetPlanNode
+		case empty:
+			control.TargetKind = EffectTargetMaintenance
+		}
+	}
+}
+
 func cloneConfigExecution(state *configExecution) *configExecution {
 	if state == nil {
 		return nil
 	}
 	copy := &configExecution{revision: state.revision, deleting: state.deleting, active: state.active.Clone(), attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event), effects: make(map[EffectID]ActiveEffect), references: make(map[ReferenceID]EffectReference), controls: make(map[ControlRequestID]EffectControl)}
+	if state.accepted != nil {
+		desired := model.CloneDesiredState(*state.accepted)
+		copy.accepted = &desired
+	}
 	for id, attempt := range state.attempts {
 		value := *attempt
 		copy.attempts[id] = &value
@@ -208,6 +281,52 @@ func cloneConfigExecution(state *configExecution) *configExecution {
 	return copy
 }
 
+// AcceptDesired durably records the latest desired revision before planning.
+// A nil error is therefore a durable acceptance ACK from the configured
+// ExecutionStore, not merely confirmation that an in-memory queue had space.
+func (r *PlanRegistry) AcceptDesired(ctx context.Context, desired model.DesiredState) (bool, error) {
+	if err := validateDesired(desired); err != nil {
+		return false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current := r.configs[desired.ConfigID.Name]
+	state := cloneConfigExecution(current)
+	if state == nil {
+		state = &configExecution{attempts: make(map[model.AttemptID]*model.Attempt), retired: make(map[model.AttemptID]*model.Attempt), outbox: make(map[string]model.Event), effects: make(map[EffectID]ActiveEffect), references: make(map[ReferenceID]EffectReference), controls: make(map[ControlRequestID]EffectControl)}
+	}
+	var previous *model.DesiredState
+	if state.accepted != nil {
+		previous = state.accepted
+	} else if state.active != nil {
+		previous = &state.active.Desired
+	}
+	if previous != nil {
+		if desired.Version < previous.Version || (desired.Version == previous.Version && desired.Digest != previous.Digest) {
+			return false, ErrDesiredConflict
+		}
+		if desired.Version == previous.Version && desired.Digest == previous.Digest {
+			if !sameDesired(*previous, desired) {
+				return false, ErrDesiredConflict
+			}
+			return false, nil
+		}
+	}
+	copy := model.CloneDesiredState(desired)
+	state.accepted = &copy
+	if err := r.persistLocked(ctx, desired.ConfigID, state.revision, state); err != nil {
+		return false, err
+	}
+	r.configs[desired.ConfigID.Name] = state
+	return true, nil
+}
+
+func sameDesired(a, b model.DesiredState) bool {
+	return a.ConfigID == b.ConfigID && a.ProviderType == b.ProviderType &&
+		a.Version == b.Version && a.Digest == b.Digest && bytes.Equal(a.Spec, b.Spec) &&
+		slices.Equal(a.DependsOn, b.DependsOn)
+}
+
 func cloneEvent(event model.Event) model.Event {
 	copy := event
 	copy.Observed.Properties = append([]byte(nil), event.Observed.Properties...)
@@ -229,6 +348,9 @@ func (r *PlanRegistry) Install(ctx context.Context, expected model.Generation, c
 	current := model.Generation(0)
 	if state.active != nil {
 		current = state.active.Generation
+	}
+	if state.accepted != nil && (candidate.DesiredVersion != state.accepted.Version || candidate.DesiredDigest != state.accepted.Digest) {
+		return nil, PlanChange{}, ErrDesiredConflict
 	}
 	if current != expected {
 		return nil, PlanChange{}, ErrGenerationChanged
@@ -367,16 +489,18 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 				retireIncompatibleControlsLocked(state, old.ID)
 				releaseControlID := ControlRequestID("release-" + string(old.ID))
 				if _, exists := state.controls[releaseControlID]; !exists {
-					state.controls[releaseControlID] = EffectControl{
+					control := EffectControl{
 						ID: releaseControlID, ConfigID: installed.ConfigID,
 						ProviderType: oldEffect.ProviderType, ProviderDigest: oldEffect.ProviderDigest,
 						Kind: EffectControlRelease, State: EffectControlPending,
 						TargetKind: EffectTargetPlanNode,
-						EffectID: old.EffectID, ReferenceID: old.ID,
+						EffectID:   old.EffectID, ReferenceID: old.ID,
 						PlanID: installed.ID, Generation: installed.Generation,
 						OperationKey: findEffectOperationKey(installed, info.effectKey, model.ExecutionEffectRelease),
 						NextCheckAt:  time.Now(),
 					}
+					bindControlToPlanNodeOrMaintenance(&control, installed, info.effectKey, model.ExecutionEffectRelease)
+					state.controls[releaseControlID] = control
 				}
 			}
 			continue
@@ -396,16 +520,18 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 		state.references[newRef.ID] = newRef
 		ensureRefControlID := ControlRequestID("ensure-ref-" + string(newRef.ID))
 		if _, exists := state.controls[ensureRefControlID]; !exists {
-			state.controls[ensureRefControlID] = EffectControl{
+			control := EffectControl{
 				ID: ensureRefControlID, ConfigID: installed.ConfigID,
 				ProviderType: oldEffect.ProviderType, ProviderDigest: oldEffect.ProviderDigest,
 				Kind: EffectControlEnsureReference, State: EffectControlPending,
 				TargetKind: EffectTargetPlanNode,
-				EffectID: oldRef.EffectID, ReferenceID: newRef.ID,
+				EffectID:   oldRef.EffectID, ReferenceID: newRef.ID,
 				PlanID: installed.ID, Generation: installed.Generation,
 				OperationKey: findEffectOperationKey(installed, info.effectKey, model.ExecutionEffectEnsure),
 				NextCheckAt:  time.Now(),
 			}
+			bindControlToPlanNodeOrMaintenance(&control, installed, info.effectKey, model.ExecutionEffectEnsure)
+			state.controls[ensureRefControlID] = control
 		}
 	}
 
@@ -427,16 +553,18 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 				retireIncompatibleControlsLocked(state, ref.ID)
 				releaseControlID := ControlRequestID("release-" + string(ref.ID))
 				if _, exists := state.controls[releaseControlID]; !exists {
-					state.controls[releaseControlID] = EffectControl{
+					control := EffectControl{
 						ID: releaseControlID, ConfigID: installed.ConfigID,
 						ProviderType: installed.ProviderType, ProviderDigest: installed.ProviderDigest,
 						Kind: EffectControlRelease, State: EffectControlPending,
 						TargetKind: EffectTargetPlanNode,
-						EffectID: ref.EffectID, ReferenceID: ref.ID,
+						EffectID:   ref.EffectID, ReferenceID: ref.ID,
 						PlanID: installed.ID, Generation: installed.Generation,
 						OperationKey: findEffectOperationKey(installed, effectKey, model.ExecutionEffectRelease),
 						NextCheckAt:  time.Now(),
 					}
+					bindControlToPlanNodeOrMaintenance(&control, installed, effectKey, model.ExecutionEffectRelease)
+					state.controls[releaseControlID] = control
 				}
 			}
 		}

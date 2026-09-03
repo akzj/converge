@@ -22,9 +22,13 @@ func beginBoundEffectKey(t *testing.T, reg *PlanRegistry, plan *model.Plan, effe
 		EffectIdentity: EffectIdentity{
 			EffectID: effectID, ReferenceID: refID,
 			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
-			EffectKey: effectKey, ProviderType: "test", ProviderDigest: "digest",
+			OperationKey: findEffectOperationKey(plan, effectKey, model.ExecutionEffectEnsure),
+			EffectKey:    effectKey, ProviderType: "test", ProviderDigest: "digest",
 		},
 		RequestID: ControlRequestID("ensure-" + string(effectID)),
+	}
+	if identity.EffectIdentity.OperationKey == "" {
+		identity.EffectIdentity.OperationKey = "apply"
 	}
 	spec := ImmutableEnsureSpec{
 		IdempotencyKey: "idem-" + string(effectID), ArtifactID: "sha256:x",
@@ -86,7 +90,7 @@ func TestMatrixLateEnsureAfterDeleteSchedulesRelease(t *testing.T) {
 		EffectIdentity: EffectIdentity{
 			EffectID: "late-e", ReferenceID: "late-r",
 			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
-			EffectKey: "download", ProviderType: plan.ProviderType, ProviderDigest: plan.ProviderDigest,
+			OperationKey: "ensure", EffectKey: "download", ProviderType: plan.ProviderType, ProviderDigest: plan.ProviderDigest,
 		},
 		RequestID: "ensure-late-e",
 	}
@@ -152,7 +156,7 @@ func TestMatrixUnknownUnboundEnsureRetryAndUnknownBoundObserve(t *testing.T) {
 		EffectIdentity: EffectIdentity{
 			EffectID: "unk-e", ReferenceID: "unk-r",
 			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
-			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
+			OperationKey: "apply", EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
 		},
 		RequestID: "ensure-unk-e",
 	}
@@ -241,7 +245,10 @@ func TestMatrixWrongIdentityRejected(t *testing.T) {
 	}{
 		{"wrong poll", func(_ *TransitionIdentity, o *EffectObservation) { o.PollRequestID = "poll-bad" }},
 		{"wrong attempt", func(id *TransitionIdentity, o *EffectObservation) { id.AttemptID = "att-bad"; o.AttemptID = "att-bad" }},
-		{"wrong effect", func(id *TransitionIdentity, o *EffectObservation) { id.EffectIdentity.EffectID = "other"; o.EffectID = "other" }},
+		{"wrong effect", func(id *TransitionIdentity, o *EffectObservation) {
+			id.EffectIdentity.EffectID = "other"
+			o.EffectID = "other"
+		}},
 		{"wrong reference", func(id *TransitionIdentity, _ *EffectObservation) { id.EffectIdentity.ReferenceID = "other" }},
 	}
 	for _, tc := range cases {
@@ -273,7 +280,7 @@ func TestMatrixStillReferencedNeverCancels(t *testing.T) {
 		EffectIdentity: EffectIdentity{
 			EffectID: "share-e", ReferenceID: "share-r2",
 			ConfigID: plan.ConfigID, PlanID: plan.ID + "-g2", Generation: plan.Generation + 1,
-			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
+			OperationKey: "apply", EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
 		},
 		RequestID: "ensure-ref-share-r2",
 	}
@@ -467,7 +474,7 @@ func TestMatrixAdministratorResolveFailedEffect(t *testing.T) {
 		EffectIdentity: EffectIdentity{
 			EffectID: "fail-e", ReferenceID: "fail-r",
 			ConfigID: plan.ConfigID, PlanID: plan.ID, Generation: plan.Generation,
-			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
+			OperationKey: "apply", EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
 		},
 		RequestID: "ensure-fail-e",
 	}

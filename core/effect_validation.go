@@ -65,6 +65,9 @@ func ValidateEffectSnapshot(snapshot ExecutionSnapshot) error {
 			return errors.Errorf("duplicate control ID %q", control.ID)
 		}
 		controls[control.ID] = struct{}{}
+		if err := validateControlShape(control); err != nil {
+			return errors.Wrapf(err, "control %q", control.ID)
+		}
 		if control.State == EffectControlCompleted {
 			continue
 		}

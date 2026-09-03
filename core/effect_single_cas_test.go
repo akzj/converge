@@ -41,9 +41,13 @@ func claimObserveControl(t *testing.T, reg *PlanRegistry, identity TransitionIde
 	}
 	claimed := identity
 	claimed.AttemptID = attID
-	if _, err := reg.ClaimDueControl(ctx, claimed.EffectIdentity.ConfigID, claimed.RequestID, time.Now(), attID, "poll-1", time.Now().Add(30*time.Second)); err != nil {
+	control, err := reg.ClaimDueControl(ctx, claimed.EffectIdentity.ConfigID, claimed.RequestID, time.Now(), attID, "poll-1", time.Now().Add(30*time.Second))
+	if err != nil {
 		t.Fatal(err)
 	}
+	claimed.EffectIdentity.PlanID = control.PlanID
+	claimed.EffectIdentity.Generation = control.Generation
+	claimed.EffectIdentity.OperationKey = control.OperationKey
 	return claimed
 }
 
@@ -178,6 +182,7 @@ func TestSingleCASReleaseConfirmed(t *testing.T) {
 		AttemptID:      "rel-att",
 		RequestID:      ControlRequestID("release-" + string(identity.EffectIdentity.ReferenceID)),
 	}
+	releaseIdentity.EffectIdentity.OperationKey = "release"
 	if d, err := reg.BeginReleaseEffect(ctx, BeginReleaseRequest{Identity: releaseIdentity}); err != nil || d != TransitionApplied {
 		t.Fatalf("BeginRelease: %v %v", d, err)
 	}
@@ -232,7 +237,7 @@ func TestSingleCASEnsureReferenceBound(t *testing.T) {
 		EffectIdentity: EffectIdentity{
 			EffectID: effID, ReferenceID: refID,
 			ConfigID: planV1.ConfigID, PlanID: planV1.ID, Generation: planV1.Generation,
-			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
+			OperationKey: "ensure", EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
 		},
 		RequestID: ControlRequestID("ensure-" + string(effID)),
 	}
@@ -286,7 +291,7 @@ func TestSingleCASEnsureReferenceBound(t *testing.T) {
 		EffectIdentity: EffectIdentity{
 			EffectID: effID, ReferenceID: newRefID,
 			ConfigID: planV2.ConfigID, PlanID: planV2.ID, Generation: planV2.Generation,
-			EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
+			OperationKey: "ensure", EffectKey: "download", ProviderType: "test", ProviderDigest: "digest",
 		},
 		AttemptID: attID,
 		RequestID: ctrlID,

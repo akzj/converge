@@ -15,8 +15,8 @@ func TestPlanRegistryPreservesEffectsAcrossRestoreAndTransition(t *testing.T) {
 	id := model.ConfigID{Name: "config"}
 	effect := validEffect()
 	reference := EffectReference{ID: "ref", EffectID: effect.ID, ConfigID: id, PlanID: "plan", Generation: 1, EffectKey: "download", State: EffectReferenceActive}
-	control := EffectControl{ID: "control", ConfigID: id, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve, State: EffectControlPending, EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now()}
-	plan := &model.Plan{ID: "plan", ConfigID: id, Generation: 1, Desired: model.DesiredState{ConfigID: id}, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest, Nodes: map[model.OperationKey]*model.Node{}}
+	control := EffectControl{ID: "control", ConfigID: id, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve, TargetKind: EffectTargetMaintenance, State: EffectControlPending, EffectID: effect.ID, ReferenceID: reference.ID, NextCheckAt: time.Now()}
+	plan := &model.Plan{ID: "plan", ConfigID: id, Generation: 1, Desired: model.DesiredState{ConfigID: id, ProviderType: effect.ProviderType, Digest: model.DesiredSpecDigest(nil)}, ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest, Nodes: map[model.OperationKey]*model.Node{}}
 	snapshot := ExecutionSnapshot{Revision: 1, Plan: plan, Effects: []ActiveEffect{effect}, EffectReferences: []EffectReference{reference}, EffectControls: []EffectControl{control}}
 	if err := store.CommitExecutionCAS(ctx, id, 0, snapshot); err != nil {
 		t.Fatal(err)

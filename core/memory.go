@@ -120,6 +120,10 @@ func cloneExecutionSnapshot(snapshot ExecutionSnapshot) ExecutionSnapshot {
 		EffectReferences: append([]EffectReference(nil), snapshot.EffectReferences...),
 		EffectControls:   append([]EffectControl(nil), snapshot.EffectControls...),
 	}
+	if snapshot.AcceptedDesired != nil {
+		desired := model.CloneDesiredState(*snapshot.AcceptedDesired)
+		copy.AcceptedDesired = &desired
+	}
 	for i, event := range snapshot.Outbox {
 		copy.Outbox[i] = cloneEvent(event)
 	}

@@ -208,19 +208,19 @@ type RecordedState struct {
 type NodeStatus string
 
 const (
-	NodePending    NodeStatus = "pending"
-	NodeReady      NodeStatus = "ready"
-	NodeRunning    NodeStatus = "running"
-	NodeWaiting    NodeStatus = "waiting"
+	NodePending NodeStatus = "pending"
+	NodeReady   NodeStatus = "ready"
+	NodeRunning NodeStatus = "running"
+	NodeWaiting NodeStatus = "waiting"
 	// NodeWaitingOnControl marks an effect node that has activated its durable
 	// EffectControl and is waiting for the EffectControl scheduler to drive it.
 	// It consumes no execSem slot and creates no DAG provider Attempt.
 	NodeWaitingOnControl NodeStatus = "waiting_on_control"
-	NodeCancelling NodeStatus = "cancelling"
-	NodeDraining   NodeStatus = "draining"
-	NodeCompleted  NodeStatus = "completed"
-	NodeFailed     NodeStatus = "failed"
-	NodeCancelled  NodeStatus = "cancelled"
+	NodeCancelling       NodeStatus = "cancelling"
+	NodeDraining         NodeStatus = "draining"
+	NodeCompleted        NodeStatus = "completed"
+	NodeFailed           NodeStatus = "failed"
+	NodeCancelled        NodeStatus = "cancelled"
 )
 
 // Node wraps an Operation with its runtime status.
@@ -359,12 +359,13 @@ const (
 
 // ManagedConfig holds the full lifecycle state for one configuration.
 type ManagedConfig struct {
-	ID       ConfigID
-	Desired  DesiredState
-	Observed ObservedState
-	Recorded RecordedState
-	Graph    *Graph
-	Status   ConfigStatus
+	ID        ConfigID
+	Desired   DesiredState
+	Observed  ObservedState
+	Recorded  RecordedState
+	Graph     *Graph
+	Status    ConfigStatus
+	LastError string
 	// DependsOnConfigs lists config names that must reach ConfigConverged before
 	// this config's reconciliation loop begins.
 	DependsOnConfigs []string

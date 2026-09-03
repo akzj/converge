@@ -26,7 +26,7 @@ func TestEffectEnsureThenObserveThenCompletedE2E(t *testing.T) {
 		ConfigID:     model.ConfigID{Name: "effect-config"},
 		ProviderType: "fake_download",
 		Version:      1,
-		Digest:       "v1",
+		Digest:       "sha256:63ab5330cde2137ab0241ffc63eaae1b221e1dcd8ebc49f6417f3d7ac6eaf1f5",
 		Spec:         []byte(`{"url":"https://example.com/file.bin"}`),
 	}
 
@@ -148,7 +148,7 @@ func TestEffectSupersessionSameArtifactReuses(t *testing.T) {
 
 	v1 := model.DesiredState{
 		ConfigID: model.ConfigID{Name: "supersede-config"}, ProviderType: "fake_download",
-		Version: 1, Digest: "artifacts/same", Spec: []byte(`{"version":1}`),
+		Version: 1, Digest: "sha256:2430f1a2ad2982d0067885488a4c89e21ad1d7c83b115ba8f1b20acc88dfaea8", Spec: []byte(`{"version":1}`),
 	}
 	if err := r.SubmitDesired(ctx, v1); err != nil {
 		t.Fatal(err)
@@ -167,10 +167,11 @@ func TestEffectSupersessionSameArtifactReuses(t *testing.T) {
 
 	if err := r.SubmitDesired(ctx, model.DesiredState{
 		ConfigID: model.ConfigID{Name: "supersede-config"}, ProviderType: "fake_download",
-		Version: 2, Digest: "artifacts/same", Spec: []byte(`{"version":2}`),
+		Version: 2, Digest: "sha256:2430f1a2ad2982d0067885488a4c89e21ad1d7c83b115ba8f1b20acc88dfaea8", Spec: []byte(`{"version":1}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
+	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		_ = r.registry.WakeDueControls(ctx, time.Now())
 		r.processDueControls(ctx)
@@ -204,7 +205,7 @@ func TestEffectSupersessionDifferentArtifact(t *testing.T) {
 
 	if err := r.SubmitDesired(ctx, model.DesiredState{
 		ConfigID: model.ConfigID{Name: "diff-config"}, ProviderType: "fake_download",
-		Version: 1, Digest: "v1", Spec: []byte(`{"v":1}`),
+		Version: 1, Digest: "sha256:afbf9d0f3560b0fd7795e81c42a0a79ee6b6fc67e064f77826aee642cad28d91", Spec: []byte(`{"v":1}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -219,10 +220,11 @@ func TestEffectSupersessionDifferentArtifact(t *testing.T) {
 
 	if err := r.SubmitDesired(ctx, model.DesiredState{
 		ConfigID: model.ConfigID{Name: "diff-config"}, ProviderType: "fake_download",
-		Version: 2, Digest: "v2", Spec: []byte(`{"v":2}`),
+		Version: 2, Digest: "sha256:2b5442799fccc3af2e7e790017697373913b7afcac933d72fb5876de994f659a", Spec: []byte(`{"v":2}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
+	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		_ = r.registry.WakeDueControls(ctx, time.Now())
 		r.processDueControls(ctx)
@@ -264,7 +266,7 @@ func TestEffectObserveControlReclaimAfterLeaseExpiry(t *testing.T) {
 
 	desired := model.DesiredState{
 		ConfigID: model.ConfigID{Name: "reclaim-e2e"}, ProviderType: "fake_download",
-		Version: 1, Digest: "v1", Spec: []byte(`{"url":"x"}`),
+		Version: 1, Digest: "sha256:c444e7e4c3ecef19664501ae12d3e63ccb16be4b2b241f349961c04a9951082b", Spec: []byte(`{"url":"x"}`),
 	}
 	if err := r.SubmitDesired(ctx, desired); err != nil {
 		t.Fatal(err)

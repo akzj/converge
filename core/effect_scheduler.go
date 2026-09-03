@@ -9,21 +9,59 @@ import (
 	"github.com/akzj/converge/pkg/model"
 )
 
-const effectControlLease = 30 * time.Second
+const (
+	effectControlLease      = 45 * time.Second
+	effectControlRPCTimeout = 30 * time.Second
+)
 
 // processDueControls claims due EffectControls and drives EnsureRetry/Observe/Release RPCs.
 func (r *Reconciler) processDueControls(ctx context.Context) {
+	select {
+	case r.controlScanSem <- struct{}{}:
+	case <-ctx.Done():
+		return
+	default:
+		return
+	}
+	go func() {
+		defer func() { <-r.controlScanSem }()
+		r.scanDueControls(ctx)
+	}()
+}
+
+func (r *Reconciler) scanDueControls(ctx context.Context) {
 	now := time.Now()
 	r.registry.ReclaimExpiredControls(ctx, now)
 	refs, _ := r.registry.ListDueControls(ctx, now)
 	for _, ref := range refs {
-		if err := r.processOneDueControl(ctx, ref, now); err != nil {
-			zap.L().Warn("converge: process due control",
-				zap.String("config", ref.ConfigID.Name),
-				zap.String("control", string(ref.ControlRequestID)),
-				zap.Error(err))
+		select {
+		case r.controlSem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		default:
+			return
 		}
+		go func(ref DueControlRef) {
+			defer func() {
+				<-r.controlSem
+				r.wakeControls()
+			}()
+			if err := r.processOneDueControl(ctx, ref, time.Now()); err != nil {
+				zap.L().Warn("converge: process due control",
+					zap.String("config", ref.ConfigID.Name),
+					zap.String("control", string(ref.ControlRequestID)),
+					zap.Error(err))
+			}
+		}(ref)
 	}
+}
+
+func (r *Reconciler) effectRPCContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := r.controlTimeout
+	if timeout <= 0 {
+		timeout = effectControlRPCTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef, now time.Time) error {
@@ -82,6 +120,7 @@ func controlIdentity(control EffectControl, attemptID model.AttemptID) Transitio
 		EffectIdentity: EffectIdentity{
 			EffectID: control.EffectID, ReferenceID: control.ReferenceID,
 			ConfigID: control.ConfigID, ProviderType: control.ProviderType, ProviderDigest: control.ProviderDigest,
+			PlanID: control.PlanID, Generation: control.Generation, OperationKey: control.OperationKey,
 		},
 		AttemptID: attemptID,
 		RequestID: control.ID,
@@ -89,10 +128,12 @@ func controlIdentity(control EffectControl, attemptID model.AttemptID) Transitio
 }
 
 func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect, attemptID model.AttemptID, pollID PollRequestID) error {
-	observations, err := provider.ObserveEffects(ctx, []ObserveEffectRequest{{
+	rpcCtx, cancel := r.effectRPCContext(ctx)
+	observations, err := provider.ObserveEffects(rpcCtx, []ObserveEffectRequest{{
 		Identity: identity.EffectIdentity, AttemptID: attemptID, PollRequestID: pollID,
 		ExternalJobID: effect.ExternalJobID, ExternalRevision: effect.ExternalRevision,
 	}})
+	cancel()
 	if err != nil {
 		_, _ = r.registry.MarkEffectUnknownBound(ctx, identity, time.Now().Add(5*time.Second))
 		return err
@@ -135,7 +176,7 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 		event := model.Event{
 			EventID: string(identity.AttemptID) + "/control-result",
 			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
-			NodeKey: identity.EffectIdentity.OperationKey,
+			NodeKey:   identity.EffectIdentity.OperationKey,
 			AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
 			State: stepState, Result: model.StepResult{State: stepState},
 		}
@@ -178,7 +219,7 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 		event := model.Event{
 			EventID: string(identity.AttemptID) + "/control-result",
 			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
-			NodeKey: nodeKey,
+			NodeKey:   nodeKey,
 			AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
 			State: stepState, Result: model.StepResult{State: stepState},
 		}
@@ -207,11 +248,13 @@ func (r *Reconciler) runObserveControl(ctx context.Context, provider EffectProvi
 }
 
 func (r *Reconciler) runEnsureRetryControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect) error {
-	result, err := provider.EnsureEffect(ctx, EnsureEffectRequest{
+	rpcCtx, cancel := r.effectRPCContext(ctx)
+	result, err := provider.EnsureEffect(rpcCtx, EnsureEffectRequest{
 		Identity: identity.EffectIdentity, IdempotencyKey: effect.IdempotencyKey,
 		ArtifactID: effect.ArtifactID, SemanticFingerprint: effect.SemanticFingerprint,
 		EnsureSpec: append([]byte(nil), effect.EnsureSpec...),
 	})
+	cancel()
 	if err != nil {
 		_, _ = r.registry.ApplyEnsureResult(ctx, identity, EnsureEffectResult{
 			EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
@@ -233,7 +276,7 @@ func (r *Reconciler) runEnsureRetryControl(ctx context.Context, provider EffectP
 		event := model.Event{
 			EventID: string(identity.AttemptID) + "/control-result",
 			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
-			NodeKey: nodeKey,
+			NodeKey:   nodeKey,
 			AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
 			State: model.StepCompleted, Result: model.StepResult{State: model.StepCompleted},
 		}
@@ -272,10 +315,12 @@ func (r *Reconciler) runEnsureRetryControl(ctx context.Context, provider EffectP
 }
 
 func (r *Reconciler) runReleaseControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect) error {
-	result, err := provider.ReleaseEffect(ctx, ReleaseEffectRequest{
+	rpcCtx, cancel := r.effectRPCContext(ctx)
+	result, err := provider.ReleaseEffect(rpcCtx, ReleaseEffectRequest{
 		Identity: identity.EffectIdentity, ReleaseRequestID: identity.RequestID,
 		ExternalJobID: effect.ExternalJobID, ExternalRevision: effect.ExternalRevision,
 	})
+	cancel()
 	if err != nil {
 		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
 		return err
@@ -293,7 +338,7 @@ func (r *Reconciler) runReleaseControl(ctx context.Context, provider EffectProvi
 		event := model.Event{
 			EventID: string(identity.AttemptID) + "/control-result",
 			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
-			NodeKey: nodeKey,
+			NodeKey:   nodeKey,
 			AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
 			State: model.StepCompleted, Result: model.StepResult{State: model.StepCompleted},
 		}
@@ -322,10 +367,12 @@ func (r *Reconciler) runReleaseControl(ctx context.Context, provider EffectProvi
 }
 
 func (r *Reconciler) runEnsureReferenceControl(ctx context.Context, provider EffectProvider, identity TransitionIdentity, effect ActiveEffect) error {
-	result, err := provider.EnsureReference(ctx, EnsureReferenceRequest{
+	rpcCtx, cancel := r.effectRPCContext(ctx)
+	result, err := provider.EnsureReference(rpcCtx, EnsureReferenceRequest{
 		Identity: identity.EffectIdentity, RequestID: identity.RequestID,
 		ExternalJobID: effect.ExternalJobID,
 	})
+	cancel()
 	if err != nil {
 		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))
 		return err
@@ -341,7 +388,7 @@ func (r *Reconciler) runEnsureReferenceControl(ctx context.Context, provider Eff
 	event := model.Event{
 		EventID: string(identity.AttemptID) + "/control-result",
 		PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
-		NodeKey: nodeKey,
+		NodeKey:   nodeKey,
 		AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
 		State: model.StepCompleted, Result: model.StepResult{State: model.StepCompleted},
 	}
@@ -364,4 +411,3 @@ func (r *Reconciler) runEnsureReferenceControl(ctx context.Context, provider Eff
 	}
 	return nil
 }
-

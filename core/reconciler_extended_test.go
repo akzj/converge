@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -125,7 +126,7 @@ func TestExecuteAttemptTimeoutMarksUnknown(t *testing.T) {
 		ProviderType: "timeout",
 		Version:      1,
 		Spec:         []byte(`{"key": "value"}`),
-		Digest:       "sha256:timeout-v1",
+		Digest:       "sha256:9724c1e20e6e3e4d7f57ed25f9d4efb006e508590d528c90da597f6a775c13e5",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +167,7 @@ func TestExecuteAttemptConditionUnmetBecomesWaiting(t *testing.T) {
 		ProviderType: "condition",
 		Version:      1,
 		Spec:         []byte(`{"key": "value"}`),
-		Digest:       "sha256:cond-v1",
+		Digest:       "sha256:9724c1e20e6e3e4d7f57ed25f9d4efb006e508590d528c90da597f6a775c13e5",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -206,7 +207,7 @@ func TestExecuteAttemptArbiterAcquiredForDestructive(t *testing.T) {
 		ProviderType: "arbiter",
 		Version:      1,
 		Spec:         []byte(`{"key": "value"}`),
-		Digest:       "sha256:arb-v1",
+		Digest:       "sha256:9724c1e20e6e3e4d7f57ed25f9d4efb006e508590d528c90da597f6a775c13e5",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +245,7 @@ func TestHandleDesiredRejectsVersionConflict(t *testing.T) {
 		ProviderType: "conflict",
 		Version:      2,
 		Spec:         []byte(`{"v": 2}`),
-		Digest:       "sha256:v2",
+		Digest:       "sha256:0b3a178d3458979eb4524c685a11f329077b77c0b98c630b02b928918d1b4f11",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -258,10 +259,10 @@ func TestHandleDesiredRejectsVersionConflict(t *testing.T) {
 		ProviderType: "conflict",
 		Version:      1,
 		Spec:         []byte(`{"v": 1}`),
-		Digest:       "sha256:v1",
+		Digest:       "sha256:9ab2253fc38981f5be9c25cf0a34b62cdf334652344bdef16b3d5dbc0b74f2f1",
 	})
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrDesiredConflict) {
+		t.Fatalf("err=%v, want ErrDesiredConflict", err)
 	}
 
 	time.Sleep(50 * time.Millisecond)
@@ -296,7 +297,7 @@ func TestHandleDesiredSameVersionIsNoop(t *testing.T) {
 		ProviderType: "noop",
 		Version:      1,
 		Spec:         []byte(`{"key": "value"}`),
-		Digest:       "sha256:noop",
+		Digest:       "sha256:9724c1e20e6e3e4d7f57ed25f9d4efb006e508590d528c90da597f6a775c13e5",
 	}
 
 	err := r.SubmitDesired(ctx, desired)
@@ -346,7 +347,7 @@ func TestHandleEventAllTypes(t *testing.T) {
 		ProviderType: "fixed",
 		Version:      1,
 		Spec:         []byte(`{"key": "value"}`),
-		Digest:       "sha256:events-v1",
+		Digest:       "sha256:9724c1e20e6e3e4d7f57ed25f9d4efb006e508590d528c90da597f6a775c13e5",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -445,7 +446,7 @@ func TestVerifyAndRecordStalePlanDoesNotRecord(t *testing.T) {
 		ProviderType: "stale",
 		Version:      1,
 		Spec:         []byte(`{"key": "value"}`),
-		Digest:       "sha256:stale-v1",
+		Digest:       "sha256:9724c1e20e6e3e4d7f57ed25f9d4efb006e508590d528c90da597f6a775c13e5",
 	}
 	if err := r.SubmitDesired(ctx, desiredV1); err != nil {
 		t.Fatal(err)
@@ -466,7 +467,7 @@ func TestVerifyAndRecordStalePlanDoesNotRecord(t *testing.T) {
 		ProviderType: "stale",
 		Version:      2,
 		Spec:         []byte(`{"key": "value2"}`),
-		Digest:       "sha256:stale-v2",
+		Digest:       "sha256:cfc7b3158f6c0dfc14c03cba3f385188e5a85d2e628219a041d9bff664957d18",
 	}
 	if err := r.SubmitDesired(ctx, desiredV2); err != nil {
 		t.Fatal(err)

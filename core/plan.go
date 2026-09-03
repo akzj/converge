@@ -212,7 +212,7 @@ func ClassifyPlanChange(oldPlan, candidate *model.Plan) (PlanChange, error) {
 			continue
 		}
 		switch oldNode.Status {
-		case model.NodePending, model.NodeReady, model.NodeWaiting, model.NodeCompleted, model.NodeFailed, model.NodeCancelled:
+		case model.NodePending, model.NodeReady, model.NodeWaiting, model.NodeWaitingOnControl, model.NodeCompleted, model.NodeFailed, model.NodeCancelled:
 			change.Drop = append(change.Drop, key)
 		case model.NodeRunning, model.NodeCancelling, model.NodeDraining:
 			if oldNode.Operation.CancelMode == model.CancelModeNone {

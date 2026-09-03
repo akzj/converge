@@ -68,6 +68,14 @@ func OperationFingerprint(op Operation, providerDigest string) (string, error) {
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
+// DesiredSpecDigest returns the wire-format digest used by DesiredState.
+// Desired specs are hashed byte-for-byte: providers remain responsible for
+// defining whether semantically equivalent JSON should be normalized upstream.
+func DesiredSpecDigest(spec []byte) string {
+	digest := sha256.Sum256(spec)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
 type fingerprintOperation struct {
 	Provider        string                 `json:"provider"`
 	ExecutionKind   OperationExecutionKind `json:"execution_kind"`

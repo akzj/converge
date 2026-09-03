@@ -138,20 +138,19 @@ func ValidateReferenceTransition(oldReference, next EffectReference) error {
 }
 
 func validateControlShape(control EffectControl) error {
-	// NodeIdentity shape is governed by TargetKind when set. The critical safety
-	// property is that Maintenance controls never carry a dangling OperationKey
-	// (they must not advance a DAG node). PlanNode controls with partial
-	// NodeIdentity are tolerated: the terminal commands degrade to effect-only
-	// apply when OperationKey is empty, which is safe.
+	// Plan-bound controls advance a DAG node and therefore require the complete
+	// immutable NodeIdentity. Maintenance controls never advance a DAG node.
 	switch control.TargetKind {
 	case EffectTargetMaintenance:
-		if control.OperationKey != "" {
-			return errors.New("maintenance control carries a dangling node key")
+		if control.PlanID != "" || control.Generation != 0 || control.OperationKey != "" {
+			return errors.New("maintenance control carries plan identity")
+		}
+	case EffectTargetPlanNode:
+		if control.PlanID == "" || control.Generation == 0 || control.OperationKey == "" {
+			return errors.New("plan-node control lacks complete node identity")
 		}
 	default:
-		if control.OperationKey != "" && control.PlanID == "" {
-			return errors.New("control has operation key without plan identity")
-		}
+		return errors.Errorf("control has unknown target kind %q", control.TargetKind)
 	}
 	if control.State == EffectControlInFlight {
 		if control.InFlightAttemptID == "" || control.PollRequestID == "" || control.LeaseExpiresAt.IsZero() {

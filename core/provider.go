@@ -3,9 +3,6 @@ package core
 
 import (
 	"context"
-	"fmt"
-
-	"go.uber.org/zap"
 
 	"github.com/akzj/converge/pkg/model"
 )
@@ -69,6 +66,7 @@ type Arbiter interface {
 type ExecutionSnapshot struct {
 	Revision         uint64
 	Deleting         bool
+	AcceptedDesired  *model.DesiredState
 	Plan             *model.Plan
 	Attempts         []model.Attempt
 	Outbox           []model.Event
@@ -89,14 +87,4 @@ type ExecutionStore interface {
 type Journal interface {
 	Append(ctx context.Context, event model.Event) error
 	Events(ctx context.Context, configID string) ([]model.Event, error)
-}
-
-func log() *zap.Logger { return zap.L() }
-
-func init() {
-	logger, err := zap.NewProduction()
-	if err != nil {
-		panic(fmt.Sprintf("converge: init zap: %v", err))
-	}
-	zap.ReplaceGlobals(logger)
 }

@@ -611,10 +611,10 @@ fields):
   and its terminal outcome only updates Effect/Reference/Control state, never a
   DAG node.
 
-Validators enforce the shape by kind: a Plan-bound control with partial
-NodeIdentity, or a Maintenance control carrying a dangling NodeIdentity, is
-rejected. The current `TargetKind` may be inferred from NodeIdentity presence
-but should become an explicit field before production.
+Validators enforce the explicit `TargetKind`: a Plan-bound control with partial
+NodeIdentity, or a Maintenance control carrying any NodeIdentity, is rejected.
+Snapshots written before `TargetKind` existed are upgraded during restore only
+when their identity is unambiguous; partial legacy identities are rejected.
 
 ### 15.10 ExternalRevision semantics
 

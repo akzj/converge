@@ -83,7 +83,7 @@ func TestValidateReferenceTransitionMatrix(t *testing.T) {
 }
 
 func TestValidateControlTransitionMatrix(t *testing.T) {
-	base := EffectControl{ID: "control", EffectID: "effect", ReferenceID: "ref", Kind: EffectControlObserve}
+	base := EffectControl{ID: "control", EffectID: "effect", ReferenceID: "ref", Kind: EffectControlObserve, TargetKind: EffectTargetMaintenance}
 	tests := []struct {
 		from, to EffectControlState
 		valid    bool
@@ -110,6 +110,36 @@ func TestValidateControlTransitionMatrix(t *testing.T) {
 		if (ValidateControlTransition(oldControl, next) == nil) != test.valid {
 			t.Fatalf("%s -> %s valid=%v", test.from, test.to, test.valid)
 		}
+	}
+}
+
+func TestValidateControlShapeRequiresExplicitCompleteTarget(t *testing.T) {
+	base := EffectControl{ID: "control", EffectID: "effect", ReferenceID: "ref", Kind: EffectControlObserve, State: EffectControlPending}
+	for _, control := range []EffectControl{
+		base,
+		func() EffectControl { c := base; c.TargetKind = EffectTargetPlanNode; c.PlanID = "plan"; return c }(),
+		func() EffectControl {
+			c := base
+			c.TargetKind = EffectTargetPlanNode
+			c.PlanID = "plan"
+			c.Generation = 1
+			return c
+		}(),
+		func() EffectControl { c := base; c.TargetKind = EffectTargetMaintenance; c.PlanID = "plan"; return c }(),
+	} {
+		if err := validateControlShape(control); err == nil {
+			t.Fatalf("accepted incomplete control: %#v", control)
+		}
+	}
+	planBound := base
+	planBound.TargetKind, planBound.PlanID, planBound.Generation, planBound.OperationKey = EffectTargetPlanNode, "plan", 1, "observe"
+	if err := validateControlShape(planBound); err != nil {
+		t.Fatalf("complete plan-bound control rejected: %v", err)
+	}
+	maintenance := base
+	maintenance.TargetKind = EffectTargetMaintenance
+	if err := validateControlShape(maintenance); err != nil {
+		t.Fatalf("maintenance control rejected: %v", err)
 	}
 }
 
