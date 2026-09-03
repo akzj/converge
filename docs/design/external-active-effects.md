@@ -1,10 +1,10 @@
 # External Active Effects: Technical Design
 
-- Status: Accepted for Phase A implementation
+- Status: Implemented
 - Owner: Converge Core
 - Last updated: 2026-07-29
 - Related: [ADR 0001](../adr/0001-generation-aware-replanning.md)
-- Normative API/model: [`external_effects_contract.go.txt`](external_effects_contract.go.txt)
+- Normative API/model: compile-checked types and interfaces in `core/effect_*.go`
 
 ## 1. Purpose and authority
 
@@ -13,11 +13,11 @@ transfer performed by an independent download service. It is an implementation
 alignment contract: divergent code requires this document to be updated and
 reviewed first.
 
-The compile-checked contract file linked above is the **normative source** for
-names, fields, enums, DTOs, Provider methods, and RegistryCommands. This document
-is normative for lifecycle, ordering, invariants, and acceptance gates. If a
-snippet here conflicts with the contract file, the contract file wins and this
-document must be corrected before implementation continues.
+The compiled Core package is the **normative source** for names, fields, enums,
+DTOs, Provider methods, and `RegistryCommands`; `PlanRegistry` has a compile-time
+interface assertion. This document is normative for lifecycle, ordering,
+invariants, and acceptance gates. If a snippet here conflicts with compiled
+Core types, this document must be corrected.
 
 ## 2. Scope
 
@@ -200,8 +200,10 @@ contract:
   initial Effect fails with ResolutionRequired=false, while add-reference fails
   the new plan and preserves the old Active Reference.
 
-The normative, compile-checked DTOs and interfaces are in
-`external_effects_contract.go.txt`.
+The normative DTOs and interfaces are compiled from `core/effect_model.go`,
+`core/effect_provider.go`, and `core/effect_registry.go`. The adjacent
+`external_effects_contract.go.txt` is retained only as a historical design
+sketch and is not an API authority.
 
 Key rules:
 

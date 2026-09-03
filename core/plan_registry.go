@@ -87,6 +87,27 @@ func (r *PlanRegistry) ExecutionPlans() []*model.Plan {
 	return plans
 }
 
+func (r *PlanRegistry) providerVersionInUse(providerType, providerDigest string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, state := range r.configs {
+		if state.active != nil && state.active.ProviderType == providerType && state.active.ProviderDigest == providerDigest {
+			return true
+		}
+		for _, effect := range state.effects {
+			if effect.ProviderType == providerType && effect.ProviderDigest == providerDigest {
+				return true
+			}
+		}
+		for _, control := range state.controls {
+			if control.ProviderType == providerType && control.ProviderDigest == providerDigest {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // AcceptedDesireds returns the durable desired revisions, including revisions
 // that have not produced an executable plan yet.
 func (r *PlanRegistry) AcceptedDesireds() []model.DesiredState {

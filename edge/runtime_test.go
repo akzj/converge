@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/akzj/converge/core"
+	"github.com/akzj/converge/observability"
 	"github.com/akzj/converge/pkg/model"
 )
 
@@ -125,6 +127,69 @@ func TestRuntimeDoesNotAckPersistenceFailure(t *testing.T) {
 	if ack.Accepted || ack.Code != "persistence_failed" {
 		t.Fatalf("persistence failure ack=%#v", ack)
 	}
+}
+
+func TestRuntimeRejectsConcurrentRun(t *testing.T) {
+	runtime, _, _ := newTestRuntime(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	waitFor(t, runtime.Ready)
+	if err := runtime.Run(context.Background()); !errors.Is(err, ErrRuntimeAlreadyRunning) {
+		t.Fatalf("second Run error = %v", err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Run error = %v", err)
+	}
+	if err := runtime.Run(context.Background()); !errors.Is(err, ErrRuntimeAlreadyRunning) {
+		t.Fatalf("Run after shutdown error = %v", err)
+	}
+}
+
+type optionObserver struct{ committed chan struct{} }
+
+func (o *optionObserver) Start(ctx context.Context, _ observability.Activity) (context.Context, observability.Span) {
+	return ctx, optionSpan{}
+}
+func (o *optionObserver) Committed(context.Context, observability.Transition) {
+	select {
+	case o.committed <- struct{}{}:
+	default:
+	}
+}
+func (*optionObserver) Runtime(context.Context, observability.RuntimeSnapshot) {}
+
+type optionSpan struct{}
+
+func (optionSpan) Event(string, ...observability.Field) {}
+func (optionSpan) Error(error, ...observability.Field)  {}
+func (optionSpan) End(observability.ActivityResult)     {}
+
+func TestOpenSQLiteRuntimePassesReconcilerOptions(t *testing.T) {
+	observer := &optionObserver{committed: make(chan struct{}, 1)}
+	runtime, reconciler, store, err := OpenSQLiteRuntime(context.Background(), filepath.Join(t.TempDir(), "options.db"), core.WithObserver(observer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := reconciler.RegisterProviderChecked(context.Background(), noOpProvider{}); err != nil {
+		t.Fatal(err)
+	}
+	if ack := runtime.SubmitSnapshot(context.Background(), snapshot(t, 1, desired("a", 1))); !ack.Accepted {
+		t.Fatalf("snapshot ack=%#v", ack)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	select {
+	case <-observer.committed:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("observer option did not reach reconciler")
+	}
+	cancel()
+	<-done
 }
 
 func TestRuntimeReplaysAcceptedSnapshotAfterRestart(t *testing.T) {

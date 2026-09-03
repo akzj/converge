@@ -69,6 +69,21 @@ Provider `Inspect`, `Replan`, `Verify`, `Execute`, and effect-control calls run
 behind bounded worker pools and deadlines. Providers must honor context
 cancellation; Go cannot forcibly stop a Provider that ignores its context.
 
+For embedded lifecycle ownership, cancel the context passed to `Runtime.Run`,
+wait for it to return, then close Provider resources, the asynchronous Observer,
+and `SQLiteStore`. `Run` waits for tracked Core workers and is single-use.
+`OpenSQLiteRuntime` accepts `core.ReconcilerOption` values so the
+embedding Agent can install its logger and Observer without bypassing the
+convenience constructor.
+
+Custom wiring should use `core.NewReconcilerChecked`, and Provider registration
+should use `RegisterProviderChecked`, so missing dependencies and invalid
+Provider identities are returned as errors instead of becoming delayed runtime
+failures. Provider implementations remain digest-bound to durable Plans. After
+the runtime has stopped, an embedding Agent may call
+`UnregisterProviderVersion`; Core rejects removal of the current version or any
+version still referenced by durable Plan, Effect, or Control state.
+
 The repository tests include database reopen recovery and a real subprocess
 kill while an Attempt is durably Running. They do not constitute a long-running
 soak or filesystem-corruption campaign.

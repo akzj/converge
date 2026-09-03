@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,7 +60,21 @@ type Reconciler struct {
 	controlTimeout time.Duration
 	planTimeout    time.Duration
 	executeTimeout time.Duration
+
+	lifecycleMu sync.Mutex
+	workers     sync.WaitGroup
+	started     bool
+	running     bool
+	stopping    bool
+	initErr     error
 }
+
+var (
+	ErrAlreadyRunning       = errors.New("reconciler Run may only be called once")
+	ErrReconcilerRunning    = errors.New("reconciler is running")
+	ErrEventBusClosed       = errors.New("event bus subscription closed")
+	ErrProviderVersionInUse = errors.New("provider version is in use")
+)
 
 type ReconcilerOption func(*Reconciler)
 
@@ -87,7 +103,55 @@ func NewReconciler(store StateStore, executionStore ExecutionStore, events Event
 		}
 	}
 	r.registry.observer = r.observer
+	r.initErr = validateReconcilerDependencies(store, executionStore, events, arbiter, journal)
 	return r
+}
+
+// NewReconcilerChecked is the preferred constructor for embedded use. It
+// rejects missing dependencies immediately while NewReconciler remains source
+// compatible and reports the same error from state-changing methods and Run.
+func NewReconcilerChecked(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal, options ...ReconcilerOption) (*Reconciler, error) {
+	r := NewReconciler(store, executionStore, events, arbiter, journal, options...)
+	if err := r.Validate(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// Validate reports construction errors without starting the reconciler.
+func (r *Reconciler) Validate() error {
+	if r == nil {
+		return errors.New("reconciler is nil")
+	}
+	return r.initErr
+}
+
+func validateReconcilerDependencies(store StateStore, executionStore ExecutionStore, events EventBus, arbiter Arbiter, journal Journal) error {
+	for _, dependency := range []struct {
+		name  string
+		value any
+	}{
+		{"state store", store}, {"execution store", executionStore}, {"event bus", events},
+		{"arbiter", arbiter}, {"journal", journal},
+	} {
+		if isNilDependency(dependency.value) {
+			return errors.Errorf("converge %s is nil", dependency.name)
+		}
+	}
+	return nil
+}
+
+func isNilDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 // wakeControls signals the Run loop that due EffectControls may exist, so it
@@ -100,17 +164,42 @@ func (r *Reconciler) wakeControls() {
 }
 
 func (r *Reconciler) RegisterProvider(ctx context.Context, provider Provider) {
-	r.mu.Lock()
-	old := r.providers[provider.Type()]
-	if r.providerVersions[provider.Type()] == nil {
-		r.providerVersions[provider.Type()] = make(map[string]Provider)
+	if err := r.RegisterProviderChecked(ctx, provider); err != nil {
+		r.logger.Error("converge: register provider", zap.Error(err))
 	}
-	r.providerVersions[provider.Type()][provider.Digest()] = provider
-	r.providers[provider.Type()] = provider
+}
+
+// RegisterProviderChecked validates a Provider before making it visible to
+// planning. Registering another implementation digest for the same type is a
+// supported rolling upgrade; existing plans remain bound to their digest.
+func (r *Reconciler) RegisterProviderChecked(ctx context.Context, provider Provider) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if isNilDependency(provider) {
+		return errors.New("provider is nil")
+	}
+	providerType, providerDigest := strings.TrimSpace(provider.Type()), strings.TrimSpace(provider.Digest())
+	if providerType == "" {
+		return errors.New("provider type is empty")
+	}
+	if providerDigest == "" {
+		return errors.New("provider digest is empty")
+	}
+	r.mu.Lock()
+	old := r.providers[providerType]
+	if r.providerVersions[providerType] == nil {
+		r.providerVersions[providerType] = make(map[string]Provider)
+	}
+	r.providerVersions[providerType][providerDigest] = provider
+	r.providers[providerType] = provider
 	var affected []string
-	if old == nil || old.Digest() != provider.Digest() {
+	if old == nil || old.Digest() != providerDigest {
 		for name, config := range r.configs {
-			if config.Desired.ProviderType == provider.Type() {
+			if config.Desired.ProviderType == providerType {
 				affected = append(affected, name)
 			}
 		}
@@ -119,9 +208,42 @@ func (r *Reconciler) RegisterProvider(ctx context.Context, provider Provider) {
 	for _, name := range affected {
 		r.queuePlan(name)
 	}
+	return nil
+}
+
+// UnregisterProviderVersion releases an old Provider implementation while the
+// reconciler is stopped. The current version and versions referenced by durable
+// Plans, Effects, or Controls cannot be removed.
+func (r *Reconciler) UnregisterProviderVersion(providerType, providerDigest string) error {
+	providerType, providerDigest = strings.TrimSpace(providerType), strings.TrimSpace(providerDigest)
+	if providerType == "" || providerDigest == "" {
+		return errors.New("provider type and digest are required")
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.running {
+		return ErrReconcilerRunning
+	}
+	if r.registry.providerVersionInUse(providerType, providerDigest) {
+		return ErrProviderVersionInUse
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if current := r.providers[providerType]; current != nil && current.Digest() == providerDigest {
+		return ErrProviderVersionInUse
+	}
+	versions := r.providerVersions[providerType]
+	delete(versions, providerDigest)
+	if len(versions) == 0 {
+		delete(r.providerVersions, providerType)
+	}
+	return nil
 }
 
 func (r *Reconciler) SubmitDesired(ctx context.Context, desired model.DesiredState) (err error) {
+	if err := r.Validate(); err != nil {
+		return err
+	}
 	ctx, rawSpan := r.observer.Start(ctx, observability.Activity{Kind: observability.ActivityAcceptDesired, ConfigID: desired.ConfigID, Provider: desired.ProviderType, Cause: desired.Cause})
 	span := observability.SafeSpan(rawSpan)
 	accepted := false
@@ -221,6 +343,9 @@ func (r *Reconciler) ConfigNames() []string {
 
 // Refresh schedules a fresh Inspect/Replan cycle without changing Desired.
 func (r *Reconciler) Refresh(ctx context.Context, name string) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -257,6 +382,9 @@ type deleteRequest struct {
 }
 
 func (r *Reconciler) submitDelete(ctx context.Context, request deleteRequest) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
 	select {
 	case r.pendingDelete <- request:
 		return nil
@@ -276,6 +404,23 @@ func (r *Reconciler) RunWithReady(ctx context.Context, ready chan<- error) error
 }
 
 func (r *Reconciler) run(ctx context.Context, ready chan<- error) error {
+	if err := ctx.Err(); err != nil {
+		if ready != nil {
+			ready <- err
+		}
+		return err
+	}
+	if err := r.beginRun(); err != nil {
+		if ready != nil {
+			ready <- err
+		}
+		return err
+	}
+	ctx, cancelRun := context.WithCancel(ctx)
+	defer func() {
+		cancelRun()
+		r.finishRun()
+	}()
 	recoverCtx, rawSpan := r.observer.Start(ctx, observability.Activity{Kind: observability.ActivityRecover})
 	span := observability.SafeSpan(rawSpan)
 	if err := r.recover(recoverCtx); err != nil {
@@ -294,9 +439,9 @@ func (r *Reconciler) run(ctx context.Context, ready chan<- error) error {
 		}
 		return errors.Wrap(err, "subscribe")
 	}
-	go r.runOutboxDispatcher(ctx)
+	r.goWorker(func() { r.runOutboxDispatcher(ctx) })
 	for range maxConcurrentDeletes {
-		go r.runDeleteWorker(ctx)
+		r.goWorker(func() { r.runDeleteWorker(ctx) })
 	}
 	if ready != nil {
 		ready <- nil
@@ -315,7 +460,10 @@ func (r *Reconciler) run(ctx context.Context, ready chan<- error) error {
 			return ctx.Err()
 		case <-r.desiredWake:
 			r.planAcceptedDesired(ctx)
-		case event := <-eventCh:
+		case event, ok := <-eventCh:
+			if !ok {
+				return ErrEventBusClosed
+			}
 			r.handleEvent(ctx, event)
 		case <-r.controlWake:
 			// EffectControl scheduler may have work; processDueControls runs below.
@@ -329,6 +477,56 @@ func (r *Reconciler) run(ctx context.Context, ready chan<- error) error {
 		r.processDueControls(ctx)
 		r.executeReady(ctx)
 	}
+}
+
+func (r *Reconciler) beginRun() error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.started {
+		return ErrAlreadyRunning
+	}
+	r.started = true
+	r.running = true
+	r.stopping = false
+	return nil
+}
+
+func (r *Reconciler) finishRun() {
+	r.lifecycleMu.Lock()
+	r.stopping = true
+	r.lifecycleMu.Unlock()
+	r.workers.Wait()
+	r.lifecycleMu.Lock()
+	r.running = false
+	r.lifecycleMu.Unlock()
+}
+
+func (r *Reconciler) reserveWorker() (func(), bool) {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopping || (r.started && !r.running) {
+		return nil, false
+	}
+	if r.running {
+		r.workers.Add(1)
+		return r.workers.Done, true
+	}
+	return func() {}, true
+}
+
+func (r *Reconciler) goWorker(work func()) bool {
+	done, ok := r.reserveWorker()
+	if !ok {
+		return false
+	}
+	go func() {
+		defer done()
+		work()
+	}()
+	return true
 }
 
 func (r *Reconciler) emitRuntimeSnapshot(ctx context.Context) {
@@ -422,7 +620,7 @@ func (r *Reconciler) planAcceptedDesired(ctx context.Context) {
 	}
 	r.mu.Unlock()
 	for _, name := range names {
-		go func(name string) {
+		if r.goWorker(func() {
 			planCtx, cancel := context.WithTimeout(ctx, r.planTimeout)
 			defer cancel()
 			r.planLatest(planCtx, name)
@@ -435,7 +633,14 @@ func (r *Reconciler) planAcceptedDesired(ctx context.Context) {
 			case r.desiredWake <- struct{}{}:
 			default:
 			}
-		}(name)
+		}) {
+			continue
+		}
+		<-r.planSem
+		r.mu.Lock()
+		delete(r.planning, name)
+		r.pendingPlans[name] = struct{}{}
+		r.mu.Unlock()
 	}
 }
 
@@ -454,7 +659,7 @@ func (r *Reconciler) queuePlan(name string) {
 func (r *Reconciler) scheduleVerify(ctx context.Context, plan *model.Plan, provider Provider) {
 	select {
 	case r.planSem <- struct{}{}:
-		go func() {
+		if r.goWorker(func() {
 			defer func() {
 				<-r.planSem
 				select {
@@ -465,7 +670,10 @@ func (r *Reconciler) scheduleVerify(ctx context.Context, plan *model.Plan, provi
 			verifyCtx, cancel := context.WithTimeout(ctx, r.planTimeout)
 			defer cancel()
 			r.verifyAndRecord(verifyCtx, plan, provider)
-		}()
+		}) {
+			return
+		}
+		<-r.planSem
 	default:
 		// A later plan pass also verifies an already-completed plan.
 		r.queuePlan(plan.ConfigID.Name)
@@ -628,8 +836,14 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			}
+			done, ok := r.reserveWorker()
+			if !ok {
+				<-r.execSem
+				return
+			}
 			attemptID, err := newAttemptID()
 			if err != nil {
+				done()
 				<-r.execSem
 				r.logger.Error("converge: generate attempt ID", zap.Error(err))
 				continue
@@ -650,10 +864,14 @@ func (r *Reconciler) executeReady(ctx context.Context) {
 				r.mu.Lock()
 				delete(r.cancels, attemptID)
 				r.mu.Unlock()
+				done()
 				<-r.execSem
 				continue
 			}
-			go r.executeAttempt(ctx, opCtx, cancel, plan, operation, attempt)
+			go func() {
+				defer done()
+				r.executeAttempt(ctx, opCtx, cancel, plan, operation, attempt)
+			}()
 		}
 	}
 }

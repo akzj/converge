@@ -3,6 +3,7 @@ package edge
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -45,14 +46,21 @@ type Runtime struct {
 	dispatchedRevision uint64
 	applyError         string
 	ready              bool
+	started            bool
+	running            bool
 }
+
+var ErrRuntimeAlreadyRunning = errors.New("edge runtime Run may only be called once")
 
 func NewRuntime(reconciler *core.Reconciler, store core.DesiredSnapshotStore) (*Runtime, error) {
 	if reconciler == nil {
 		return nil, errors.New("edge runtime reconciler is nil")
 	}
-	if store == nil {
+	if isNilDependency(store) {
 		return nil, errors.New("edge runtime snapshot store is nil")
+	}
+	if err := reconciler.Validate(); err != nil {
+		return nil, errors.Wrap(err, "invalid edge runtime reconciler")
 	}
 	return &Runtime{reconciler: reconciler, store: store, wake: make(chan struct{}, 1)}, nil
 }
@@ -60,12 +68,16 @@ func NewRuntime(reconciler *core.Reconciler, store core.DesiredSnapshotStore) (*
 // OpenSQLiteRuntime wires one SQLite database into all durable Core stores and
 // uses process-local delivery/arbitration under the database's exclusive
 // ownership lock. Callers register Providers before starting Runtime.Run.
-func OpenSQLiteRuntime(ctx context.Context, path string) (*Runtime, *core.Reconciler, *core.SQLiteStore, error) {
+func OpenSQLiteRuntime(ctx context.Context, path string, options ...core.ReconcilerOption) (*Runtime, *core.Reconciler, *core.SQLiteStore, error) {
 	store, err := core.OpenSQLite(ctx, path)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	reconciler := core.NewReconciler(store, store, core.NewMemoryEventBus(), core.NewMemoryArbiter(), store)
+	reconciler, err := core.NewReconcilerChecked(store, store, core.NewMemoryEventBus(), core.NewMemoryArbiter(), store, options...)
+	if err != nil {
+		_ = store.Close()
+		return nil, nil, nil, err
+	}
 	runtime, err := NewRuntime(reconciler, store)
 	if err != nil {
 		_ = store.Close()
@@ -136,6 +148,23 @@ func (r *Runtime) Ready() bool {
 // Run recovers Core first, then replays the latest durable snapshot. A
 // successful SubmitSnapshot does not depend on Run being online.
 func (r *Runtime) Run(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if r.started {
+		r.mu.Unlock()
+		return ErrRuntimeAlreadyRunning
+	}
+	r.started = true
+	r.running = true
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.running = false
+		r.ready = false
+		r.mu.Unlock()
+	}()
 	ready := make(chan error, 1)
 	coreDone := make(chan error, 1)
 	go func() { coreDone <- r.reconciler.RunWithReady(ctx, ready) }()
@@ -145,16 +174,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 			return err
 		}
 	case <-ctx.Done():
+		<-coreDone
 		return ctx.Err()
 	}
 	r.mu.Lock()
 	r.ready = true
 	r.mu.Unlock()
-	defer func() {
-		r.mu.Lock()
-		r.ready = false
-		r.mu.Unlock()
-	}()
 	if err := r.applyLatest(ctx); err != nil {
 		r.recordApply(0, err)
 	}
@@ -163,6 +188,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			<-coreDone
 			return ctx.Err()
 		case err := <-coreDone:
 			return err
@@ -180,6 +206,19 @@ func (r *Runtime) Run(ctx context.Context) error {
 				}
 			}
 		}
+	}
+}
+
+func isNilDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
 	}
 }
 

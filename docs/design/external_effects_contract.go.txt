@@ -1,3 +1,6 @@
+// Deprecated: this is a historical, non-normative design sketch. The compiled
+// contract lives in core/effect_model.go, core/effect_provider.go, and the
+// RegistryCommands interface in core/effect_registry.go.
 package externaleffects
 
 import (

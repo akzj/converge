@@ -24,10 +24,12 @@ func (r *Reconciler) processDueControls(ctx context.Context) {
 	default:
 		return
 	}
-	go func() {
+	if !r.goWorker(func() {
 		defer func() { <-r.controlScanSem }()
 		r.scanDueControls(ctx)
-	}()
+	}) {
+		<-r.controlScanSem
+	}
 }
 
 func (r *Reconciler) scanDueControls(ctx context.Context) {
@@ -42,7 +44,7 @@ func (r *Reconciler) scanDueControls(ctx context.Context) {
 		default:
 			return
 		}
-		go func(ref DueControlRef) {
+		if r.goWorker(func() {
 			defer func() {
 				<-r.controlSem
 				r.wakeControls()
@@ -53,7 +55,11 @@ func (r *Reconciler) scanDueControls(ctx context.Context) {
 					zap.String("control", string(ref.ControlRequestID)),
 					zap.Error(err))
 			}
-		}(ref)
+		}) {
+			continue
+		}
+		<-r.controlSem
+		return
 	}
 }
 
