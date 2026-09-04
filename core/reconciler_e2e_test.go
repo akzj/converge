@@ -119,3 +119,17 @@ func TestReconcilerRetriesWithFreshAttemptsEndToEnd(t *testing.T) {
 		t.Fatalf("unique attempts=%d, want 3: %#v", len(seen), snapshot.Attempts)
 	}
 }
+
+func TestPlanWaitingOnEffectControl(t *testing.T) {
+	plan := &model.Plan{Nodes: map[model.OperationKey]*model.Node{
+		"pending": {Status: model.NodePending},
+		"effect":  {Status: model.NodeWaitingOnControl},
+	}}
+	if !planWaitingOnEffectControl(plan) {
+		t.Fatal("waiting effect control was not detected")
+	}
+	plan.Nodes["effect"].Status = model.NodeCompleted
+	if planWaitingOnEffectControl(plan) {
+		t.Fatal("terminal effect control reported as waiting")
+	}
+}

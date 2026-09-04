@@ -716,6 +716,15 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 		}
 
 		snapshot := r.registry.Snapshot(desired.ConfigID)
+		// Dependency wakeups and explicit refreshes may coalesce while a
+		// provider EffectControl is still running. Reinstalling an equivalent
+		// plan here would retire the only control that can resolve that effect
+		// and create another external attempt. The durable control scheduler
+		// owns progress and retry until the node becomes terminal. A genuinely
+		// newer Desired is not suppressed.
+		if snapshot.Plan != nil && sameDesired(snapshot.Plan.Desired, desired) && planWaitingOnEffectControl(snapshot.Plan) {
+			return
+		}
 		expected := model.Generation(0)
 		if snapshot.Plan != nil {
 			expected = snapshot.Plan.Generation
@@ -776,6 +785,18 @@ func (r *Reconciler) planLatest(ctx context.Context, name string) {
 	r.logger.Warn("converge: replan CAS contention", zap.String("config", name))
 	outcome = observability.ActivityResult{Outcome: "error", Code: "cas_contention", Reason: "replan CAS contention"}
 	r.setConfigError(name, errors.New("replan CAS contention"))
+}
+
+func planWaitingOnEffectControl(plan *model.Plan) bool {
+	if plan == nil {
+		return false
+	}
+	for _, node := range plan.Nodes {
+		if node != nil && node.Status == model.NodeWaitingOnControl {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Reconciler) cancelRetired(snapshot model.PlanSnapshot, change PlanChange) {
