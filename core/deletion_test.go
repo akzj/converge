@@ -179,6 +179,44 @@ func TestMaintenanceReleaseCompletionFinalizesDeletion(t *testing.T) {
 	}
 }
 
+func TestDeletionReadyIgnoresRecoveredAttemptAfterControlCompleted(t *testing.T) {
+	configID := model.ConfigID{Name: "config"}
+	attempt := &model.Attempt{
+		ID: "attempt", ConfigID: configID, PlanID: "plan", Generation: 3,
+		NodeKey: "ensure", Status: model.AttemptUnknown,
+	}
+	state := &configExecution{
+		deleting: true,
+		retired:  map[model.AttemptID]*model.Attempt{attempt.ID: attempt},
+		controls: map[ControlRequestID]EffectControl{
+			"ensure": {
+				ID: "ensure", ConfigID: configID, TargetKind: EffectTargetPlanNode,
+				PlanID: attempt.PlanID, Generation: attempt.Generation,
+				OperationKey: attempt.NodeKey, State: EffectControlCompleted,
+			},
+		},
+		effects:    map[EffectID]ActiveEffect{},
+		references: map[ReferenceID]EffectReference{},
+	}
+	registry := NewPlanRegistry(NewMemoryExecutionStore())
+	registry.configs[configID.Name] = state
+	if !registry.DeletionReady(configID) {
+		t.Fatal("completed effect control must resolve its recovered node attempt")
+	}
+	state.controls["ensure"] = EffectControl{
+		ID: "ensure", ConfigID: configID, TargetKind: EffectTargetPlanNode,
+		PlanID: attempt.PlanID, Generation: attempt.Generation,
+		OperationKey: attempt.NodeKey, State: EffectControlPending,
+	}
+	if registry.DeletionReady(configID) {
+		t.Fatal("pending effect control must keep deletion blocked")
+	}
+	delete(state.controls, "ensure")
+	if registry.DeletionReady(configID) {
+		t.Fatal("unknown direct attempt without a matching control must keep deletion blocked")
+	}
+}
+
 type releaseConfirmProvider struct{ *mockProvider }
 
 func (*releaseConfirmProvider) Digest() string { return "digest" }

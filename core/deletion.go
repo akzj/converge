@@ -103,6 +103,31 @@ func deletionAttempts(state *configExecution) []model.Attempt {
 	return attempts
 }
 
+// blockingDeletionAttempts excludes effect-operation attempts whose durable
+// control has already reached a terminal state. After a crash, an in-flight
+// node attempt is conservatively recovered as Unknown, but a later maintenance
+// control can still authoritatively release its external reference. Keeping
+// that superseded attempt as a deletion barrier would strand the tombstone.
+func blockingDeletionAttempts(state *configExecution) []model.Attempt {
+	attempts := deletionAttempts(state)
+	result := attempts[:0]
+	for _, attempt := range attempts {
+		resolved := false
+		for _, control := range state.controls {
+			if control.TargetKind == EffectTargetPlanNode && control.State == EffectControlCompleted &&
+				control.PlanID == attempt.PlanID && control.Generation == attempt.Generation &&
+				control.OperationKey == attempt.NodeKey {
+				resolved = true
+				break
+			}
+		}
+		if !resolved {
+			result = append(result, attempt)
+		}
+	}
+	return result
+}
+
 // retireIncompatibleControlsLocked completes Observe/EnsureReference controls that
 // become illegal once a reference enters ReleaseRequested. EnsureRetry is retained
 // for CancelRequested Unbound late-ensure repair.
@@ -148,7 +173,7 @@ func (r *PlanRegistry) DeletionReady(configID model.ConfigID) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	state := r.configs[configID.Name]
-	if state == nil || !state.deleting || len(deletionAttempts(state)) > 0 {
+	if state == nil || !state.deleting || len(blockingDeletionAttempts(state)) > 0 {
 		return false
 	}
 	for _, effect := range state.effects {
