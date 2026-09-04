@@ -116,6 +116,13 @@ func blockingDeletionAttempts(state *configExecution) []model.Attempt {
 	attempts := deletionAttempts(state)
 	result := attempts[:0]
 	for _, attempt := range attempts {
+		// Maintenance controls intentionally have no plan/node identity. Their
+		// external uncertainty is represented by the durable control, effect and
+		// reference state checked below; a poll Attempt left Unknown by process
+		// recovery must not become a second, unresolvable deletion barrier.
+		if attempt.PlanID == "" && attempt.Generation == 0 && attempt.NodeKey == "" {
+			continue
+		}
 		resolved := false
 		for _, control := range state.controls {
 			if control.TargetKind == EffectTargetPlanNode && control.State == EffectControlCompleted &&

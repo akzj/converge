@@ -265,6 +265,24 @@ func TestDeletionReadyIgnoresRecoveredAttemptAfterControlCompleted(t *testing.T)
 	}
 }
 
+func TestDeletionReadyIgnoresRecoveredMaintenancePollAttempt(t *testing.T) {
+	configID := model.ConfigID{Name: "config"}
+	state := &configExecution{
+		deleting: true,
+		retired: map[model.AttemptID]*model.Attempt{
+			"poll": {ID: "poll", ConfigID: configID, Status: model.AttemptUnknown},
+		},
+		controls:   map[ControlRequestID]EffectControl{},
+		effects:    map[EffectID]ActiveEffect{},
+		references: map[ReferenceID]EffectReference{},
+	}
+	registry := NewPlanRegistry(NewMemoryExecutionStore())
+	registry.configs[configID.Name] = state
+	if !registry.DeletionReady(configID) {
+		t.Fatal("recovered maintenance poll attempt must not block deletion")
+	}
+}
+
 type releaseConfirmProvider struct{ *mockProvider }
 
 func (*releaseConfirmProvider) Digest() string { return "digest" }
