@@ -128,3 +128,48 @@ func TestCompleteEnsureAndNodePersistsAuthoritativeFailureAtomically(t *testing.
 		t.Fatalf("atomic failure lost after restore: %#v", restored)
 	}
 }
+
+func TestInstallAfterAuthoritativeEnsureRejectionRetiresUnboundReference(t *testing.T) {
+	ctx := context.Background()
+	registry := NewPlanRegistry(NewMemoryExecutionStore())
+	plan, _, err := registry.Install(ctx, 0, testPlan(t, "digest-v1",
+		model.Operation{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "artifact"},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := TransitionIdentity{EffectIdentity: EffectIdentity{
+		EffectID: "effect", ReferenceID: "reference", ConfigID: plan.ConfigID,
+		PlanID: plan.ID, Generation: plan.Generation, OperationKey: "ensure",
+		EffectKey: "artifact", ProviderType: plan.ProviderType, ProviderDigest: plan.ProviderDigest,
+	}, RequestID: "ensure-effect", AttemptID: "attempt"}
+	if disposition, err := registry.BeginEnsureEffect(ctx, BeginEnsureRequest{Identity: identity, Spec: ImmutableEnsureSpec{
+		IdempotencyKey: "idempotency", ArtifactID: "digest-v1", SemanticFingerprint: "fingerprint-v1", EnsureSpec: []byte(`{}`),
+	}}); err != nil || disposition != TransitionApplied {
+		t.Fatalf("begin ensure: disposition=%s err=%v", disposition, err)
+	}
+	if _, err := registry.ClaimDueControl(ctx, plan.ConfigID, identity.RequestID, time.Now(), identity.AttemptID, "poll", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	event := model.Event{EventID: "failed", PlanID: plan.ID, Generation: plan.Generation, NodeKey: "ensure", AttemptID: identity.AttemptID, ConfigID: plan.ConfigID.Name, State: model.StepFailed, Result: model.StepResult{State: model.StepFailed}}
+	result := EnsureEffectResult{EffectID: identity.EffectIdentity.EffectID, ReferenceID: identity.EffectIdentity.ReferenceID, Disposition: EnsureFailed, Failure: EnsureFailureAuthoritativeRejected}
+	if disposition, err := registry.CompleteEnsureAndNode(ctx, identity, result, "ensure", event); err != nil || disposition != TransitionApplied {
+		t.Fatalf("complete ensure: disposition=%s err=%v", disposition, err)
+	}
+
+	replacement := testPlan(t, "digest-v2", model.Operation{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "artifact", Input: []byte(`{"version":2}`)})
+	if _, _, err := registry.Install(ctx, plan.Generation, replacement); err != nil {
+		t.Fatal(err)
+	}
+	execution := registry.Execution(plan.ConfigID)
+	for _, reference := range execution.EffectReferences {
+		if reference.ID == identity.EffectIdentity.ReferenceID && reference.State != EffectReferenceReleased {
+			t.Fatalf("authoritatively rejected reference state=%s, want released", reference.State)
+		}
+	}
+	for _, control := range execution.EffectControls {
+		if control.ReferenceID == identity.EffectIdentity.ReferenceID && control.Kind == EffectControlRelease && control.State != EffectControlCompleted {
+			t.Fatalf("unbound rejected effect scheduled release: %#v", control)
+		}
+	}
+}

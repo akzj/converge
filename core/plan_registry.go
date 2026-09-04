@@ -808,6 +808,15 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 		if !sameArtifact {
 			if oldRef.State == EffectReferenceActive || oldRef.State == EffectReferenceEnsuring {
 				old := *oldRef
+				// An authoritative pre-job rejection has no external object to
+				// release. Retire its reference directly; Release requires a bound
+				// effect and would make the replacement snapshot invalid.
+				if oldEffect.Binding == EffectBindingUnbound && oldEffect.State == ExternalEffectFailed && !oldEffect.ResolutionRequired {
+					old.State = EffectReferenceReleased
+					state.references[old.ID] = old
+					retireIncompatibleControlsLocked(state, old.ID)
+					continue
+				}
 				old.State = EffectReferenceReleaseRequested
 				state.references[old.ID] = old
 				retireIncompatibleControlsLocked(state, old.ID)
@@ -872,6 +881,13 @@ func (r *PlanRegistry) transferEffectReferences(ctx context.Context, state *conf
 			}
 			expectedRefID := ReferenceID(fmt.Sprintf("%s/%s/%d/%s", installed.ConfigID.Name, oldPlan.ID, oldPlan.Generation, effectKey))
 			if ref, exists := state.references[expectedRefID]; exists {
+				effect := state.effects[ref.EffectID]
+				if effect.Binding == EffectBindingUnbound && effect.State == ExternalEffectFailed && !effect.ResolutionRequired {
+					ref.State = EffectReferenceReleased
+					state.references[ref.ID] = ref
+					retireIncompatibleControlsLocked(state, ref.ID)
+					continue
+				}
 				ref.State = EffectReferenceReleaseRequested
 				state.references[ref.ID] = ref
 				retireIncompatibleControlsLocked(state, ref.ID)
