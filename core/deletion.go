@@ -70,7 +70,11 @@ func (r *PlanRegistry) MarkDeleting(ctx context.Context, configID model.ConfigID
 			reference.State = EffectReferenceReleaseRequested
 			state.references[id] = reference
 		}
-		retireObserveControlsLocked(state, reference.ID)
+		// Once deletion changes an ensuring reference to release-requested,
+		// its EnsureReference control is no longer a legal owner of progress.
+		// Retire it together with Observe controls before validating the
+		// snapshot, then let the maintenance Release control own cleanup.
+		retireIncompatibleControlsLocked(state, reference.ID)
 		releaseID := ControlRequestID("release-" + string(reference.ID))
 		if _, exists := state.controls[releaseID]; exists {
 			continue

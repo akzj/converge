@@ -45,6 +45,54 @@ func TestMarkDeletingStopsSchedulingAndPersistsTombstone(t *testing.T) {
 	}
 }
 
+func TestMarkDeletingRetiresInFlightEnsureReference(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	registry := NewPlanRegistry(store)
+	configID := model.ConfigID{Name: "config"}
+	effect := validEffect()
+	reference := EffectReference{
+		ID: "reference", EffectID: effect.ID, ConfigID: configID,
+		PlanID: "plan", Generation: 2, EffectKey: "artifact",
+		State: EffectReferenceEnsuring,
+	}
+	control := EffectControl{
+		ID: "ensure-reference", ConfigID: configID,
+		ProviderType: effect.ProviderType, ProviderDigest: effect.ProviderDigest,
+		Kind: EffectControlEnsureReference, TargetKind: EffectTargetPlanNode,
+		State: EffectControlInFlight, EffectID: effect.ID, ReferenceID: reference.ID,
+		PlanID: reference.PlanID, Generation: reference.Generation, OperationKey: "ensure",
+		InFlightAttemptID: "attempt", PollRequestID: "poll", LeaseExpiresAt: time.Now().Add(time.Minute),
+	}
+	registry.configs[configID.Name] = &configExecution{
+		active:   &model.Plan{ID: reference.PlanID, ConfigID: configID, Generation: reference.Generation},
+		attempts: map[model.AttemptID]*model.Attempt{}, retired: map[model.AttemptID]*model.Attempt{},
+		outbox: map[string]model.Event{}, effects: map[EffectID]ActiveEffect{effect.ID: effect},
+		references: map[ReferenceID]EffectReference{reference.ID: reference},
+		controls:   map[ControlRequestID]EffectControl{control.ID: control},
+	}
+
+	if _, err := registry.MarkDeleting(ctx, configID); err != nil {
+		t.Fatal(err)
+	}
+	execution := registry.Execution(configID)
+	if !execution.Deleting {
+		t.Fatal("deletion tombstone was not persisted")
+	}
+	controls := make(map[ControlRequestID]EffectControl, len(execution.EffectControls))
+	for _, got := range execution.EffectControls {
+		controls[got.ID] = got
+	}
+	retired := controls[control.ID]
+	if retired.State != EffectControlCompleted || retired.InFlightAttemptID != "" || retired.PollRequestID != "" || !retired.LeaseExpiresAt.IsZero() {
+		t.Fatalf("ensure-reference control not retired: %#v", retired)
+	}
+	release, ok := controls[ControlRequestID("release-"+string(reference.ID))]
+	if !ok || release.Kind != EffectControlRelease || release.State != EffectControlPending {
+		t.Fatalf("release control not scheduled: %#v", controls)
+	}
+}
+
 func TestConditionalDeleteCannotRemoveNewerDesired(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := NewReconciler(NewMemoryStateStore(), NewMemoryExecutionStore(), NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
