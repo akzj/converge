@@ -62,6 +62,7 @@ type Reconciler struct {
 	executeTimeout time.Duration
 
 	lifecycleMu sync.Mutex
+	deletionMu  sync.Mutex
 	workers     sync.WaitGroup
 	started     bool
 	running     bool
@@ -1213,6 +1214,14 @@ func (r *Reconciler) deleteConfigRequest(ctx context.Context, request deleteRequ
 }
 
 func (r *Reconciler) finalizeDeletion(ctx context.Context, configID model.ConfigID) error {
+	// Multiple maintenance controls may complete concurrently. Serialize only
+	// final deletion commits, then recheck the durable tombstone so at most one
+	// caller emits the deleted transition.
+	r.deletionMu.Lock()
+	defer r.deletionMu.Unlock()
+	if !r.registry.IsDeleting(configID) || !r.registry.DeletionReady(configID) {
+		return nil
+	}
 	execution := r.registry.Execution(configID)
 	provider := ""
 	cause := model.CausalContext{}

@@ -121,3 +121,80 @@ func TestReconcilerDeletionCascadesAndFinalizes(t *testing.T) {
 		}
 	}
 }
+
+func TestMaintenanceReleaseCompletionFinalizesDeletion(t *testing.T) {
+	ctx := context.Background()
+	stateStore := NewMemoryStateStore()
+	executionStore := NewMemoryExecutionStore()
+	r := NewReconciler(stateStore, executionStore, NewMemoryEventBus(), NewMemoryArbiter(), NewMemoryJournal())
+	provider := &releaseConfirmProvider{mockProvider: &mockProvider{typeName: "test"}}
+	r.RegisterProvider(ctx, provider)
+
+	plan, _, err := r.registry.Install(ctx, 0, testPlan(t, provider.Digest(),
+		model.Operation{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "download"},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginBoundEffect(t, r.registry, plan, "effect-delete", "reference-delete", "job-delete")
+	recorded := model.RecordedState{
+		ConfigID: plan.ConfigID, ProviderType: provider.Type(), DesiredVersion: 1,
+		DesiredDigest: "desired-delete", Status: model.ConfigConverged,
+	}
+	if err := stateStore.Record(ctx, recorded); err != nil {
+		t.Fatal(err)
+	}
+	r.configs[plan.ConfigID.Name] = &model.ManagedConfig{
+		ID: plan.ConfigID, Recorded: recorded, Status: model.ConfigConverged,
+		Desired: model.DesiredState{ConfigID: plan.ConfigID, ProviderType: provider.Type(), Version: 1, Digest: "desired-delete"},
+	}
+	if _, err := r.registry.MarkDeleting(ctx, plan.ConfigID); err != nil {
+		t.Fatal(err)
+	}
+	controls, err := r.registry.ListDueControls(ctx, time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var release DueControlRef
+	for _, control := range controls {
+		if control.ControlRequestID == "release-reference-delete" {
+			release = control
+			break
+		}
+	}
+	if release.ControlRequestID == "" {
+		t.Fatalf("release control not scheduled: %#v", controls)
+	}
+	if err := r.processOneDueControl(ctx, release, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := r.Config(plan.ConfigID.Name); exists {
+		t.Fatal("config remains after terminal maintenance release")
+	}
+	if snapshot := r.registry.Snapshot(plan.ConfigID); snapshot.Plan != nil {
+		t.Fatalf("execution remains after deletion: %#v", snapshot)
+	}
+	if stored, err := stateStore.Get(ctx, plan.ConfigID); err != nil || stored != nil {
+		t.Fatalf("recorded state remains: %#v err=%v", stored, err)
+	}
+}
+
+type releaseConfirmProvider struct{ *mockProvider }
+
+func (*releaseConfirmProvider) Digest() string { return "digest" }
+func (*releaseConfirmProvider) EnsureEffect(context.Context, EnsureEffectRequest) (EnsureEffectResult, error) {
+	return EnsureEffectResult{}, nil
+}
+func (*releaseConfirmProvider) ObserveEffects(context.Context, []ObserveEffectRequest) (map[PollRequestID]EffectObservationResult, error) {
+	return nil, nil
+}
+func (*releaseConfirmProvider) EnsureReference(context.Context, EnsureReferenceRequest) (EnsureReferenceResult, error) {
+	return EnsureReferenceResult{}, nil
+}
+func (*releaseConfirmProvider) ReleaseEffect(_ context.Context, request ReleaseEffectRequest) (ReleaseEffectResult, error) {
+	return ReleaseEffectResult{
+		EffectID: request.Identity.EffectID, ReferenceID: request.Identity.ReferenceID,
+		ReleaseRequestID: request.ReleaseRequestID, ExternalJobID: request.ExternalJobID,
+		ExternalRevision: request.ExternalRevision + 1, Disposition: ReleaseConfirmed, Failure: ReleaseFailureNone,
+	}, nil
+}

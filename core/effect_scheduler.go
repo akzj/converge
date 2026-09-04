@@ -117,27 +117,38 @@ func (r *Reconciler) processOneDueControl(ctx context.Context, ref DueControlRef
 		Cause:     control.Cause,
 	}
 
+	var controlErr error
 	switch control.Kind {
 	case EffectControlObserve, EffectControlObserveCancellation:
-		return r.runObservedProviderCall(ctx, observability.ActivityObserveEffects, control, func(callCtx context.Context) error {
+		controlErr = r.runObservedProviderCall(ctx, observability.ActivityObserveEffects, control, func(callCtx context.Context) error {
 			return r.runObserveControl(callCtx, effectProvider, identity, effect, attemptID, pollID)
 		})
 	case EffectControlEnsureRetry:
-		return r.runObservedProviderCall(ctx, observability.ActivityEnsureEffect, control, func(callCtx context.Context) error {
+		controlErr = r.runObservedProviderCall(ctx, observability.ActivityEnsureEffect, control, func(callCtx context.Context) error {
 			return r.runEnsureRetryControl(callCtx, effectProvider, identity, effect)
 		})
 	case EffectControlRelease:
-		return r.runObservedProviderCall(ctx, observability.ActivityReleaseEffect, control, func(callCtx context.Context) error {
+		controlErr = r.runObservedProviderCall(ctx, observability.ActivityReleaseEffect, control, func(callCtx context.Context) error {
 			return r.runReleaseControl(callCtx, effectProvider, identity, effect)
 		})
 	case EffectControlEnsureReference:
-		return r.runObservedProviderCall(ctx, observability.ActivityEnsureReference, control, func(callCtx context.Context) error {
+		controlErr = r.runObservedProviderCall(ctx, observability.ActivityEnsureReference, control, func(callCtx context.Context) error {
 			return r.runEnsureReferenceControl(callCtx, effectProvider, identity, effect)
 		})
 	default:
 		_, _ = r.registry.YieldControl(ctx, identity, now.Add(5*time.Second))
 		return nil
 	}
+	if controlErr != nil {
+		return controlErr
+	}
+	// Maintenance controls are outside the active DAG, so no node/outbox event
+	// will revisit deletion. The control transition itself is the completion
+	// boundary and must drive durable finalization.
+	if r.registry.IsDeleting(ref.ConfigID) && r.registry.DeletionReady(ref.ConfigID) {
+		return r.finalizeDeletion(ctx, ref.ConfigID)
+	}
+	return nil
 }
 
 func (r *Reconciler) runObservedProviderCall(ctx context.Context, kind observability.ActivityKind, control *EffectControl, call func(context.Context) error) error {
