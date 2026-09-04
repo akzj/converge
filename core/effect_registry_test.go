@@ -64,3 +64,67 @@ func TestPlanRegistryRestoreRejectsInvalidEffectSnapshot(t *testing.T) {
 		t.Fatal("expected invalid snapshot restore error")
 	}
 }
+
+func TestCompleteEnsureAndNodePersistsAuthoritativeFailureAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryExecutionStore()
+	registry := NewPlanRegistry(store)
+	plan, _, err := registry.Install(ctx, 0, testPlan(t, "digest",
+		model.Operation{Key: "ensure", ExecutionKind: model.ExecutionEffectEnsure, EffectKey: "artifact"},
+		model.Operation{Key: "observe", ExecutionKind: model.ExecutionEffectObserve, EffectKey: "artifact", DependsOn: []string{"ensure"}},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := TransitionIdentity{
+		EffectIdentity: EffectIdentity{
+			EffectID: "effect", ReferenceID: "reference", ConfigID: plan.ConfigID,
+			PlanID: plan.ID, Generation: plan.Generation, OperationKey: "ensure",
+			EffectKey: "artifact", ProviderType: plan.ProviderType, ProviderDigest: plan.ProviderDigest,
+		},
+		RequestID: "ensure-effect", AttemptID: "attempt",
+	}
+	if disposition, err := registry.BeginEnsureEffect(ctx, BeginEnsureRequest{Identity: identity, Spec: ImmutableEnsureSpec{
+		IdempotencyKey: "idempotency", ArtifactID: "artifact", SemanticFingerprint: "fingerprint", EnsureSpec: []byte(`{}`),
+	}}); err != nil || disposition != TransitionApplied {
+		t.Fatalf("begin ensure: disposition=%s err=%v", disposition, err)
+	}
+	if _, err := registry.ClaimDueControl(ctx, plan.ConfigID, identity.RequestID, time.Now(), identity.AttemptID, "poll", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	event := model.Event{
+		EventID: "attempt/control-result", PlanID: plan.ID, Generation: plan.Generation,
+		NodeKey: "ensure", AttemptID: identity.AttemptID, ConfigID: plan.ConfigID.Name,
+		State: model.StepFailed, Result: model.StepResult{State: model.StepFailed, Code: "ensure_failed", Reason: "not found"},
+	}
+	result := EnsureEffectResult{
+		EffectID: identity.EffectIdentity.EffectID, ReferenceID: identity.EffectIdentity.ReferenceID,
+		Disposition: EnsureFailed, Failure: EnsureFailureAuthoritativeRejected, Code: "ensure_failed", Reason: "not found",
+	}
+	if disposition, err := registry.CompleteEnsureAndNode(ctx, identity, result, "ensure", event); err != nil || disposition != TransitionApplied {
+		t.Fatalf("complete failed ensure: disposition=%s err=%v", disposition, err)
+	}
+
+	snapshot := registry.Execution(plan.ConfigID)
+	if snapshot.Plan.Nodes["ensure"].Status != model.NodeFailed {
+		t.Fatalf("ensure node status=%s, want failed", snapshot.Plan.Nodes["ensure"].Status)
+	}
+	if len(snapshot.Effects) != 1 || snapshot.Effects[0].State != ExternalEffectFailed || snapshot.Effects[0].ResolutionRequired {
+		t.Fatalf("failed effect state=%#v", snapshot.Effects)
+	}
+	if len(snapshot.EffectControls) != 0 {
+		t.Fatalf("terminal ensure control retained: %#v", snapshot.EffectControls)
+	}
+	if len(snapshot.Outbox) != 1 || snapshot.Outbox[0].State != model.StepFailed {
+		t.Fatalf("failure event not persisted: %#v", snapshot.Outbox)
+	}
+
+	recovered := NewPlanRegistry(store)
+	if err := recovered.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restored := recovered.Execution(plan.ConfigID)
+	if restored.Plan.Nodes["ensure"].Status != model.NodeFailed || len(restored.Outbox) != 1 {
+		t.Fatalf("atomic failure lost after restore: %#v", restored)
+	}
+}

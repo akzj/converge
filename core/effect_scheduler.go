@@ -355,8 +355,23 @@ func (r *Reconciler) runEnsureRetryControl(ctx context.Context, provider EffectP
 		_, _ = r.registry.RetireControlAttempt(ctx, identity, model.AttemptYielded)
 		return err
 	case EnsureFailed:
-		_, err := r.registry.ApplyEnsureResult(ctx, identity, result)
-		_, _ = r.registry.RetireControlAttempt(ctx, identity, model.AttemptFailed)
+		nodeKey := identity.EffectIdentity.OperationKey
+		if nodeKey == "" || identity.EffectIdentity.PlanID == "" {
+			_, err := r.registry.ApplyEnsureResult(ctx, identity, result)
+			_, _ = r.registry.RetireControlAttempt(ctx, identity, model.AttemptFailed)
+			return err
+		}
+		event := model.Event{
+			EventID: string(identity.AttemptID) + "/control-result",
+			PlanID:  identity.EffectIdentity.PlanID, Generation: identity.EffectIdentity.Generation,
+			NodeKey: nodeKey, AttemptID: identity.AttemptID, ConfigID: identity.EffectIdentity.ConfigID.Name,
+			State:  model.StepFailed,
+			Result: model.StepResult{State: model.StepFailed, Code: result.Code, Reason: result.Reason},
+		}
+		disp, err := r.registry.CompleteEnsureAndNode(ctx, identity, result, nodeKey, event)
+		if err == nil && (disp == TransitionApplied || disp == TransitionDuplicate) {
+			r.wakeOutbox()
+		}
 		return err
 	default:
 		_, _ = r.registry.YieldControl(ctx, identity, time.Now().Add(5*time.Second))

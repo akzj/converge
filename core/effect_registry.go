@@ -247,10 +247,10 @@ func (r *PlanRegistry) ApplyEnsureResult(ctx context.Context, identity Transitio
 	return TransitionApplied, nil
 }
 
-// CompleteEnsureAndNode atomically applies an EnsureBound result, marks the
+// CompleteEnsureAndNode atomically applies a terminal Ensure result, marks the
 // ensure node terminal, and enqueues the lifecycle outbox event in a single
-// execution Revision CAS. It closes the crash window where the effect is Bound
-// but the ensure node has not advanced.
+// execution Revision CAS. It closes the crash window where the effect has
+// reached Bound or Failed but the ensure node has not advanced.
 func (r *PlanRegistry) CompleteEnsureAndNode(
 	ctx context.Context,
 	identity TransitionIdentity,
@@ -261,7 +261,7 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 	if err := ValidateEnsureDispositionFailure(result.Disposition, result.Failure); err != nil {
 		return TransitionRejected, err
 	}
-	if result.Disposition != EnsureBound {
+	if result.Disposition != EnsureBound && result.Disposition != EnsureFailed {
 		return TransitionRejected, errors.Errorf("unsupported terminal ensure disposition %q", result.Disposition)
 	}
 	unlockConfig := r.lockConfig(identity.EffectIdentity.ConfigID)
@@ -296,46 +296,53 @@ func (r *PlanRegistry) CompleteEnsureAndNode(
 	}
 
 	oldEffect := effect
-	effect.Binding = EffectBindingBound
-	effect.ExternalJobID = result.ExternalJobID
-	effect.ExternalRevision = result.ExternalRevision
-	effect.ResolutionRequired = true
-	if oldEffect.State == ExternalEffectCancelRequested {
-		effect.State = ExternalEffectCancelRequested
+	if result.Disposition == EnsureBound {
+		effect.Binding = EffectBindingBound
+		effect.ExternalJobID = result.ExternalJobID
+		effect.ExternalRevision = result.ExternalRevision
+		effect.ResolutionRequired = true
+		if oldEffect.State == ExternalEffectCancelRequested {
+			effect.State = ExternalEffectCancelRequested
+		} else {
+			effect.State = ExternalEffectActive
+		}
 	} else {
-		effect.State = ExternalEffectActive
+		effect.State = ExternalEffectFailed
+		effect.ResolutionRequired = result.Failure != EnsureFailureAuthoritativeRejected
 	}
 	if err := ValidateEffectTransition(oldEffect, effect, EffectTransitionEnsureResult); err != nil {
 		return TransitionRejected, err
 	}
 	state.effects[effect.ID] = effect
 
-	reference := state.references[identity.EffectIdentity.ReferenceID]
-	if reference.ID != "" {
-		oldReference := reference
-		if reference.State != EffectReferenceActive {
-			reference.State = EffectReferenceActive
-			if err := ValidateReferenceTransition(oldReference, reference); err != nil {
-				return TransitionRejected, err
-			}
-		}
-		state.references[reference.ID] = reference
-	}
-
-	// Create the Observe control so the scheduler can drive polling.
-	observeControl := EffectControl{
-		ID:       ControlRequestID("observe-" + string(identity.EffectIdentity.ReferenceID)),
-		ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
-		ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
-		TargetKind: EffectTargetPlanNode,
-		State:      EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
-		PlanID: state.active.ID, Generation: state.active.Generation,
-		OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve),
-		NextCheckAt:  time.Now(),
-	}
-	bindControlToPlanNodeOrMaintenance(&observeControl, state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve)
 	delete(state.controls, identity.RequestID)
-	state.controls[observeControl.ID] = observeControl
+	if result.Disposition == EnsureBound {
+		reference := state.references[identity.EffectIdentity.ReferenceID]
+		if reference.ID != "" {
+			oldReference := reference
+			if reference.State != EffectReferenceActive {
+				reference.State = EffectReferenceActive
+				if err := ValidateReferenceTransition(oldReference, reference); err != nil {
+					return TransitionRejected, err
+				}
+			}
+			state.references[reference.ID] = reference
+		}
+
+		// Create the Observe control so the scheduler can drive polling.
+		observeControl := EffectControl{
+			ID:       ControlRequestID("observe-" + string(identity.EffectIdentity.ReferenceID)),
+			ConfigID: identity.EffectIdentity.ConfigID, ProviderType: effect.ProviderType,
+			ProviderDigest: effect.ProviderDigest, Kind: EffectControlObserve,
+			TargetKind: EffectTargetPlanNode,
+			State:      EffectControlPending, EffectID: effect.ID, ReferenceID: identity.EffectIdentity.ReferenceID,
+			PlanID: state.active.ID, Generation: state.active.Generation,
+			OperationKey: findEffectOperationKey(state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve),
+			NextCheckAt:  time.Now(),
+		}
+		bindControlToPlanNodeOrMaintenance(&observeControl, state.active, identity.EffectIdentity.EffectKey, model.ExecutionEffectObserve)
+		state.controls[observeControl.ID] = observeControl
+	}
 
 	// --- Verify NodeIdentity matches the active plan, preventing
 	// cross-generation advancement by a stale control. ---
