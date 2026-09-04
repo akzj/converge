@@ -22,10 +22,10 @@ import (
 // Journal. Execution updates use a revision-guarded statement, so competing
 // writers cannot silently overwrite a newer snapshot.
 type SQLiteStore struct {
-	db         *sql.DB
-	lockFile   *os.File
-	snapshotMu sync.Mutex
-	path       string
+	db       *sql.DB
+	lockFile *os.File
+	writeMu  sync.Mutex
+	path     string
 }
 
 const sqliteSchemaVersion = 2
@@ -196,6 +196,8 @@ func (s *SQLiteStore) Ping(ctx context.Context) error {
 // Backup creates a transactionally consistent standalone database using
 // SQLite's online VACUUM INTO facility. The destination must not already exist.
 func (s *SQLiteStore) Backup(ctx context.Context, destination string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	abs, err := filepath.Abs(destination)
 	if err != nil {
 		return errors.Wrap(err, "resolve sqlite backup path")
@@ -218,8 +220,8 @@ func (s *SQLiteStore) AcceptDesiredSnapshot(ctx context.Context, snapshot model.
 	if err := model.ValidateDesiredSnapshot(snapshot); err != nil {
 		return false, err
 	}
-	s.snapshotMu.Lock()
-	defer s.snapshotMu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return false, errors.Wrap(err, "encode desired snapshot")
@@ -337,6 +339,8 @@ func (s *SQLiteStore) List(ctx context.Context) ([]model.ConfigID, error) {
 }
 
 func (s *SQLiteStore) Record(ctx context.Context, state model.RecordedState) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	state.UpdatedAt = time.Now()
 	payload, err := json.Marshal(state)
 	if err != nil {
@@ -348,6 +352,8 @@ ON CONFLICT(config_id) DO UPDATE SET payload = excluded.payload`, state.ConfigID
 }
 
 func (s *SQLiteStore) Delete(ctx context.Context, id model.ConfigID) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.ExecContext(ctx, `DELETE FROM converge_state WHERE config_id = ?`, id.Name)
 	return errors.Wrap(err, "delete recorded state")
 }
@@ -386,6 +392,8 @@ func (s *SQLiteStore) ListExecutions(ctx context.Context) ([]model.ConfigID, err
 }
 
 func (s *SQLiteStore) CommitExecutionCAS(ctx context.Context, id model.ConfigID, expectedRevision uint64, snapshot ExecutionSnapshot) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if snapshot.Revision != expectedRevision+1 {
 		return errors.Errorf("invalid execution revision %d, want %d", snapshot.Revision, expectedRevision+1)
 	}
@@ -415,11 +423,15 @@ WHERE config_id = ? AND revision = ?`, snapshot.Revision, payload, id.Name, expe
 }
 
 func (s *SQLiteStore) DeleteExecution(ctx context.Context, id model.ConfigID) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.ExecContext(ctx, `DELETE FROM converge_execution WHERE config_id = ?`, id.Name)
 	return errors.Wrap(err, "delete execution")
 }
 
 func (s *SQLiteStore) Append(ctx context.Context, event model.Event) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return errors.Wrap(err, "encode journal event")

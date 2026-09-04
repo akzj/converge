@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,6 +125,45 @@ func TestSQLiteExecutionCASAllowsIndependentConfigs(t *testing.T) {
 			errs <- store.CommitExecutionCAS(ctx, model.ConfigID{Name: name}, 0, ExecutionSnapshot{Revision: 1})
 		}(name)
 	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSQLiteSerializesSnapshotAcceptanceWithRuntimeWrites(t *testing.T) {
+	ctx := context.Background()
+	store := openTestSQLite(t)
+	const iterations = 100
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() {
+		<-start
+		for revision := uint64(1); revision <= iterations; revision++ {
+			if accepted, err := store.AcceptDesiredSnapshot(ctx, sqliteDesiredSnapshot(t, revision)); err != nil || !accepted {
+				errs <- errors.Join(err, errors.New("snapshot was not accepted"))
+				return
+			}
+		}
+		errs <- nil
+	}()
+	go func() {
+		<-start
+		for revision := uint64(1); revision <= iterations; revision++ {
+			id := model.ConfigID{Name: "runtime"}
+			if err := store.Record(ctx, model.RecordedState{ConfigID: id, ProviderType: "test", DesiredVersion: revision}); err != nil {
+				errs <- err
+				return
+			}
+			if err := store.Append(ctx, model.Event{EventID: fmt.Sprintf("event-%d", revision), ConfigID: id.Name}); err != nil {
+				errs <- err
+				return
+			}
+		}
+		errs <- nil
+	}()
 	close(start)
 	for range 2 {
 		if err := <-errs; err != nil {
