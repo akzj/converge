@@ -1057,15 +1057,18 @@ func (r *Reconciler) handleEvent(ctx context.Context, event model.Event) {
 		}
 		return
 	}
-	if !changed {
-		return
-	}
 	snapshot := r.registry.Snapshot(model.ConfigID{Name: event.ConfigID})
 	if snapshot.Plan == nil {
 		return
 	}
+	if !changed && (snapshot.Plan.ID != event.PlanID || snapshot.Plan.Generation != event.Generation) {
+		return
+	}
 	if planFailed(snapshot.Plan) {
 		r.setConfigError(event.ConfigID, errors.Errorf("operation %q failed: %s", event.NodeKey, event.Result.Reason))
+		return
+	}
+	if !changed {
 		return
 	}
 	if planCompleted(snapshot.Plan) {
